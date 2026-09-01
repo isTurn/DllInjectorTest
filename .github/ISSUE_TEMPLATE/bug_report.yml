@@ -1,0 +1,50 @@
+---
+name: Bug 报告
+description: 提交一个 Bug
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢提交 Bug！请尽量提供完整信息，便于快速定位问题。
+  - type: input
+    id: version
+    attributes:
+      label: 注入器版本
+      description: x64 还是 x86？哪个 Release 版本？
+      placeholder: 例如 DllInjector-x64.exe v1.0.0
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: 系统环境
+      description: Windows 版本、DPI 缩放比例
+      placeholder: Windows 11 23H2, 150% 缩放
+    validations:
+      required: true
+  - type: textarea
+    id: desc
+    attributes:
+      label: 问题描述
+      description: 发生了什么？期望是什么？
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: 复现步骤
+      description: 如何复现
+      placeholder: |
+        1. 选择 xxx.exe
+        2. 选择 xxx.dll
+        3. 点击注入并启动
+        4. ...
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: 日志 / 截图
+      description: 界面日志内容或截图（可粘贴文本或拖入图片）

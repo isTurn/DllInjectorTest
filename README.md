@@ -1,12 +1,17 @@
 # DLL 注入器 (DLL Injector)
 
 [![Release](https://img.shields.io/github/v/release/isTurn/DllInjectorTest?style=flat-square&logo=github)](https://github.com/isTurn/DllInjectorTest/releases)
+[![Build](https://img.shields.io/github/actions/workflow/status/isTurn/DllInjectorTest/build.yml?style=flat-square&logo=githubactions&logoColor=white&label=build)](https://github.com/isTurn/DllInjectorTest/actions)
 [![License](https://img.shields.io/github/license/isTurn/DllInjectorTest?style=flat-square)](LICENSE)
 [![Language](https://img.shields.io/github/languages/top/isTurn/DllInjectorTest?style=flat-square)](https://github.com/isTurn/DllInjectorTest)
 [![.NET](https://img.shields.io/badge/.NET-8.0-512BD4?style=flat-square&logo=dotnet)](https://dotnet.microsoft.com/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20x64%20%7C%20x86-0078D6?style=flat-square&logo=windows)]()
 
 一个带图形界面的 Windows 工具：选择目标 exe 和要注入的 dll，点击「注入并启动」，工具会以**挂起方式启动目标程序 → 把 DLL 注入进去 → 恢复运行**。支持 **x64 / x86** 双架构。
+
+## 界面预览
+
+![DLL Injector 界面](screenshot.png)
 
 ## 功能特性
 
@@ -82,17 +87,27 @@ build.bat
 | `out\x64\DllInjector.exe` | 64 位 |
 | `out\x86\DllInjector.exe` | 32 位 |
 
+> 也可以直接使用仓库内置的 [GitHub Actions](.github/workflows/build.yml)：打 `v*` 标签即可自动构建并发布 Release。
+
 ## 目录结构
 
 ```
 DllInjectorTest/
-├── DllInjector/            # 注入器源码（C# WinForms）
-│   ├── Program.cs          # 入口 + 注入核心 + 命令行模式
+├── .github/
+│   ├── workflows/build.yml     # CI：自动构建 x64/x86，打标签时自动发 Release
+│   ├── ISSUE_TEMPLATE/          # Issue 模板
+│   └── PULL_REQUEST_TEMPLATE.md # PR 模板
+├── DllInjector/                # 注入器源码（C# WinForms）
+│   ├── Program.cs              # 入口 + 注入核心 + 命令行模式
 │   └── DllInjector.csproj
 ├── test/
-│   ├── TestDll/            # 自测用注入 DLL 源码（DllMain 写标记文件验证）
-│   └── TestTarget/         # 自测用目标程序源码
-├── build.bat               # 一键构建脚本（x64 + x86）
+│   ├── TestDll/                # 自测用注入 DLL 源码（DllMain 写标记文件验证）
+│   └── TestTarget/             # 自测用目标程序源码
+├── screenshot.png              # 界面截图
+├── build.bat                   # 一键构建脚本（x64 + x86）
+├── CHANGELOG.md
+├── CONTRIBUTING.md
+├── SECURITY.md
 ├── .gitignore
 └── README.md
 ```
@@ -102,7 +117,7 @@ DllInjectorTest/
 - **位数必须一致**：DLL 必须与目标程序同为 32 位或 64 位，否则会拒绝注入；
 - **仅支持原生 DLL**：需为含 `DllMain` 的 C/C++ 编译产物，托管 .NET DLL 无法以此方式执行代码；
 - **杀毒软件可能告警**：`CreateRemoteThread` 注入是常见注入手法，部分杀软会报毒；
-- **请合法使用**：仅对你有权操作的软件使用（如插件、MOD、调试、内部工具等场景）。
+- **请合法使用**：仅对你有权操作的软件使用（如插件、MOD、调试、内部工具等场景），详见 [SECURITY.md](SECURITY.md)。
 
 ## License
 

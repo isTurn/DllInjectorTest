@@ -11,6 +11,12 @@
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <SatelliteResourceLanguages>zh-Hans</SatelliteResourceLanguages>
     <InvariantGlobalization>false</InvariantGlobalization>
+    <Version>1.0.0</Version>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <FileVersion>1.0.0.0</FileVersion>
+    <Product>DLL 注入器 (DLL Injector)</Product>
+    <Company>isTurn</Company>
+    <Authors>isTurn</Authors>
   </PropertyGroup>
 
 </Project>

@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DLL 注入器 (DLL Injector)</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    background: #0f172a; color: #e2e8f0;
+    min-height: 100vh; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; padding: 40px 20px;
+  }
+  .card {
+    max-width: 760px; width: 100%; text-align: center;
+    background: #1e293b; border: 1px solid #334155; border-radius: 16px;
+    padding: 48px 40px; box-shadow: 0 20px 60px rgba(0,0,0,.4);
+  }
+  .logo {
+    font-size: 52px; line-height: 1;
+    width: 88px; height: 88px; margin: 0 auto 24px;
+    display: flex; align-items: center; justify-content: center;
+    background: #1677ff; color: #fff; border-radius: 22px;
+    box-shadow: 0 10px 30px rgba(22,119,255,.4);
+  }
+  h1 { font-size: 32px; font-weight: 700; color: #fff; margin-bottom: 12px; }
+  .sub { font-size: 16px; color: #94a3b8; line-height: 1.7; margin-bottom: 28px; }
+  .features {
+    list-style: none; text-align: left; margin: 0 auto 32px; max-width: 560px;
+    display: grid; gap: 10px;
+  }
+  .features li {
+    background: #334155; border-radius: 10px; padding: 12px 16px;
+    font-size: 14px; color: #cbd5e1;
+  }
+  .features b { color: #fff; }
+  .btns { display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; }
+  .btn {
+    display: inline-block; padding: 12px 26px; border-radius: 10px;
+    font-size: 15px; font-weight: 600; text-decoration: none; transition: .2s;
+  }
+  .btn-primary { background: #1677ff; color: #fff; }
+  .btn-primary:hover { background: #4096ff; }
+  .btn-ghost { background: transparent; color: #94a3b8; border: 1px solid #475569; }
+  .btn-ghost:hover { color: #e2e8f0; border-color: #64748b; }
+  .footer { margin-top: 32px; font-size: 13px; color: #64748b; }
+  .footer a { color: #94a3b8; }
+  @media (prefers-color-scheme: light) {
+    body { background: #f1f5f9; color: #1e293b; }
+    .card { background: #fff; border-color: #e2e8f0; }
+    .features li { background: #f1f5f9; color: #334155; }
+    .features b { color: #0f172a; }
+    .sub { color: #64748b; }
+    .btn-ghost { color: #64748b; border-color: #cbd5e1; }
+    .btn-ghost:hover { color: #0f172a; border-color: #94a3b8; }
+    .footer { color: #94a3b8; }
+    .footer a { color: #475569; }
+  }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">D</div>
+    <h1>DLL 注入器</h1>
+    <p class="sub">选择目标程序与 DLL，一键「挂起启动 → 注入 → 恢复运行」。支持 Windows x64 / x86 双架构。</p>
+    <ul class="features">
+      <li><b>图形界面</b> — WinForms 界面，支持拖拽选择文件</li>
+      <li><b>命令行模式</b> — <code>-inject &lt;exe&gt; &lt;dll&gt;</code> 便于自动化</li>
+      <li><b>位数自动校验</b> — x64 / x86 不匹配时拦截提示</li>
+      <li><b>支持中文路径</b> — UTF-16 写入远程进程</li>
+    </ul>
+    <div class="btns">
+      <a class="btn btn-primary" href="https://github.com/isTurn/DllInjectorTest/releases" target="_blank" rel="noopener">下载 EXE</a>
+      <a class="btn btn-ghost" href="https://github.com/isTurn/DllInjectorTest" target="_blank" rel="noopener">查看源码</a>
+    </div>
+    <div class="footer">
+      开源 · <a href="https://github.com/isTurn/DllInjectorTest/blob/main/README.md" target="_blank" rel="noopener">使用文档</a> ·
+      <a href="https://github.com/isTurn/DllInjectorTest/blob/main/LICENSE" target="_blank" rel="noopener">MIT License</a>
+    </div>
+  </div>
+</body>
+</html>

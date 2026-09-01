@@ -1,0 +1,501 @@
+using System;
+using System.ComponentModel;
+using System.Drawing;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+
+namespace DllInjector
+{
+    /// <summary>Win32 API 声明</summary>
+    internal static class NativeMethods
+    {
+        public const uint CREATE_SUSPENDED  = 0x00000004;
+        public const uint CREATE_NEW_CONSOLE = 0x00000010;
+        public const uint MEM_COMMIT        = 0x1000;
+        public const uint MEM_RESERVE       = 0x2000;
+        public const uint MEM_RELEASE       = 0x8000;
+        public const uint PAGE_READWRITE    = 0x04;
+        public const uint INFINITE          = 0xFFFFFFFF;
+        public const uint WAIT_TIMEOUT      = 0x00000102;
+        public const uint WAIT_FAILED       = 0xFFFFFFFF;
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct STARTUPINFO
+        {
+            public int cb;
+            public string lpReserved;
+            public string lpDesktop;
+            public string lpTitle;
+            public int dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
+            public short wShowWindow;
+            public short cbReserved2;
+            public IntPtr lpReserved2;
+            public IntPtr hStdInput, hStdOutput, hStdError;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct PROCESS_INFORMATION
+        {
+            public IntPtr hProcess;
+            public IntPtr hThread;
+            public int dwProcessId;
+            public int dwThreadId;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        public static extern bool CreateProcess(
+            string lpApplicationName,
+            string lpCommandLine,
+            IntPtr lpProcessAttributes,
+            IntPtr lpThreadAttributes,
+            bool bInheritHandles,
+            uint dwCreationFlags,
+            IntPtr lpEnvironment,
+            string lpCurrentDirectory,
+            ref STARTUPINFO lpStartupInfo,
+            out PROCESS_INFORMATION lpProcessInformation);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr VirtualAllocEx(IntPtr hProcess, IntPtr lpAddress, UIntPtr dwSize, uint flAllocationType, uint flProtect);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool WriteProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, byte[] lpBuffer, UIntPtr nSize, out UIntPtr lpNumberOfBytesWritten);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr CreateRemoteThread(IntPtr hProcess, IntPtr lpThreadAttributes, UIntPtr dwStackSize, IntPtr lpStartAddress, IntPtr lpParameter, uint dwCreationFlags, out uint lpThreadId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool ResumeThread(IntPtr hThread);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool GetExitCodeThread(IntPtr hThread, out uint lpExitCode);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool VirtualFreeEx(IntPtr hProcess, IntPtr lpAddress, UIntPtr dwSize, uint dwFreeType);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr GetModuleHandle(string lpModuleName);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr GetProcAddress(IntPtr hModule, string lpProcName);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool CloseHandle(IntPtr hObject);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
+
+        public static string LastErrorText()
+        {
+            int code = Marshal.GetLastWin32Error();
+            return $"0x{code:X8} ({new Win32Exception(code).Message})";
+        }
+    }
+
+    /// <summary>读取 PE 文件头判断可执行文件位数</summary>
+    internal static class PeHelper
+    {
+        /// <summary>返回 32 / 64；无法识别返回 0。</summary>
+        public static int GetExeBitness(string path)
+        {
+            try
+            {
+                using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                using var br = new BinaryReader(fs);
+                if (br.ReadUInt16() != 0x5A4D) return 0;          // "MZ"
+                fs.Seek(0x3C, SeekOrigin.Begin);
+                int peOffset = br.ReadInt32();
+                fs.Seek(peOffset, SeekOrigin.Begin);
+                if (br.ReadUInt32() != 0x00004550) return 0;       // "PE\0\0"
+                ushort machine = br.ReadUInt16();
+                if (machine == 0x014C) return 32;                  // IMAGE_FILE_MACHINE_I386
+                if (machine == 0x8664) return 64;                  // IMAGE_FILE_MACHINE_AMD64
+                return 0;
+            }
+            catch { return 0; }
+        }
+    }
+
+    public class MainForm : Form
+    {
+        private Label _lblExe, _lblDll, _tip, _lblLog;
+        private TextBox _txtExe;
+        private TextBox _txtDll;
+        private Button _btnExe;
+        private Button _btnDll;
+        private Button _btnInject;
+        private TextBox _log;
+
+        // 96 DPI 逻辑布局基准值
+        private const int PadLeft = 12;      // 左侧留白
+        private const int LabelWidth = 112;  // 标签区宽度（足够容纳"目标程序:"/"DLL 文件:"）
+        private const int BrowseWidth = 120; // 浏览按钮宽度
+        private const int RowHeight = 34;
+
+        private float _scale = 1f;  // 当前 DPI 缩放系数（144 DPI 时为 1.5）
+        private bool _layouting;    // 防重入
+
+        public MainForm()
+        {
+            Text = "DLL 注入器 - 启动时注入";
+            Font = new Font("Microsoft YaHei UI", 9F);
+            // 关闭框架自动缩放（.NET 8 下对代码构建的窗体不会按 DPI 缩放），改为手动精确缩放
+            AutoScaleMode = AutoScaleMode.None;
+            ClientSize = new Size(720, 440);
+            MinimumSize = new Size(620, 400);
+            StartPosition = FormStartPosition.CenterScreen;
+            BackColor = Color.White;
+
+            BuildUi();
+            Resize += (s, e) => LayoutAll();
+            Log($"注入器已启动（当前为 {IntPtr.Size * 8} 位版本）。");
+            Log("使用方式：选择要启动的目标 exe 和要注入的 dll，点击\"注入并启动\"。");
+            Log("提示：DLL 必须与目标程序同为 32 位或 64 位；DLL 需为原生 DLL（含 DllMain）。");
+        }
+
+        protected override void OnLoad(EventArgs e)
+        {
+            base.OnLoad(e);
+            ApplyDpiScale();
+        }
+
+        protected override void OnDpiChanged(DpiChangedEventArgs e)
+        {
+            base.OnDpiChanged(e);
+            ApplyDpiScale();
+        }
+
+        /// <summary>应用 DPI 缩放：更新缩放系数、字号与窗体尺寸，然后重新布局</summary>
+        private void ApplyDpiScale()
+        {
+            _scale = DeviceDpi / 96f;
+            Font = new Font("Microsoft YaHei UI", 9f * _scale, GraphicsUnit.Point);
+            if (_log != null) _log.Font = new Font("Consolas", 9f * _scale, GraphicsUnit.Point);
+            if (Math.Abs(_scale - 1f) > 0.01f)
+            {
+                SuspendLayout();
+                ClientSize = new Size(Scale(720), Scale(440));
+                ResumeLayout(true);
+            }
+            LayoutAll();
+        }
+
+        private int Scale(int v) => (int)Math.Round(v * _scale);
+
+        private void BuildUi()
+        {
+            _lblExe = MakeLabel("目标程序:");
+            _txtExe = MakeBox();
+            _btnExe = MakeBrowseButton("浏览",
+                () => _txtExe.Text = PickFile("可执行文件 (*.exe)|*.exe|所有文件 (*.*)|*.*", _txtExe.Text));
+
+            _lblDll = MakeLabel("DLL 文件:");
+            _txtDll = MakeBox();
+            _btnDll = MakeBrowseButton("浏览",
+                () => _txtDll.Text = PickFile("DLL 文件 (*.dll)|*.dll|所有文件 (*.*)|*.*", _txtDll.Text));
+
+            _btnInject = new Button
+            {
+                Text = "注入并启动",
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.FromArgb(22, 119, 255),
+                ForeColor = Color.White,
+                Cursor = Cursors.Hand
+            };
+            _btnInject.Click += BtnInject_Click;
+
+            _tip = new Label
+            {
+                Text = "将程序以挂起方式启动 -> 注入 DLL -> 恢复运行",
+                AutoSize = true,
+                ForeColor = Color.Gray
+            };
+
+            _lblLog = new Label { Text = "运行日志:", AutoSize = true };
+
+            _log = new TextBox
+            {
+                Multiline = true,
+                ReadOnly = true,
+                ScrollBars = ScrollBars.Vertical,
+                Font = new Font("Consolas", 9F),
+                BackColor = Color.FromArgb(28, 28, 30),
+                ForeColor = Color.FromArgb(230, 230, 230),
+                BorderStyle = BorderStyle.FixedSingle
+            };
+
+            Controls.AddRange(new Control[] { _lblExe, _txtExe, _btnExe, _lblDll, _txtDll, _btnDll, _btnInject, _tip, _lblLog, _log });
+        }
+
+        /// <summary>统一布局：以 96 DPI 逻辑坐标为准，按当前缩放系数与窗口尺寸摆放所有控件</summary>
+        private void LayoutAll()
+        {
+            if (_layouting || _txtExe == null) return;
+            _layouting = true;
+            try
+            {
+                SuspendLayout();
+                int padL = Scale(12), labelW = Scale(LabelWidth), browseW = Scale(BrowseWidth);
+                int gap = Scale(8), rowH = Scale(RowHeight), boxH = Scale(26), btnH = Scale(34);
+                int y = Scale(18);
+
+                // 第 1 行：目标程序
+                _lblExe.Location = new Point(padL, y + Scale(6));
+                _txtExe.Location = new Point(labelW, y);
+                _btnExe.Location = new Point(ClientSize.Width - padL - browseW, y);
+                _txtExe.Size = new Size(ClientSize.Width - padL - labelW - gap - browseW - padL, boxH);
+                _btnExe.Size = new Size(browseW, boxH);
+                y += rowH;
+
+                // 第 2 行：DLL 文件
+                _lblDll.Location = new Point(padL, y + Scale(6));
+                _txtDll.Location = new Point(labelW, y);
+                _btnDll.Location = new Point(ClientSize.Width - padL - browseW, y);
+                _txtDll.Size = new Size(ClientSize.Width - padL - labelW - gap - browseW - padL, boxH);
+                _btnDll.Size = new Size(browseW, boxH);
+                y += rowH + Scale(6);
+
+                // 注入按钮 + 流程说明
+                _btnInject.Location = new Point(labelW, y);
+                _btnInject.Size = new Size(Scale(150), btnH);
+                _tip.Location = new Point(labelW + Scale(160), y + Scale(7));
+                y += rowH + Scale(8);
+
+                // 日志区
+                _lblLog.Location = new Point(padL, y);
+                y += Scale(22);
+                _log.Location = new Point(padL, y);
+                _log.Size = new Size(ClientSize.Width - 2 * padL, ClientSize.Height - y - padL);
+
+                // 最小尺寸随缩放
+                MinimumSize = new Size(Scale(620), Scale(400));
+
+                ResumeLayout(true);
+                PerformLayout();
+            }
+            finally
+            {
+                _layouting = false;
+            }
+        }
+
+        /// <summary>标签：自动宽度，文字永不被截断</summary>
+        private static Label MakeLabel(string text)
+            => new Label { Text = text, AutoSize = true };
+
+        private TextBox MakeBox()
+        {
+            var tb = new TextBox { AllowDrop = true };
+            tb.DragEnter += (s, e) => { if (e.Data.GetDataPresent(DataFormats.FileDrop)) e.Effect = DragDropEffects.Copy; };
+            tb.DragDrop += (s, e) =>
+            {
+                if (e.Data.GetData(DataFormats.FileDrop) is string[] files && files.Length > 0)
+                    tb.Text = files[0];
+            };
+            return tb;
+        }
+
+        private Button MakeBrowseButton(string text, Action onClick)
+        {
+            var b = new Button { Text = text, FlatStyle = FlatStyle.Flat, Cursor = Cursors.Hand };
+            b.Click += (s, e) => onClick();
+            return b;
+        }
+
+        /// <summary>文件选择：初始目录固定为注入器 EXE 所在文件夹（与 DllInjector 同目录）</summary>
+        private string PickFile(string filter, string currentPath)
+        {
+            using var dlg = new OpenFileDialog { Filter = filter, CheckFileExists = true };
+
+            // 始终从注入器所在目录打开，方便把目标 exe / dll 放在同一文件夹
+            string exeDir = AppContext.BaseDirectory;
+            if (Directory.Exists(exeDir)) dlg.InitialDirectory = exeDir;
+
+            return dlg.ShowDialog(this) == DialogResult.OK ? dlg.FileName : null;
+        }
+
+        private void Log(string msg)
+        {
+            if (InvokeRequired) { BeginInvoke(new Action<string>(Log), msg); return; }
+            _log.AppendText($"[{DateTime.Now:HH:mm:ss}] {msg}{Environment.NewLine}");
+            _log.SelectionStart = _log.TextLength;
+            _log.ScrollToCaret();
+        }
+
+        private async void BtnInject_Click(object sender, EventArgs e)
+        {
+            string exe = _txtExe.Text.Trim().Trim('"');
+            string dll = _txtDll.Text.Trim().Trim('"');
+            if (string.IsNullOrEmpty(exe) || string.IsNullOrEmpty(dll))
+            {
+                MessageBox.Show("请先选择目标 exe 和 dll 文件。", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            var btn = sender as Button;
+            btn.Enabled = false;
+            try
+            {
+                await Task.Run(() => InjectorCore.Run(exe, dll, Log));
+            }
+            catch (Exception ex)
+            {
+                Log("发生异常: " + ex.Message);
+            }
+            finally
+            {
+                btn.Enabled = true;
+            }
+        }
+    }
+
+    /// <summary>注入核心逻辑（GUI 与命令行模式共用）</summary>
+    internal static class InjectorCore
+    {
+        /// <summary>核心注入流程：挂起启动 -> 远程写入路径 -> CreateRemoteThread(LoadLibraryW) -> 恢复主线程</summary>
+        public static bool Run(string exePath, string dllPath, Action<string> log)
+        {
+            log("================ 开始注入 ================");
+            if (!File.Exists(exePath)) { log("错误: 目标程序不存在: " + exePath); return false; }
+            if (!File.Exists(dllPath)) { log("错误: DLL 不存在: " + dllPath); return false; }
+
+            int toolBits = IntPtr.Size * 8;
+            int targetBits = PeHelper.GetExeBitness(exePath);
+            if (targetBits == 0)
+            {
+                log("错误: 无法识别目标程序架构，可能不是有效的 PE 可执行文件。");
+                return false;
+            }
+            log($"目标程序: {Path.GetFileName(exePath)}（{targetBits} 位）| 注入器: {toolBits} 位");
+            if (targetBits != toolBits)
+            {
+                log($"错误: 位数不匹配，无法注入。请使用与目标程序同位数（{targetBits} 位）的注入器版本。");
+                return false;
+            }
+
+            string workDir = Path.GetDirectoryName(exePath);
+            var si = new NativeMethods.STARTUPINFO { cb = Marshal.SizeOf<NativeMethods.STARTUPINFO>() };
+            NativeMethods.PROCESS_INFORMATION pi;
+
+            if (!NativeMethods.CreateProcess(exePath, "\"" + exePath + "\"", IntPtr.Zero, IntPtr.Zero,
+                    false, NativeMethods.CREATE_SUSPENDED | NativeMethods.CREATE_NEW_CONSOLE,
+                    IntPtr.Zero, workDir, ref si, out pi))
+            {
+                log("错误: 创建进程失败 - " + NativeMethods.LastErrorText());
+                return false;
+            }
+            log($"已创建目标进程（PID={pi.dwProcessId}）并挂起，开始注入...");
+
+            bool ok = false;
+            IntPtr remoteBuf = IntPtr.Zero;
+            IntPtr hRemoteThread = IntPtr.Zero;
+            try
+            {
+                // 使用 LoadLibraryW，支持中文等非 ASCII 路径
+                byte[] dllPathBytes = Encoding.Unicode.GetBytes(dllPath);
+                remoteBuf = NativeMethods.VirtualAllocEx(pi.hProcess, IntPtr.Zero,
+                    (UIntPtr)(dllPathBytes.Length + 2),
+                    NativeMethods.MEM_COMMIT | NativeMethods.MEM_RESERVE, NativeMethods.PAGE_READWRITE);
+                if (remoteBuf == IntPtr.Zero)
+                {
+                    log("错误: 在目标进程分配内存失败 - " + NativeMethods.LastErrorText());
+                    return false;
+                }
+
+                if (!NativeMethods.WriteProcessMemory(pi.hProcess, remoteBuf, dllPathBytes,
+                        (UIntPtr)dllPathBytes.Length, out _))
+                {
+                    log("错误: 写入 DLL 路径失败 - " + NativeMethods.LastErrorText());
+                    return false;
+                }
+                log("DLL 路径已写入目标进程内存。");
+
+                IntPtr kernel32 = NativeMethods.GetModuleHandle("kernel32.dll");
+                IntPtr loadLibraryW = NativeMethods.GetProcAddress(kernel32, "LoadLibraryW");
+                if (loadLibraryW == IntPtr.Zero)
+                {
+                    log("错误: 获取 LoadLibraryW 地址失败 - " + NativeMethods.LastErrorText());
+                    return false;
+                }
+
+                hRemoteThread = NativeMethods.CreateRemoteThread(pi.hProcess, IntPtr.Zero, UIntPtr.Zero,
+                    loadLibraryW, remoteBuf, 0, out _);
+                if (hRemoteThread == IntPtr.Zero)
+                {
+                    log("错误: 创建远程线程失败 - " + NativeMethods.LastErrorText());
+                    return false;
+                }
+                log("已创建远程线程，等待 DLL 的 DllMain 初始化完成...");
+
+                uint wait = NativeMethods.WaitForSingleObject(hRemoteThread, 15000);
+                if (wait == NativeMethods.WAIT_TIMEOUT)
+                {
+                    log("警告: 等待超时（15 秒），DLL 可能在 DllMain 中阻塞；将强制恢复程序运行。");
+                }
+                else if (wait == NativeMethods.WAIT_FAILED)
+                {
+                    log("错误: WaitForSingleObject 失败 - " + NativeMethods.LastErrorText());
+                }
+                else if (NativeMethods.GetExitCodeThread(hRemoteThread, out uint code))
+                {
+                    if (code == 0)
+                        log("警告: LoadLibrary 返回 0，DLL 加载失败（检查依赖 / 位数是否匹配）。");
+                    else
+                    {
+                        ok = true;
+                        log($"注入成功！DLL 已加载（模块句柄 0x{code:X}）。");
+                    }
+                }
+            }
+            finally
+            {
+                if (remoteBuf != IntPtr.Zero)
+                    NativeMethods.VirtualFreeEx(pi.hProcess, remoteBuf, UIntPtr.Zero, NativeMethods.MEM_RELEASE);
+                if (hRemoteThread != IntPtr.Zero)
+                    NativeMethods.CloseHandle(hRemoteThread);
+                NativeMethods.ResumeThread(pi.hThread);
+                log("主线程已恢复，目标程序开始运行。");
+                NativeMethods.CloseHandle(pi.hThread);
+                NativeMethods.CloseHandle(pi.hProcess);
+            }
+
+            log(ok ? "===== 注入流程完成 =====" : "===== 注入流程结束（未完全成功，见上方日志）=====");
+            return ok;
+        }
+    }
+
+    internal static class Program
+    {
+        [STAThread]
+        static void Main(string[] args)
+        {
+            // 无头命令行模式：DllInjector.exe -inject <exe路径> <dll路径> （用于自动化 / 测试）
+            if (args.Length >= 3 && string.Equals(args[0], "-inject", StringComparison.OrdinalIgnoreCase))
+            {
+                int code = 1;
+                try
+                {
+                    string logPath = Path.Combine(AppContext.BaseDirectory, "inject_log.txt");
+                    var lines = new System.Collections.Generic.List<string>();
+                    bool ok = InjectorCore.Run(args[1], args[2], s => { lines.Add(s); Console.WriteLine(s); });
+                    File.WriteAllLines(logPath, lines);
+                    code = ok ? 0 : 1;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine("异常: " + ex.Message);
+                    code = 1;
+                }
+                Environment.Exit(code);
+            }
+
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+            Application.SetHighDpiMode(HighDpiMode.PerMonitorV2);
+            Application.Run(new MainForm());
+        }
+    }
+}

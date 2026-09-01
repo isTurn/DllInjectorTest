@@ -150,6 +150,7 @@ namespace DllInjector
             BackColor = Color.White;
 
             BuildUi();
+            LoadLastSelection();
             Resize += (s, e) => LayoutAll();
             Log($"注入器已启动（当前为 {IntPtr.Size * 8} 位版本）。");
             Log("使用方式：选择要启动的目标 exe 和要注入的 dll，点击\"注入并启动\"。");
@@ -317,6 +318,16 @@ namespace DllInjector
             return dlg.ShowDialog(this) == DialogResult.OK ? dlg.FileName : null;
         }
 
+        /// <summary>载入上次记忆的 exe / dll（仅当文件仍存在时填充输入框）</summary>
+        private void LoadLastSelection()
+        {
+            ConfigStore.Load(out string exe, out string dll);
+            if (!string.IsNullOrEmpty(exe) && File.Exists(exe)) _txtExe.Text = exe;
+            if (!string.IsNullOrEmpty(dll) && File.Exists(dll)) _txtDll.Text = dll;
+            if (_txtExe.Text.Length > 0 || _txtDll.Text.Length > 0)
+                Log("已载入上次选择（配置: " + ConfigStore.ConfigPath + "）。");
+        }
+
         private void Log(string msg)
         {
             if (InvokeRequired) { BeginInvoke(new Action<string>(Log), msg); return; }
@@ -334,6 +345,8 @@ namespace DllInjector
                 MessageBox.Show("请先选择目标 exe 和 dll 文件。", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
+
+            ConfigStore.Save(exe, dll);   // 记忆本次选择，下次启动自动带出
 
             var btn = sender as Button;
             btn.Enabled = false;
@@ -464,6 +477,66 @@ namespace DllInjector
 
             log(ok ? "===== 注入流程完成 =====" : "===== 注入流程结束（未完全成功，见上方日志）=====");
             return ok;
+        }
+    }
+
+    /// <summary>记忆上次选择的 exe / dll 路径：配置文件优先放注入器同目录，目录不可写时回退到 %AppData%</summary>
+    internal static class ConfigStore
+    {
+        private static string _path;
+
+        static ConfigStore()
+        {
+            // 优先使用注入器所在目录（与用户把目标文件放同目录的使用习惯一致）
+            string exeDir = AppContext.BaseDirectory;
+            try
+            {
+                if (Directory.Exists(exeDir))
+                {
+                    string probe = Path.Combine(exeDir, ".dllinjector_wtest");
+                    File.WriteAllText(probe, "t");
+                    File.Delete(probe);
+                    _path = Path.Combine(exeDir, "DllInjector.config");
+                    return;
+                }
+            }
+            catch { }
+
+            // 回退：%AppData%\DllInjector\config.txt
+            string appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+            string dir = Path.Combine(appData, "DllInjector");
+            try { Directory.CreateDirectory(dir); } catch { }
+            _path = Path.Combine(dir, "config.txt");
+        }
+
+        /// <summary>配置文件路径（用于日志展示）</summary>
+        public static string ConfigPath => _path ?? "";
+
+        /// <summary>读取上次记忆的 exe / dll 路径；不存在则返回 null。</summary>
+        public static void Load(out string exe, out string dll)
+        {
+            exe = null; dll = null;
+            try
+            {
+                if (_path == null || !File.Exists(_path)) return;
+                var lines = File.ReadAllLines(_path);
+                if (lines.Length > 0) exe = lines[0].Trim();
+                if (lines.Length > 1) dll = lines[1].Trim();
+                if (string.IsNullOrEmpty(exe)) exe = null;
+                if (string.IsNullOrEmpty(dll)) dll = null;
+            }
+            catch { exe = null; dll = null; }
+        }
+
+        /// <summary>保存本次选择的 exe / dll 路径</summary>
+        public static void Save(string exe, string dll)
+        {
+            try
+            {
+                if (_path == null) return;
+                File.WriteAllLines(_path, new[] { exe ?? "", dll ?? "" }, new UTF8Encoding(false));
+            }
+            catch { }
         }
     }
 

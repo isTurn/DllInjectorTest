@@ -515,7 +515,7 @@ namespace DllInjector
             _lblExe = MakeLabel("目标程序:");
             _txtExe = MakeBox();
             _btnExe = MakeBrowseButton("浏览",
-                () => _txtExe.Text = PickFile("可执行文件 (*.exe)|*.exe|所有文件 (*.*)|*.*", _txtExe.Text));
+                () => _txtExe.Text = PickFile("可执行文件 (*.exe)|*.exe|所有文件 (*.*)|*.*"));
 
             _lblDll = MakeLabel("DLL 文件:");
             _txtDll = MakeBox();
@@ -774,7 +774,7 @@ namespace DllInjector
         }
 
         /// <summary>文件选择：初始目录固定为注入器 EXE 所在文件夹（与 DllInjector 同目录）</summary>
-        private string PickFile(string filter, string currentPath)
+        private string PickFile(string filter)
         {
             using var dlg = new OpenFileDialog { Filter = filter, CheckFileExists = true };
 
@@ -816,9 +816,9 @@ namespace DllInjector
         {
             if (InvokeRequired) { BeginInvoke(new Action<string>(Log), msg); return; }
             _log.AppendText($"[{DateTime.Now:HH:mm:ss}] {msg}{Environment.NewLine}");
-            // 日志最大行数控制（固定 1000 行）
+            // 日志最大行数控制（固定 1000 行）：先把 \r\n 归一到 \n，截断后行尾不再残留 \r
             int max = 1000;
-            string[] lines = _log.Text.Split('\n');
+            string[] lines = _log.Text.Replace("\r\n", "\n").Split('\n');
             if (lines.Length > max)
                 _log.Text = string.Join("\n", lines, lines.Length - max, max);
             _log.SelectionStart = _log.TextLength;
@@ -1438,8 +1438,12 @@ namespace DllInjector
                         if (method != NativeMethods.INJECT_APC && method != NativeMethods.INJECT_RFI && remoteBuf != IntPtr.Zero)
                             NativeMethods.VirtualFreeEx(pi.hProcess, remoteBuf, UIntPtr.Zero, NativeMethods.MEM_RELEASE);
                     }
-                    else if (remoteBuf != IntPtr.Zero)
-                        NativeMethods.VirtualFreeEx(pi.hProcess, remoteBuf, UIntPtr.Zero, NativeMethods.MEM_RELEASE);
+                    else
+                    {
+                        allOk = false;   // 注入失败：标记整体流程未全部成功（修正：原代码漏了该赋值）
+                        if (remoteBuf != IntPtr.Zero)
+                            NativeMethods.VirtualFreeEx(pi.hProcess, remoteBuf, UIntPtr.Zero, NativeMethods.MEM_RELEASE);
+                    }
 
                     if (hRemoteThread != IntPtr.Zero)
                         NativeMethods.CloseHandle(hRemoteThread);
@@ -1771,6 +1775,7 @@ namespace DllInjector
                 if (status != 0 || hRemoteThread == IntPtr.Zero)
                 {
                     log($"错误: NtCreateThreadEx 失败（NTSTATUS=0x{(uint)status:X8}）。");
+                    hRemoteThread = IntPtr.Zero;   // 失败时防止无效句柄被调用方 CloseHandle
                     return false;
                 }
                 log("已通过 NtCreateThreadEx 创建远程线程，等待 DLL 的 DllMain 初始化完成...");
@@ -2206,10 +2211,10 @@ namespace DllInjector
             Flush();
         }
 
-        /// <summary>上次使用的注入方式（0/1/2），默认 0（CreateRemoteThread）</summary>
+        /// <summary>上次使用的注入方式（0=CRT / 1=NTC / 2=APC / 3=RFI），默认 0（CreateRemoteThread）</summary>
         public static int Method
         {
-            get { int m; return int.TryParse(Get("method", "0"), out m) && m >= 0 && m <= 2 ? m : 0; }
+            get { int m; return int.TryParse(Get("method", "0"), out m) && m >= 0 && m <= 3 ? m : 0; }
             set { if (_path == null) return; Reload(); _data["method"] = value.ToString(); Flush(); }
         }
 
@@ -2260,9 +2265,9 @@ namespace DllInjector
             }
 
             // 无头命令行模式（用于自动化 / 测试）：
-            //   -inject     <exe路径> <dll1> [dll2...] [-args <参数>] [-method crt|ntc|apc] [-export <函数>] [-exportarg <参数>]
-            //   -injectpid  <pid1[,pid2...]> <dll1> [dll2...] [-method crt|ntc] [-export <函数>] [-exportarg <参数>]   （多 PID 用逗号分隔 = 批量）
-            //   -injectname <进程名> <dll1> [dll2...] [-method crt|ntc] [-export <函数>] [-exportarg <参数>]            （按进程名批量，支持 * ? 通配）
+            //   -inject     <exe路径> <dll1> [dll2...] [-args <参数>] [-method crt|ntc|apc|rfi] [-export <函数>] [-exportarg <参数>]
+            //   -injectpid  <pid1[,pid2...]> <dll1> [dll2...] [-method crt|ntc|rfi] [-export <函数>] [-exportarg <参数>]   （多 PID 用逗号分隔 = 批量）
+            //   -injectname <进程名> <dll1> [dll2...] [-method crt|ntc|rfi] [-export <函数>] [-exportarg <参数>]            （按进程名批量，支持 * ? 通配）
             //   -eject      <pid> <dll文件名>
             //   -checkdll   <dll1> [dll2...]   （注入前 PE 体检，不执行注入）
             if (args.Length >= 1 &&
@@ -2349,7 +2354,9 @@ namespace DllInjector
                         {
                             try
                             {
-                                if (p.Id > 0 && !string.IsNullOrEmpty(p.ProcessName) && WildcardMatch(pattern, p.ProcessName))
+                                // 进程名可能带 .exe 后缀，两种都匹配
+                                if (p.Id > 0 && !string.IsNullOrEmpty(p.ProcessName) &&
+                                    (WildcardMatch(pattern, p.ProcessName) || WildcardMatch(pattern, p.ProcessName + ".exe")))
                                     pids.Add(p.Id);
                             }
                             catch { }
@@ -2362,7 +2369,12 @@ namespace DllInjector
                         }
                     }
                     else if (string.Equals(args[0], "-eject", StringComparison.OrdinalIgnoreCase) && args.Length >= 3)
-                        ok = InjectorCore.EjectDll(int.Parse(args[1]), args[2], log);
+                    {
+                        if (int.TryParse(args[1], out int ejectPid) && ejectPid > 0)
+                            ok = InjectorCore.EjectDll(ejectPid, args[2], log);
+                        else
+                            log("错误: 无效 PID: " + args[1]);
+                    }
                     else if (string.Equals(args[0], "-checkdll", StringComparison.OrdinalIgnoreCase) && args.Length >= 2)
                     {
                         // -checkdll <dll...>：仅做注入前 PE 体检
@@ -2378,7 +2390,7 @@ namespace DllInjector
                         ok = allValid;
                     }
                     else
-                        Console.WriteLine("用法: DllInjector.exe -inject <exe> <dll...> [-args ...] [-method crt|ntc|apc] [-export <函数>] [-exportarg <参数>] | -injectpid <pid1[,pid2...]> <dll...> [-method crt|ntc] [-export <函数>] [-exportarg <参数>] | -injectname <进程名> <dll...> [-method crt|ntc] [-export <函数>] [-exportarg <参数>] | -eject <pid> <dll名> | -checkdll <dll...>");
+                        Console.WriteLine("用法: DllInjector.exe -inject <exe> <dll...> [-args ...] [-method crt|ntc|apc|rfi] [-export <函数>] [-exportarg <参数>] | -injectpid <pid1[,pid2...]> <dll...> [-method crt|ntc|rfi] [-export <函数>] [-exportarg <参数>] | -injectname <进程名> <dll...> [-method crt|ntc|rfi] [-export <函数>] [-exportarg <参数>] | -eject <pid> <dll名> | -checkdll <dll...>");
 
                     File.WriteAllLines(logPath, lines);
                     code = ok ? 0 : 1;

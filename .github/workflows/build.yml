@@ -1,4 +1,4 @@
-name: build
+﻿name: build
 
 on:
   push:
@@ -26,7 +26,7 @@ jobs:
           dotnet-version: '8.0.x'
 
       - name: Publish self-contained single-file
-        run: dotnet publish DllInjector/DllInjector.csproj -c Release -r ${{ matrix.rid }} --self-contained true -p:PublishSingleFile=true -o out/${{ matrix.rid }}
+        run: dotnet publish DllInjector/DllInjector.csproj -c Release -r ${{ matrix.rid }} --self-contained true -p:PublishSingleFile=true -p:EnableCompressionInSingleFile=true -o out/${{ matrix.rid }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -61,3 +61,4 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
+

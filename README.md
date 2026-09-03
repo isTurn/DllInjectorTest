@@ -11,7 +11,7 @@
 
 ## 界面预览
 
-![DLL Injector 界面](screenshot.png?v=2)
+![DLL Injector 界面](screenshot.png?v=3)
 
 ## 功能特性
 

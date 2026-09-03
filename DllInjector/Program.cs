@@ -345,8 +345,15 @@ namespace DllInjector
                     if (s.WorkingArea.IntersectsWith(rect)) { visible = true; break; }
                 if (visible)
                 {
+                    // 限制窗口完整落在屏幕工作区内：防止异常记忆值（过大/越界）
+                    // 导致窗口部分超出屏幕、内容不可见或无法访问。
+                    var wa = Screen.FromRectangle(rect).WorkingArea;
+                    int w2 = Math.Min(rect.Width, wa.Width);
+                    int h2 = Math.Min(rect.Height, wa.Height);
+                    int x2 = Math.Max(wa.X, Math.Min(rect.X, wa.Right - w2));
+                    int y2 = Math.Max(wa.Y, Math.Min(rect.Y, wa.Bottom - h2));
                     StartPosition = FormStartPosition.Manual;
-                    Bounds = rect;
+                    Bounds = new Rectangle(x2, y2, w2, h2);
                 }
             }
         }

@@ -245,6 +245,7 @@
       <div class="feat"><div class="f-ico">🚀</div><h3>启动时注入</h3><p>以<code>CREATE_SUSPENDED</code>挂起方式启动目标 → 批量注入 DLL → 恢复主线程运行。</p></div>
       <div class="feat"><div class="f-ico">📦</div><h3>多 DLL 批量注入</h3><p>DLL 输入框内用 <code>;</code> 分隔多个 DLL，一次全部注入（GUI / CLI 均支持）。</p></div>
       <div class="feat"><div class="f-ico">🖥️</div><h3>注入到运行中进程</h3><p>刷新枚举进程（名称 + PID），选中后一键注入（OpenProcess + 远程 LoadLibraryW）。</p></div>
+      <div class="feat"><div class="f-ico">🧩</div><h3>注入后调用导出函数</h3><p>注入成功后自动远程调用指定导出函数（如 <code>InstallHook</code> / <code>Init</code>），可传一个字符串参数，并记录函数返回码。</p></div>
       <div class="feat"><div class="f-ico">📤</div><h3>卸载已注入 DLL</h3><p>远程调用 <code>FreeLibrary</code> 卸载，注入 / 卸载闭环；64 位进程基址完整枚举，卸载可靠。</p></div>
       <div class="feat"><div class="f-ico">✅</div><h3>注入结果核验</h3><p>注入后自动在目标进程模块列表核对 DLL 是否真正加载成功（带重试容忍枚举时序）。</p></div>
       <div class="feat"><div class="f-ico">🧬</div><h3>三种注入方式</h3><p><code>CreateRemoteThread</code>（兼容）· <code>NtCreateThreadEx</code>（隐蔽）· <code>QueueUserAPC</code>（仅启动时）。</p></div>
@@ -252,7 +253,7 @@
       <div class="feat"><div class="f-ico">🛡️</div><h3>自动 UAC 提权</h3><p>非管理员启动自动弹出 UAC 提权；取消则按普通权限继续，注入普通进程无需提权。</p></div>
       <div class="feat"><div class="f-ico">💾</div><h3>记忆上次选择</h3><p>自动记住上次的 exe / dll（多 DLL 完整记忆）、注入方式与窗口位置，下次启动直接带出。</p></div>
       <div class="feat"><div class="f-ico">🌐</div><h3>支持中文路径</h3><p>DLL 路径以 UTF-16 写入远程进程，中文目录 / 文件名完全兼容。</p></div>
-      <div class="feat"><div class="f-ico">⚙️</div><h3>命令行模式</h3><p><code>-inject</code> / <code>-injectpid</code> / <code>-eject</code>，支持多 DLL 与注入方式选择，退出码明确区分成败。</p></div>
+      <div class="feat"><div class="f-ico">⚙️</div><h3>命令行模式</h3><p><code>-inject</code> / <code>-injectpid</code> / <code>-eject</code>，支持多 DLL、注入方式与 <code>-export</code> 导出函数调用，退出码明确区分成败。</p></div>
     </div>
   </div>
 </section>
@@ -287,6 +288,7 @@
           <li>「目标程序」选择要启动的 exe</li>
           <li>「DLL 文件」选择要注入的 dll（多个用 <code>;</code> 分隔）</li>
           <li>（可选）填写「启动参数」</li>
+          <li>（可选）填写「导出函数」（注入后要调用的函数名，如 <code>InstallHook</code>）与「调用参数」</li>
           <li>选择「注入方式」→ 点击<b>注入并启动</b></li>
         </ol>
       </div>
@@ -312,8 +314,8 @@
       </div>
     </div>
     <pre><span class="c"># 命令行模式（自动化 / 脚本）</span>
-<span class="k">DllInjector-x64.exe</span> -inject <span class="s">&lt;exe路径&gt;</span> <span class="s">&lt;dll1&gt;</span> [dll2 ...] [-args <span class="s">&lt;参数&gt;</span>] [-method crt|ntc|apc]
-<span class="k">DllInjector-x64.exe</span> -injectpid <span class="s">&lt;pid&gt;</span> <span class="s">&lt;dll1&gt;</span> [dll2 ...] [-method crt|ntc]
+<span class="k">DllInjector-x64.exe</span> -inject <span class="s">&lt;exe路径&gt;</span> <span class="s">&lt;dll1&gt;</span> [dll2 ...] [-args <span class="s">&lt;参数&gt;</span>] [-method crt|ntc|apc] [-export <span class="s">&lt;函数&gt;</span>] [-exportarg <span class="s">&lt;参数&gt;</span>]
+<span class="k">DllInjector-x64.exe</span> -injectpid <span class="s">&lt;pid&gt;</span> <span class="s">&lt;dll1&gt;</span> [dll2 ...] [-method crt|ntc] [-export <span class="s">&lt;函数&gt;</span>] [-exportarg <span class="s">&lt;参数&gt;</span>]
 <span class="k">DllInjector-x64.exe</span> -eject <span class="s">&lt;pid&gt;</span> <span class="s">&lt;dll文件名&gt;</span></pre>
   </div>
 </section>

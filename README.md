@@ -7,7 +7,7 @@
 [![.NET](https://img.shields.io/badge/.NET-8.0-512BD4?style=flat-square&logo=dotnet)](https://dotnet.microsoft.com/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20x64%20%7C%20x86-0078D6?style=flat-square&logo=windows)]()
 
-一个带图形界面的 Windows 工具：选择目标 exe 和要注入的 dll，点击「注入并启动」，工具会以**挂起方式启动目标程序 → 批量注入 DLL → 恢复运行**；也可以**向运行中的进程直接注入**，或**卸载已注入的 DLL**。支持 **x64 / x86** 双架构、**多 DLL 批量注入**、**启动参数透传**、**三种注入方式**与**注入结果自动核验**。
+一个带图形界面的 Windows 工具：选择目标 exe 和要注入的 dll，点击「注入并启动」，工具会以**挂起方式启动目标程序 → 批量注入 DLL → 恢复运行**；也可以**向运行中的进程直接注入**，或**卸载已注入的 DLL**。支持 **x64 / x86** 双架构、**多 DLL 批量注入**、**启动参数透传**、**三种注入方式**、**注入后调用 DLL 导出函数**与**注入结果自动核验**。
 
 ## 界面预览
 
@@ -19,6 +19,7 @@
 - **启动时注入**：以挂起方式启动目标程序 → 批量注入 DLL → 恢复运行
 - **多 DLL 批量注入**：DLL 输入框内用 `;` 分隔多个 DLL，一次性全部注入（GUI / CLI 均支持）
 - **启动参数透传**：启动目标程序时可附加命令行参数（GUI「启动参数」输入框 / CLI `-args`）
+- **注入后调用 DLL 导出函数**：注入成功后自动远程调用指定导出函数（如 `InstallHook` / `Init`），可传入一个字符串参数；「启动时注入」与「注入到运行中进程」均支持（GUI「导出函数」「调用参数」输入框 / CLI `-export` / `-exportarg`）
 - **注入方式可选**：`CreateRemoteThread`（兼容性最好）、`NtCreateThreadEx`（底层、隐蔽性较好）、`QueueUserAPC`（仅启动时注入，隐蔽性最好）
 - **注入到运行中进程**：点击「刷新」枚举当前进程（名称 + PID），选中后一键注入（OpenProcess + 远程 LoadLibraryW）
 - **卸载已注入 DLL**：从目标进程远程调用 FreeLibrary，实现注入 / 卸载闭环
@@ -55,8 +56,9 @@
 2. 「目标程序」→「浏览...」选择要启动的 exe（也可直接把文件拖进输入框）；
 3. 「DLL 文件」→「浏览...」选择要注入的 dll，**多个 DLL 用 `;` 分隔**（或一次多选）；
 4. （可选）在「启动参数」输入框填写附加给目标程序的命令行参数；
-5. 在「注入方式」下拉框选择注入方式（默认 `CreateRemoteThread`）；
-6. 点击「注入并启动」，下方日志实时显示每一步结果，注入完成后自动核验。
+5. （可选）在「导出函数」输入框填写注入成功后要调用的 DLL 导出函数名（如 `InstallHook`），在「调用参数」填写传给该函数的一个字符串参数（可留空 = 传 NULL）；
+6. 在「注入方式」下拉框选择注入方式（默认 `CreateRemoteThread`）；
+7. 点击「注入并启动」，下方日志实时显示每一步结果，注入完成后自动核验。
 
 **方式二：注入到运行中进程 / 卸载**
 
@@ -70,13 +72,15 @@
 ### 命令行模式（自动化 / 脚本）
 
 ```
-DllInjector-x64.exe -inject <exe路径> <dll1> [dll2 ...] [-args <参数>] [-method crt|ntc|apc]
-DllInjector-x64.exe -injectpid <pid> <dll1> [dll2 ...] [-method crt|ntc]
+DllInjector-x64.exe -inject <exe路径> <dll1> [dll2 ...] [-args <参数>] [-method crt|ntc|apc] [-export <函数>] [-exportarg <参数>]
+DllInjector-x64.exe -injectpid <pid> <dll1> [dll2 ...] [-method crt|ntc] [-export <函数>] [-exportarg <参数>]
 DllInjector-x64.exe -eject <pid> <dll文件名>
 ```
 
 - `-args`：附加给目标程序的命令行参数（可含空格）
 - `-method`：注入方式，`crt`（默认，CreateRemoteThread）/ `ntc`（NtCreateThreadEx）/ `apc`（QueueUserAPC，仅启动时）
+- `-export`：注入成功后要调用的 DLL 导出函数名（可空）
+- `-exportarg`：传给该导出函数的一个字符串参数（UTF-16，可空）
 - 退出码：`0` = 成功，`1` = 失败
 - 详细日志写入同目录下 `inject_log.txt`
 
@@ -136,6 +140,34 @@ CreateRemoteThread(LoadLibraryW)            CreateRemoteThread(FreeLibrary)
 
 > 说明：64 位进程中模块句柄是 64 位值，而远程线程退出码只有 32 位，直接把退出码当句柄传给 `FreeLibrary` 会导致卸载失败；本工具改为在注入器侧枚举目标进程模块取得完整基址，因此 x64 / x86 卸载均可靠。
 
+### 注入后调用 DLL 导出函数
+
+```
+（注入完成，DLL 已加载，目标进程正常运行）
+      ▼
+PeHelper.GetExportRva(dllPath, funcName)
+      │  本地解析 DLL 导出表，得到导出函数 RVA（PE 解析，无需目标进程配合）
+      ▼
+枚举目标进程模块 → 模块基址
+      │  Process.Modules 取得该 DLL 的完整（64 位）基址
+      ▼
+目标地址 = 模块基址 + 导出 RVA
+      │  规避 64 位句柄截断，得到真实函数入口
+      ▼
+（可选）VirtualAllocEx + WriteProcessMemory
+      │  把「调用参数」以 UTF-16 写入目标进程，指针作为唯一参数
+      ▼
+CreateRemoteThread(导出函数地址, 参数指针)
+      │  远程线程执行导出函数
+      ▼
+WaitForSingleObject(15s) → GetExitCodeThread
+      │  同步等待完成，读取函数返回码（记录到日志）
+      ▼
+  调用完成
+```
+
+> 导出函数建议签名：`DWORD __stdcall MyFunc(LPVOID arg)`（x86）或 `unsigned __int64 MyFunc(void* arg)`（x64）。传入的 `arg` 指向目标进程内的一段 UTF-16 字符串（未填参数时为 `NULL`）。返回码即线程退出码，`0` 通常表示失败或无返回值。该功能会在注入流程完成后自动执行，每个成功注入的 DLL 都会尝试调用一次。
+
 ## 从源码构建
 
 需要 [.NET 8 SDK](https://dotnet.microsoft.com/)。
@@ -181,6 +213,7 @@ DllInjectorTest/
 
 - **位数必须一致**：DLL 必须与目标程序同为 32 位或 64 位，否则会拒绝注入；
 - **仅支持原生 DLL**：需为含 `DllMain` 的 C/C++ 编译产物，托管 .NET DLL 无法以此方式执行代码；
+- **导出函数调用约定**：被调用的导出函数应接受**一个指针参数**（传字符串时指向目标进程内 UTF-16 文本，未填参数时为 `NULL`）；函数若阻塞超过 15 秒会被判定超时；QueueUserAPC 为异步加载，调用导出函数时 DLL 可能尚未加载完成，建议使用 CRT/NTC 方式；
 - **QueueUserAPC 的局限**：仅适用于启动时注入，且目标主线程需处于可告警等待（SleepEx / GetMessage 循环），否则不会执行（核验会提示）；
 - **UAC 提权**：图形界面非管理员启动时自动请求管理员权限；若不希望每次弹 UAC，可取消后按普通权限使用（普通进程注入无需提权）；
 - **杀毒软件可能告警**：`CreateRemoteThread` 注入是常见注入手法，部分杀软会报毒；

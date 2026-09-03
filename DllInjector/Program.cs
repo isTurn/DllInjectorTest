@@ -156,6 +156,109 @@ namespace DllInjector
             }
             catch { return 0; }
         }
+
+        /// <summary>读取 PE 导出表，返回指定导出函数的 RVA（相对模块基址）；未找到或解析失败返回 -1。</summary>
+        public static long GetExportRva(string dllPath, string funcName)
+        {
+            try
+            {
+                using var fs = new FileStream(dllPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                using var br = new BinaryReader(fs);
+                if (br.ReadUInt16() != 0x5A4D) return -1;           // "MZ"
+                fs.Seek(0x3C, SeekOrigin.Begin);
+                int peOffset = br.ReadInt32();
+                fs.Seek(peOffset, SeekOrigin.Begin);
+                if (br.ReadUInt32() != 0x00004550) return -1;       // "PE\0\0"
+                br.ReadUInt16();                                    // Machine
+                ushort numberOfSections = br.ReadUInt16();
+                br.ReadUInt32();                                    // TimeDateStamp
+                br.ReadUInt32();                                    // PointerToSymbolTable
+                br.ReadUInt32();                                    // NumberOfSymbols
+                ushort sizeOfOptionalHeader = br.ReadUInt16();
+                br.ReadUInt16();                                    // Characteristics
+
+                long optStart = fs.Position;
+                ushort magic = br.ReadUInt16();                     // 0x10B PE32 / 0x20B PE32+
+                // DataDirectory 在 PE32 的 OptionalHeader 偏移 96 处，PE32+ 偏移 112 处
+                int dataDirOffset = magic == 0x20B ? 112 : 96;
+                fs.Seek(optStart + dataDirOffset, SeekOrigin.Begin);
+                uint exportRva = br.ReadUInt32();                   // 导出表 RVA
+                br.ReadUInt32();                                    // 导出表 Size
+                if (exportRva == 0) return -1;
+
+                // 读取节表，构建 RVA -> 文件偏移 映射
+                long sectionStart = optStart + sizeOfOptionalHeader;
+                var sections = new System.Collections.Generic.List<(uint va, uint rawPtr, uint rawSize)>();
+                fs.Seek(sectionStart, SeekOrigin.Begin);
+                for (int i = 0; i < numberOfSections; i++)
+                {
+                    br.ReadBytes(8);                                // Name
+                    br.ReadUInt32();                                // VirtualSize
+                    uint va = br.ReadUInt32();                      // VirtualAddress
+                    uint rawSize = br.ReadUInt32();                 // SizeOfRawData
+                    uint rawPtr = br.ReadUInt32();                  // PointerToRawData
+                    br.ReadBytes(16);                               // 其余字段
+                    sections.Add((va, rawPtr, rawSize));
+                }
+
+                long RvaToOffset(uint rva)
+                {
+                    foreach (var s in sections)
+                        if (rva >= s.va && rva < s.va + s.rawSize)
+                            return s.rawPtr + (rva - s.va);
+                    return -1;
+                }
+
+                long exportOff = RvaToOffset(exportRva);
+                if (exportOff < 0) return -1;
+                fs.Seek(exportOff, SeekOrigin.Begin);
+                br.ReadUInt32();                                    // Characteristics
+                br.ReadUInt32();                                    // TimeDateStamp
+                br.ReadUInt16(); br.ReadUInt16();                   // Major/MinorVersion
+                br.ReadUInt32();                                    // Name
+                br.ReadUInt32();                                    // Base
+                br.ReadUInt32();                                    // NumberOfFunctions
+                uint numberOfNames = br.ReadUInt32();
+                uint addressOfFunctions = br.ReadUInt32();          // EAT
+                uint addressOfNames = br.ReadUInt32();              // ENT
+                uint addressOfNameOrdinals = br.ReadUInt32();       // EOT
+
+                long namesOff = RvaToOffset(addressOfNames);
+                long ordsOff = RvaToOffset(addressOfNameOrdinals);
+                long funcsOff = RvaToOffset(addressOfFunctions);
+                if (namesOff < 0 || ordsOff < 0 || funcsOff < 0) return -1;
+
+                for (uint i = 0; i < numberOfNames; i++)
+                {
+                    fs.Seek(namesOff + i * 4, SeekOrigin.Begin);
+                    long nameOff = RvaToOffset(br.ReadUInt32());
+                    if (nameOff < 0) continue;
+                    fs.Seek(nameOff, SeekOrigin.Begin);
+                    if (ReadAsciiZ(br) == funcName)
+                    {
+                        fs.Seek(ordsOff + i * 2, SeekOrigin.Begin);
+                        ushort ordinal = br.ReadUInt16();
+                        fs.Seek(funcsOff + ordinal * 4, SeekOrigin.Begin);
+                        return br.ReadUInt32();                     // 导出函数 RVA
+                    }
+                }
+                return -1;
+            }
+            catch { return -1; }
+        }
+
+        /// <summary>读取以 \0 结尾的 ASCII 字符串</summary>
+        private static string ReadAsciiZ(BinaryReader br)
+        {
+            var sb = new StringBuilder();
+            while (true)
+            {
+                byte b = br.ReadByte();
+                if (b == 0) break;
+                sb.Append((char)b);
+            }
+            return sb.ToString();
+        }
     }
 
     public class MainForm : Form
@@ -170,6 +273,10 @@ namespace DllInjector
         private ComboBox _cboProc;
         private Label _lblArgs;
         private TextBox _txtArgs;
+        private Label _lblExport;
+        private TextBox _txtExport;
+        private Label _lblExportArg;
+        private TextBox _txtExportArg;
         private Label _lblMethod;
         private ComboBox _cboMethod;
         private Button _btnRefresh;
@@ -192,8 +299,8 @@ namespace DllInjector
             Font = new Font("Microsoft YaHei UI", 9F);
             // 关闭框架自动缩放（.NET 8 下对代码构建的窗体不会按 DPI 缩放），改为手动精确缩放
             AutoScaleMode = AutoScaleMode.None;
-            ClientSize = new Size(720, 640);
-            MinimumSize = new Size(620, 600);
+            ClientSize = new Size(720, 700);
+            MinimumSize = new Size(620, 660);
             StartPosition = FormStartPosition.CenterScreen;
 
             BuildUi();
@@ -259,7 +366,7 @@ namespace DllInjector
             if (Math.Abs(_scale - 1f) > 0.01f)
             {
                 SuspendLayout();
-                ClientSize = new Size(Scale(720), Scale(640));
+                ClientSize = new Size(Scale(720), Scale(700));
                 ResumeLayout(true);
             }
             LayoutAll();
@@ -298,6 +405,11 @@ namespace DllInjector
 
             _lblArgs = MakeLabel("启动参数:");
             _txtArgs = MakeBox();
+
+            _lblExport = MakeLabel("导出函数:");
+            _txtExport = MakeBox();
+            _lblExportArg = MakeLabel("调用参数:");
+            _txtExportArg = MakeBox();
 
             _lblMethod = MakeLabel("注入方式:");
             _cboMethod = new ComboBox
@@ -356,7 +468,7 @@ namespace DllInjector
             };
 
             Controls.AddRange(new Control[] { _lblExe, _txtExe, _btnExe, _lblDll, _txtDll, _btnDll,
-                _lblArgs, _txtArgs, _btnInject, _tip,
+                _lblArgs, _txtArgs, _lblExport, _txtExport, _lblExportArg, _txtExportArg, _btnInject, _tip,
                 _lblProc, _cboProc, _btnRefresh, _btnInjectProc, _btnEject, _lblMethod, _cboMethod,
                 _lblLog, _log });
         }
@@ -395,13 +507,25 @@ namespace DllInjector
                 _txtArgs.Size = new Size(ClientSize.Width - padL - labelW - padL, boxH);
                 y += rowH + Scale(4);
 
-                // 第 4 行：注入并启动 + 提示
+                // 第 4 行：导出函数（可空，注入后调用）
+                _lblExport.Location = new Point(padL, y + Scale(6));
+                _txtExport.Location = new Point(labelW, y);
+                _txtExport.Size = new Size(ClientSize.Width - padL - labelW - padL, boxH);
+                y += rowH + Scale(4);
+
+                // 第 5 行：调用参数（可空，传给导出函数）
+                _lblExportArg.Location = new Point(padL, y + Scale(6));
+                _txtExportArg.Location = new Point(labelW, y);
+                _txtExportArg.Size = new Size(ClientSize.Width - padL - labelW - padL, boxH);
+                y += rowH + Scale(4);
+
+                // 第 6 行：注入并启动 + 提示
                 _btnInject.Location = new Point(labelW, y);
                 _btnInject.Size = new Size(Scale(150), btnH);
                 _tip.Location = new Point(labelW + Scale(160), y + Scale(7));
                 y += rowH + Scale(8);
 
-                // 第 5 行：运行中进程（下拉框 + 刷新）
+                // 第 7 行：运行中进程（下拉框 + 刷新）
                 _lblProc.Location = new Point(padL, y + Scale(6));
                 int refreshW = Scale(70);
                 _cboProc.Location = new Point(labelW, y);
@@ -410,14 +534,14 @@ namespace DllInjector
                 _btnRefresh.Size = new Size(refreshW, boxH);
                 y += rowH;
 
-                // 第 6 行：注入到进程 / 卸载 DLL
+                // 第 8 行：注入到进程 / 卸载 DLL
                 _btnInjectProc.Location = new Point(labelW, y);
                 _btnInjectProc.Size = new Size(Scale(150), btnH);
                 _btnEject.Location = new Point(labelW + Scale(160), y);
                 _btnEject.Size = new Size(Scale(150), btnH);
                 y += rowH + Scale(6);
 
-                // 第 7 行：注入方式（下拉框）
+                // 第 9 行：注入方式（下拉框）
                 _lblMethod.Location = new Point(padL, y + Scale(6));
                 _cboMethod.Location = new Point(labelW, y);
                 _cboMethod.Size = new Size(ClientSize.Width - padL - labelW - padL, boxH);
@@ -551,6 +675,8 @@ namespace DllInjector
             string exe = _txtExe.Text.Trim().Trim('"');
             string[] dlls = InjectorCore.SplitDlls(_txtDll.Text);
             string args = _txtArgs.Text.Trim();
+            string exportFunc = _txtExport.Text.Trim();
+            string exportArg = _txtExportArg.Text.Trim();
             int method = _cboMethod.SelectedIndex;
             ConfigStore.Method = method;   // 记忆注入方式
             if (string.IsNullOrEmpty(exe) || dlls.Length == 0)
@@ -565,7 +691,7 @@ namespace DllInjector
             btn.Enabled = false;
             try
             {
-                await Task.Run(() => InjectorCore.Run(exe, dlls, args, method, Log));
+                await Task.Run(() => InjectorCore.Run(exe, dlls, args, method, exportFunc, exportArg, Log));
             }
             catch (Exception ex)
             {
@@ -625,13 +751,15 @@ namespace DllInjector
                 MessageBox.Show("请先选择要注入的 dll 文件。", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
+            string exportFunc = _txtExport.Text.Trim();
+            string exportArg = _txtExportArg.Text.Trim();
             int method = _cboMethod.SelectedIndex;
             ConfigStore.Method = method;   // 记忆注入方式
             var btn = sender as Button;
             btn.Enabled = false;
             try
             {
-                await Task.Run(() => InjectorCore.InjectToProcess(pid, dlls, method, Log));
+                await Task.Run(() => InjectorCore.InjectToProcess(pid, dlls, method, exportFunc, exportArg, Log));
             }
             catch (Exception ex)
             {
@@ -694,8 +822,8 @@ namespace DllInjector
     /// <summary>注入核心逻辑（GUI 与命令行模式共用）</summary>
     internal static class InjectorCore
     {
-        /// <summary>核心注入流程：挂起启动 -> 逐个注入 DLL -> 恢复主线程 -> 注入结果核验</summary>
-        public static bool Run(string exePath, string[] dllPaths, string args, int method, Action<string> log)
+        /// <summary>核心注入流程：挂起启动 -> 逐个注入 DLL -> 恢复主线程 -> 调用导出函数 -> 注入结果核验</summary>
+        public static bool Run(string exePath, string[] dllPaths, string args, int method, string exportFunc, string exportArg, Action<string> log)
         {
             log("================ 开始注入 ================");
             if (!File.Exists(exePath)) { log("错误: 目标程序不存在: " + exePath); return false; }
@@ -760,8 +888,18 @@ namespace DllInjector
                 NativeMethods.ResumeThread(pi.hThread);
                 log("主线程已恢复，目标程序开始运行。");
                 NativeMethods.CloseHandle(pi.hThread);
-                NativeMethods.CloseHandle(pi.hProcess);
             }
+
+            // 注入后调用 DLL 导出函数（目标进程已运行、模块齐全）
+            if (!string.IsNullOrEmpty(exportFunc) && injected.Count > 0)
+            {
+                if (method == NativeMethods.INJECT_APC)
+                    log("提示: QueueUserAPC 为异步加载，DLL 可能尚未加载完成，导出函数调用可能失败。");
+                foreach (var dll in injected)
+                    CallExport(pi.hProcess, pi.dwProcessId, dll, exportFunc, exportArg, log);
+            }
+
+            NativeMethods.CloseHandle(pi.hProcess);
 
             // 注入结果核验（目标进程已运行，模块列表齐全）
             if (injected.Count > 0)
@@ -778,8 +916,8 @@ namespace DllInjector
             return allOk;
         }
 
-        /// <summary>向已运行的进程注入 DLL（OpenProcess + 远程 LoadLibraryW，支持多 DLL）</summary>
-        public static bool InjectToProcess(int pid, string[] dllPaths, int method, Action<string> log)
+        /// <summary>向已运行的进程注入 DLL（OpenProcess + 远程 LoadLibraryW，支持多 DLL 与导出函数调用）</summary>
+        public static bool InjectToProcess(int pid, string[] dllPaths, int method, string exportFunc, string exportArg, Action<string> log)
         {
             log("================ 注入到运行中进程 ================");
             if (pid <= 0) { log("错误: 无效 PID: " + pid); return false; }
@@ -832,6 +970,11 @@ namespace DllInjector
                     if (hThread != IntPtr.Zero)
                         NativeMethods.CloseHandle(hThread);
                 }
+
+                // 注入后调用 DLL 导出函数
+                if (!string.IsNullOrEmpty(exportFunc) && injected.Count > 0)
+                    foreach (var dll in injected)
+                        CallExport(hProcess, pid, dll, exportFunc, exportArg, log);
 
                 if (injected.Count > 0)
                 {
@@ -1079,6 +1222,98 @@ namespace DllInjector
             return false;
         }
 
+        /// <summary>注入后远程调用 DLL 的导出函数（模块基址 + RVA 计算地址，规避 64 位句柄/地址截断）。</summary>
+        /// <param name="callArg">可选参数：以 UTF-16 字符串写入目标进程内存，作为导出函数唯一指针参数；为空则传 NULL。</param>
+        private static bool CallExport(IntPtr hProcess, int pid, string dllPath, string funcName, string callArg, Action<string> log)
+        {
+            log("----- 调用导出函数: " + funcName + " -----");
+            long rva = PeHelper.GetExportRva(dllPath, funcName);
+            if (rva < 0)
+            {
+                log("错误: 未在 " + Path.GetFileName(dllPath) + " 中找到导出函数 " + funcName);
+                return false;
+            }
+
+            // 枚举目标进程模块，取得完整（64 位）模块基址（LoadLibrary 返回句柄会被截断）
+            string moduleName = Path.GetFileName(dllPath);
+            IntPtr moduleBase = IntPtr.Zero;
+            for (int attempt = 0; attempt < 3 && moduleBase == IntPtr.Zero; attempt++)
+            {
+                try
+                {
+                    using var proc = System.Diagnostics.Process.GetProcessById(pid);
+                    foreach (System.Diagnostics.ProcessModule m in proc.Modules)
+                    {
+                        try
+                        {
+                            if (string.Equals(Path.GetFileName(m.FileName), moduleName, StringComparison.OrdinalIgnoreCase))
+                            { moduleBase = m.BaseAddress; break; }
+                        }
+                        catch { }
+                    }
+                }
+                catch (Exception ex) { log("错误: 枚举目标进程模块失败 - " + ex.Message); return false; }
+                if (moduleBase == IntPtr.Zero) System.Threading.Thread.Sleep(200);
+            }
+            if (moduleBase == IntPtr.Zero)
+            {
+                log("错误: 未在目标进程（PID=" + pid + "）中找到已加载的模块 " + moduleName);
+                return false;
+            }
+            long targetAddr = moduleBase.ToInt64() + rva;
+            log($"模块基址 0x{moduleBase.ToInt64():X} + 导出 RVA 0x{rva:X} = 0x{targetAddr:X}");
+
+            // 可选参数内存（UTF-16）
+            IntPtr argBuf = IntPtr.Zero;
+            if (!string.IsNullOrEmpty(callArg))
+            {
+                byte[] bytes = Encoding.Unicode.GetBytes(callArg);
+                argBuf = NativeMethods.VirtualAllocEx(hProcess, IntPtr.Zero, (UIntPtr)(bytes.Length + 2),
+                    NativeMethods.MEM_COMMIT | NativeMethods.MEM_RESERVE, NativeMethods.PAGE_READWRITE);
+                if (argBuf == IntPtr.Zero)
+                {
+                    log("错误: 在目标进程分配参数内存失败 - " + NativeMethods.LastErrorText());
+                    return false;
+                }
+                if (!NativeMethods.WriteProcessMemory(hProcess, argBuf, bytes, (UIntPtr)bytes.Length, out _))
+                {
+                    log("错误: 写入参数失败 - " + NativeMethods.LastErrorText());
+                    NativeMethods.VirtualFreeEx(hProcess, argBuf, UIntPtr.Zero, NativeMethods.MEM_RELEASE);
+                    return false;
+                }
+                log("参数已写入目标进程（UTF-16）：" + callArg);
+            }
+
+            IntPtr hThread = NativeMethods.CreateRemoteThread(hProcess, IntPtr.Zero, UIntPtr.Zero,
+                new IntPtr(targetAddr), argBuf, 0, out _);
+            if (hThread == IntPtr.Zero)
+            {
+                log("错误: 创建调用线程失败 - " + NativeMethods.LastErrorText());
+                if (argBuf != IntPtr.Zero) NativeMethods.VirtualFreeEx(hProcess, argBuf, UIntPtr.Zero, NativeMethods.MEM_RELEASE);
+                return false;
+            }
+            try
+            {
+                if (NativeMethods.WaitForSingleObject(hThread, 15000) != 0)
+                {
+                    log("警告: 等待导出函数执行超时（15 秒），函数可能阻塞。");
+                    return false;
+                }
+                if (!NativeMethods.GetExitCodeThread(hThread, out uint ret))
+                {
+                    log("警告: 读取导出函数返回码失败 - " + NativeMethods.LastErrorText());
+                    return false;
+                }
+                log($"导出函数 {funcName} 调用完成（返回 {ret}，0 通常表示失败或无返回值）。");
+            }
+            finally
+            {
+                NativeMethods.CloseHandle(hThread);
+                if (argBuf != IntPtr.Zero) NativeMethods.VirtualFreeEx(hProcess, argBuf, UIntPtr.Zero, NativeMethods.MEM_RELEASE);
+            }
+            return true;
+        }
+
         /// <summary>解析 DLL 输入内容为路径列表（支持 ; | 换行 分隔，自动去引号去空白）</summary>
         public static string[] SplitDlls(string text)
         {
@@ -1233,8 +1468,8 @@ namespace DllInjector
             }
 
             // 无头命令行模式（用于自动化 / 测试）：
-            //   -inject     <exe路径> <dll1> [dll2...] [-args <参数>] [-method crt|ntc|apc]
-            //   -injectpid  <pid> <dll1> [dll2...] [-method crt|ntc]
+            //   -inject     <exe路径> <dll1> [dll2...] [-args <参数>] [-method crt|ntc|apc] [-export <函数>] [-exportarg <参数>]
+            //   -injectpid  <pid> <dll1> [dll2...] [-method crt|ntc] [-export <函数>] [-exportarg <参数>]
             //   -eject      <pid> <dll文件名>
             if (args.Length >= 1 &&
                 (string.Equals(args[0], "-inject", StringComparison.OrdinalIgnoreCase) ||
@@ -1251,10 +1486,10 @@ namespace DllInjector
                     bool ok = false;
                     if (string.Equals(args[0], "-inject", StringComparison.OrdinalIgnoreCase) && args.Length >= 3)
                     {
-                        // -inject <exe> <dll...> [-args ...] [-method ...]
+                        // -inject <exe> <dll...> [-args ...] [-method ...] [-export ...] [-exportarg ...]
                         string exe = args[1];
                         var dlls = new System.Collections.Generic.List<string>();
-                        string cmdArgs = "";
+                        string cmdArgs = "", exportFunc = "", exportArg = "";
                         int method = NativeMethods.INJECT_CRT;
                         bool inArgs = false;
                         for (int i = 2; i < args.Length; i++)
@@ -1262,29 +1497,38 @@ namespace DllInjector
                             if (string.Equals(args[i], "-args", StringComparison.OrdinalIgnoreCase)) { inArgs = true; continue; }
                             if (string.Equals(args[i], "-method", StringComparison.OrdinalIgnoreCase))
                             { inArgs = false; if (i + 1 < args.Length) method = ParseMethod(args[++i]); continue; }
+                            if (string.Equals(args[i], "-export", StringComparison.OrdinalIgnoreCase))
+                            { inArgs = false; if (i + 1 < args.Length) exportFunc = args[++i]; continue; }
+                            if (string.Equals(args[i], "-exportarg", StringComparison.OrdinalIgnoreCase))
+                            { inArgs = false; if (i + 1 < args.Length) exportArg = args[++i]; continue; }
                             if (inArgs) cmdArgs = (cmdArgs.Length > 0 ? cmdArgs + " " : "") + args[i];
                             else dlls.Add(args[i]);
                         }
-                        ok = InjectorCore.Run(exe, dlls.ToArray(), cmdArgs, method, log);
+                        ok = InjectorCore.Run(exe, dlls.ToArray(), cmdArgs, method, exportFunc, exportArg, log);
                     }
                     else if (string.Equals(args[0], "-injectpid", StringComparison.OrdinalIgnoreCase) && args.Length >= 3)
                     {
-                        // -injectpid <pid> <dll...> [-method ...]
+                        // -injectpid <pid> <dll...> [-method ...] [-export ...] [-exportarg ...]
                         int pid = int.Parse(args[1]);
                         var dlls = new System.Collections.Generic.List<string>();
                         int method = NativeMethods.INJECT_CRT;
+                        string exportFunc = "", exportArg = "";
                         for (int i = 2; i < args.Length; i++)
                         {
                             if (string.Equals(args[i], "-method", StringComparison.OrdinalIgnoreCase))
                             { if (i + 1 < args.Length) method = ParseMethod(args[++i]); continue; }
+                            if (string.Equals(args[i], "-export", StringComparison.OrdinalIgnoreCase))
+                            { if (i + 1 < args.Length) exportFunc = args[++i]; continue; }
+                            if (string.Equals(args[i], "-exportarg", StringComparison.OrdinalIgnoreCase))
+                            { if (i + 1 < args.Length) exportArg = args[++i]; continue; }
                             dlls.Add(args[i]);
                         }
-                        ok = InjectorCore.InjectToProcess(pid, dlls.ToArray(), method, log);
+                        ok = InjectorCore.InjectToProcess(pid, dlls.ToArray(), method, exportFunc, exportArg, log);
                     }
                     else if (string.Equals(args[0], "-eject", StringComparison.OrdinalIgnoreCase) && args.Length >= 3)
                         ok = InjectorCore.EjectDll(int.Parse(args[1]), args[2], log);
                     else
-                        Console.WriteLine("用法: DllInjector.exe -inject <exe> <dll...> [-args ...] [-method crt|ntc|apc] | -injectpid <pid> <dll...> [-method crt|ntc] | -eject <pid> <dll名>");
+                        Console.WriteLine("用法: DllInjector.exe -inject <exe> <dll...> [-args ...] [-method crt|ntc|apc] [-export <函数>] [-exportarg <参数>] | -injectpid <pid> <dll...> [-method crt|ntc] [-export <函数>] [-exportarg <参数>] | -eject <pid> <dll名>");
 
                     File.WriteAllLines(logPath, lines);
                     code = ok ? 0 : 1;

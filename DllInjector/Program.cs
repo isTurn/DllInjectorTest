@@ -22,6 +22,17 @@ namespace DllInjector
         public const uint WAIT_TIMEOUT      = 0x00000102;
         public const uint WAIT_FAILED       = 0xFFFFFFFF;
 
+        // 进程访问权限
+        public const uint PROCESS_CREATE_THREAD     = 0x0002;
+        public const uint PROCESS_VM_OPERATION      = 0x0008;
+        public const uint PROCESS_VM_READ           = 0x0010;
+        public const uint PROCESS_VM_WRITE          = 0x0020;
+        public const uint PROCESS_QUERY_INFORMATION = 0x0400;
+
+        /// <summary>注入 / 卸载所需的最小权限组合</summary>
+        public const uint PROCESS_ACCESS_FOR_INJECT =
+            PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION;
+
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
         public struct STARTUPINFO
         {
@@ -88,6 +99,12 @@ namespace DllInjector
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern uint WaitForSingleObject(IntPtr hHandle, uint dwMilliseconds);
 
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, int dwProcessId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool IsWow64Process(IntPtr hProcess, out bool Wow64Process);
+
         public static string LastErrorText()
         {
             int code = Marshal.GetLastWin32Error();
@@ -127,6 +144,11 @@ namespace DllInjector
         private Button _btnExe;
         private Button _btnDll;
         private Button _btnInject;
+        private Label _lblProc;
+        private ComboBox _cboProc;
+        private Button _btnRefresh;
+        private Button _btnInjectProc;
+        private Button _btnEject;
         private TextBox _log;
 
         // 96 DPI 逻辑布局基准值
@@ -140,12 +162,12 @@ namespace DllInjector
 
         public MainForm()
         {
-            Text = "DLL 注入器 - 启动时注入";
+            Text = "DLL 注入器";
             Font = new Font("Microsoft YaHei UI", 9F);
             // 关闭框架自动缩放（.NET 8 下对代码构建的窗体不会按 DPI 缩放），改为手动精确缩放
             AutoScaleMode = AutoScaleMode.None;
-            ClientSize = new Size(720, 440);
-            MinimumSize = new Size(620, 400);
+            ClientSize = new Size(720, 520);
+            MinimumSize = new Size(620, 480);
             StartPosition = FormStartPosition.CenterScreen;
             BackColor = Color.White;
 
@@ -153,8 +175,9 @@ namespace DllInjector
             LoadLastSelection();
             Resize += (s, e) => LayoutAll();
             Log($"注入器已启动（当前为 {IntPtr.Size * 8} 位版本）。");
-            Log("使用方式：选择要启动的目标 exe 和要注入的 dll，点击\"注入并启动\"。");
-            Log("提示：DLL 必须与目标程序同为 32 位或 64 位；DLL 需为原生 DLL（含 DllMain）。");
+            Log("使用方式①：选择目标 exe 和 dll，点击\"注入并启动\"（启动时注入）。");
+            Log("使用方式②：在下方选择运行中的进程，点击\"注入到进程\"或\"卸载 DLL\"。");
+            Log("提示：注入其它进程可能需要管理员权限；位数需一致；DLL 需为原生 DLL。");
         }
 
         protected override void OnLoad(EventArgs e)
@@ -178,7 +201,7 @@ namespace DllInjector
             if (Math.Abs(_scale - 1f) > 0.01f)
             {
                 SuspendLayout();
-                ClientSize = new Size(Scale(720), Scale(440));
+                ClientSize = new Size(Scale(720), Scale(520));
                 ResumeLayout(true);
             }
             LayoutAll();
@@ -215,6 +238,35 @@ namespace DllInjector
                 ForeColor = Color.Gray
             };
 
+            _lblProc = new Label { Text = "运行中进程:", AutoSize = true };
+            _cboProc = new ComboBox
+            {
+                DropDownStyle = ComboBoxStyle.DropDownList,
+                FlatStyle = FlatStyle.Flat
+            };
+            _cboProc.Items.Add("（点击\"刷新\"加载进程列表）");
+            _btnRefresh = MakeBrowseButton("刷新", () => BtnRefreshProc_Click(null, EventArgs.Empty));
+
+            _btnInjectProc = new Button
+            {
+                Text = "注入到进程",
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.FromArgb(22, 119, 255),
+                ForeColor = Color.White,
+                Cursor = Cursors.Hand
+            };
+            _btnInjectProc.Click += BtnInjectProc_Click;
+
+            _btnEject = new Button
+            {
+                Text = "卸载 DLL",
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.FromArgb(120, 120, 128),
+                ForeColor = Color.White,
+                Cursor = Cursors.Hand
+            };
+            _btnEject.Click += BtnEject_Click;
+
             _lblLog = new Label { Text = "运行日志:", AutoSize = true };
 
             _log = new TextBox
@@ -228,7 +280,8 @@ namespace DllInjector
                 BorderStyle = BorderStyle.FixedSingle
             };
 
-            Controls.AddRange(new Control[] { _lblExe, _txtExe, _btnExe, _lblDll, _txtDll, _btnDll, _btnInject, _tip, _lblLog, _log });
+            Controls.AddRange(new Control[] { _lblExe, _txtExe, _btnExe, _lblDll, _txtDll, _btnDll, _btnInject, _tip,
+                _lblProc, _cboProc, _btnRefresh, _btnInjectProc, _btnEject, _lblLog, _log });
         }
 
         /// <summary>统一布局：以 96 DPI 逻辑坐标为准，按当前缩放系数与窗口尺寸摆放所有控件</summary>
@@ -263,6 +316,22 @@ namespace DllInjector
                 _btnInject.Location = new Point(labelW, y);
                 _btnInject.Size = new Size(Scale(150), btnH);
                 _tip.Location = new Point(labelW + Scale(160), y + Scale(7));
+                y += rowH + Scale(10);
+
+                // 第 4 行：运行中进程（下拉框 + 刷新）
+                _lblProc.Location = new Point(padL, y + Scale(6));
+                int refreshW = Scale(70);
+                _cboProc.Location = new Point(labelW, y);
+                _cboProc.Size = new Size(ClientSize.Width - padL - labelW - gap - refreshW - padL, boxH);
+                _btnRefresh.Location = new Point(ClientSize.Width - padL - refreshW, y);
+                _btnRefresh.Size = new Size(refreshW, boxH);
+                y += rowH;
+
+                // 第 5 行：注入到进程 / 卸载 DLL
+                _btnInjectProc.Location = new Point(labelW, y);
+                _btnInjectProc.Size = new Size(Scale(150), btnH);
+                _btnEject.Location = new Point(labelW + Scale(160), y);
+                _btnEject.Size = new Size(Scale(150), btnH);
                 y += rowH + Scale(8);
 
                 // 日志区
@@ -363,6 +432,117 @@ namespace DllInjector
                 btn.Enabled = true;
             }
         }
+
+        /// <summary>刷新运行中进程列表（异步，避免卡 UI）</summary>
+        private async void BtnRefreshProc_Click(object sender, EventArgs e)
+        {
+            _btnRefresh.Enabled = false;
+            _cboProc.Items.Clear();
+            _cboProc.Items.Add("正在加载进程列表...");
+            try
+            {
+                var items = await Task.Run(() =>
+                {
+                    var list = new System.Collections.Generic.List<ProcItem>();
+                    foreach (var p in System.Diagnostics.Process.GetProcesses())
+                    {
+                        try
+                        {
+                            if (p.Id > 0 && !string.IsNullOrEmpty(p.ProcessName))
+                                list.Add(new ProcItem { Pid = p.Id, Name = $"{p.ProcessName} [PID {p.Id}]" });
+                        }
+                        catch { }
+                    }
+                    list.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
+                    return list;
+                });
+
+                _cboProc.Items.Clear();
+                foreach (var item in items) _cboProc.Items.Add(item);
+                Log($"进程列表已刷新（{items.Count} 个进程）。");
+            }
+            catch (Exception ex)
+            {
+                Log("刷新进程列表失败: " + ex.Message);
+            }
+            finally
+            {
+                _btnRefresh.Enabled = true;
+            }
+        }
+
+        /// <summary>向选中的运行中进程注入 DLL</summary>
+        private async void BtnInjectProc_Click(object sender, EventArgs e)
+        {
+            if (!TryGetSelectedPid(out int pid)) return;
+            string dll = _txtDll.Text.Trim().Trim('"');
+            if (string.IsNullOrEmpty(dll))
+            {
+                MessageBox.Show("请先选择要注入的 dll 文件。", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            var btn = sender as Button;
+            btn.Enabled = false;
+            try
+            {
+                await Task.Run(() => InjectorCore.InjectToProcess(pid, dll, Log));
+            }
+            catch (Exception ex)
+            {
+                Log("发生异常: " + ex.Message);
+            }
+            finally
+            {
+                btn.Enabled = true;
+            }
+        }
+
+        /// <summary>从选中的运行中进程卸载 DLL（使用 DLL 输入框中的文件名）</summary>
+        private async void BtnEject_Click(object sender, EventArgs e)
+        {
+            if (!TryGetSelectedPid(out int pid)) return;
+            string dll = _txtDll.Text.Trim().Trim('"');
+            if (string.IsNullOrEmpty(dll))
+            {
+                MessageBox.Show("请先选择要卸载的 dll 文件（或输入模块名）。", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            var btn = sender as Button;
+            btn.Enabled = false;
+            try
+            {
+                await Task.Run(() => InjectorCore.EjectDll(pid, dll, Log));
+            }
+            catch (Exception ex)
+            {
+                Log("发生异常: " + ex.Message);
+            }
+            finally
+            {
+                btn.Enabled = true;
+            }
+        }
+
+        /// <summary>从进程下拉框取出 PID；未选择时提示并返回 false</summary>
+        private bool TryGetSelectedPid(out int pid)
+        {
+            pid = -1;
+            if (_cboProc.SelectedItem is ProcItem item && item.Pid > 0)
+            {
+                pid = item.Pid;
+                return true;
+            }
+            MessageBox.Show("请先点击\"刷新\"并选择一个运行中的进程。", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return false;
+        }
+
+        /// <summary>进程下拉框条目：显示名称 + 真实 PID</summary>
+        private sealed class ProcItem
+        {
+            public int Pid;
+            public string Name;
+            public override string ToString() => Name;
+        }
     }
 
     /// <summary>注入核心逻辑（GUI 与命令行模式共用）</summary>
@@ -407,61 +587,7 @@ namespace DllInjector
             IntPtr hRemoteThread = IntPtr.Zero;
             try
             {
-                // 使用 LoadLibraryW，支持中文等非 ASCII 路径
-                byte[] dllPathBytes = Encoding.Unicode.GetBytes(dllPath);
-                remoteBuf = NativeMethods.VirtualAllocEx(pi.hProcess, IntPtr.Zero,
-                    (UIntPtr)(dllPathBytes.Length + 2),
-                    NativeMethods.MEM_COMMIT | NativeMethods.MEM_RESERVE, NativeMethods.PAGE_READWRITE);
-                if (remoteBuf == IntPtr.Zero)
-                {
-                    log("错误: 在目标进程分配内存失败 - " + NativeMethods.LastErrorText());
-                    return false;
-                }
-
-                if (!NativeMethods.WriteProcessMemory(pi.hProcess, remoteBuf, dllPathBytes,
-                        (UIntPtr)dllPathBytes.Length, out _))
-                {
-                    log("错误: 写入 DLL 路径失败 - " + NativeMethods.LastErrorText());
-                    return false;
-                }
-                log("DLL 路径已写入目标进程内存。");
-
-                IntPtr kernel32 = NativeMethods.GetModuleHandle("kernel32.dll");
-                IntPtr loadLibraryW = NativeMethods.GetProcAddress(kernel32, "LoadLibraryW");
-                if (loadLibraryW == IntPtr.Zero)
-                {
-                    log("错误: 获取 LoadLibraryW 地址失败 - " + NativeMethods.LastErrorText());
-                    return false;
-                }
-
-                hRemoteThread = NativeMethods.CreateRemoteThread(pi.hProcess, IntPtr.Zero, UIntPtr.Zero,
-                    loadLibraryW, remoteBuf, 0, out _);
-                if (hRemoteThread == IntPtr.Zero)
-                {
-                    log("错误: 创建远程线程失败 - " + NativeMethods.LastErrorText());
-                    return false;
-                }
-                log("已创建远程线程，等待 DLL 的 DllMain 初始化完成...");
-
-                uint wait = NativeMethods.WaitForSingleObject(hRemoteThread, 15000);
-                if (wait == NativeMethods.WAIT_TIMEOUT)
-                {
-                    log("警告: 等待超时（15 秒），DLL 可能在 DllMain 中阻塞；将强制恢复程序运行。");
-                }
-                else if (wait == NativeMethods.WAIT_FAILED)
-                {
-                    log("错误: WaitForSingleObject 失败 - " + NativeMethods.LastErrorText());
-                }
-                else if (NativeMethods.GetExitCodeThread(hRemoteThread, out uint code))
-                {
-                    if (code == 0)
-                        log("警告: LoadLibrary 返回 0，DLL 加载失败（检查依赖 / 位数是否匹配）。");
-                    else
-                    {
-                        ok = true;
-                        log($"注入成功！DLL 已加载（模块句柄 0x{code:X}）。");
-                    }
-                }
+                ok = LoadLibraryIntoProcess(pi.hProcess, dllPath, log, out remoteBuf, out hRemoteThread);
             }
             finally
             {
@@ -477,6 +603,213 @@ namespace DllInjector
 
             log(ok ? "===== 注入流程完成 =====" : "===== 注入流程结束（未完全成功，见上方日志）=====");
             return ok;
+        }
+
+        /// <summary>向已运行的进程注入 DLL（OpenProcess + 远程 LoadLibraryW）</summary>
+        public static bool InjectToProcess(int pid, string dllPath, Action<string> log)
+        {
+            log("================ 注入到运行中进程 ================");
+            if (pid <= 0) { log("错误: 无效 PID: " + pid); return false; }
+            if (!File.Exists(dllPath)) { log("错误: DLL 不存在: " + dllPath); return false; }
+
+            int toolBits = IntPtr.Size * 8;
+            IntPtr hProcess = NativeMethods.OpenProcess(NativeMethods.PROCESS_ACCESS_FOR_INJECT, false, pid);
+            if (hProcess == IntPtr.Zero)
+            {
+                log($"错误: 无法打开进程 PID={pid} - {NativeMethods.LastErrorText()}（可能需要管理员权限）");
+                return false;
+            }
+            try
+            {
+                // 运行中进程用 IsWow64Process 判断位数
+                bool isWow64 = false;
+                int targetBits = toolBits;
+                if (NativeMethods.IsWow64Process(hProcess, out isWow64))
+                    targetBits = isWow64 ? 32 : 64;
+
+                log($"目标进程 PID={pid}（{targetBits} 位）| 注入器: {toolBits} 位");
+                if (targetBits != toolBits)
+                {
+                    log($"错误: 位数不匹配，无法注入。请使用与目标进程同位数（{targetBits} 位）的注入器版本。");
+                    return false;
+                }
+
+                IntPtr remoteBuf, hThread;
+                bool ok = LoadLibraryIntoProcess(hProcess, dllPath, log, out remoteBuf, out hThread);
+                if (remoteBuf != IntPtr.Zero)
+                    NativeMethods.VirtualFreeEx(hProcess, remoteBuf, UIntPtr.Zero, NativeMethods.MEM_RELEASE);
+                if (hThread != IntPtr.Zero)
+                    NativeMethods.CloseHandle(hThread);
+                log(ok ? "===== 注入到进程完成 =====" : "===== 注入到进程结束（未成功）=====");
+                return ok;
+            }
+            finally
+            {
+                NativeMethods.CloseHandle(hProcess);
+            }
+        }
+
+        /// <summary>从运行中的进程卸载 DLL（注入器侧枚举模块基址 + 远程 FreeLibrary）</summary>
+        public static bool EjectDll(int pid, string dllNameOrPath, Action<string> log)
+        {
+            log("================ 卸载 DLL ================");
+            if (pid <= 0) { log("错误: 无效 PID"); return false; }
+            string moduleName = Path.GetFileName(dllNameOrPath.Trim().Trim('"'));
+            if (string.IsNullOrEmpty(moduleName)) { log("错误: 未指定要卸载的 DLL 文件名"); return false; }
+
+            int toolBits = IntPtr.Size * 8;
+            IntPtr hProcess = NativeMethods.OpenProcess(NativeMethods.PROCESS_ACCESS_FOR_INJECT, false, pid);
+            if (hProcess == IntPtr.Zero)
+            {
+                log($"错误: 无法打开进程 PID={pid} - {NativeMethods.LastErrorText()}（可能需要管理员权限）");
+                return false;
+            }
+            try
+            {
+                // 位数校验（与注入一致）
+                bool isWow64 = false;
+                int targetBits = toolBits;
+                if (NativeMethods.IsWow64Process(hProcess, out isWow64))
+                    targetBits = isWow64 ? 32 : 64;
+                if (targetBits != toolBits)
+                {
+                    log($"错误: 位数不匹配。请使用与目标进程同位数（{targetBits} 位）的注入器版本。");
+                    return false;
+                }
+
+                // 在注入器侧枚举目标进程模块，取得完整（64 位）模块基址。
+                // 原因：远程线程退出码只有 32 位，64 位进程的模块句柄会被截断导致 FreeLibrary 失败。
+                IntPtr moduleBase = IntPtr.Zero;
+                try
+                {
+                    using var proc = System.Diagnostics.Process.GetProcessById(pid);
+                    foreach (System.Diagnostics.ProcessModule m in proc.Modules)
+                    {
+                        try
+                        {
+                            if (string.Equals(Path.GetFileName(m.FileName), moduleName, StringComparison.OrdinalIgnoreCase))
+                            { moduleBase = m.BaseAddress; break; }
+                        }
+                        catch { }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    log("错误: 枚举目标进程模块失败 - " + ex.Message);
+                    return false;
+                }
+                if (moduleBase == IntPtr.Zero)
+                {
+                    log($"未在目标进程（PID={pid}）中找到模块 {moduleName}，可能尚未注入或已卸载。");
+                    return false;
+                }
+                log($"目标进程中模块 {moduleName} 基址: 0x{moduleBase.ToInt64():X}");
+
+                IntPtr kernel32 = NativeMethods.GetModuleHandle("kernel32.dll");
+                IntPtr freeLibrary = NativeMethods.GetProcAddress(kernel32, "FreeLibrary");
+                if (freeLibrary == IntPtr.Zero)
+                {
+                    log("错误: 获取 FreeLibrary 地址失败。");
+                    return false;
+                }
+
+                // 远程 FreeLibrary(完整基址) 卸载
+                IntPtr hThread = NativeMethods.CreateRemoteThread(hProcess, IntPtr.Zero, UIntPtr.Zero,
+                    freeLibrary, moduleBase, 0, out _);
+                if (hThread == IntPtr.Zero)
+                {
+                    log("错误: 创建远程线程失败 - " + NativeMethods.LastErrorText());
+                    return false;
+                }
+                try
+                {
+                    if (NativeMethods.WaitForSingleObject(hThread, 15000) != 0 ||
+                        !NativeMethods.GetExitCodeThread(hThread, out uint freeResult))
+                    {
+                        log("警告: 等待 FreeLibrary 完成超时或失败。");
+                        return false;
+                    }
+                    log($"FreeLibrary 调用完成（返回 {freeResult}，0 表示卸载失败或仍被引用）。");
+                }
+                finally
+                {
+                    NativeMethods.CloseHandle(hThread);
+                }
+                log("===== 卸载完成 =====");
+                return true;
+            }
+            finally
+            {
+                NativeMethods.CloseHandle(hProcess);
+            }
+        }
+
+        /// <summary>在目标进程内远程调用 LoadLibraryW 加载 DLL。失败时通过 out 返回已分配资源，由调用方负责清理。</summary>
+        private static bool LoadLibraryIntoProcess(IntPtr hProcess, string dllPath, Action<string> log,
+            out IntPtr remoteBuf, out IntPtr hRemoteThread)
+        {
+            remoteBuf = IntPtr.Zero;
+            hRemoteThread = IntPtr.Zero;
+
+            // 使用 LoadLibraryW，支持中文等非 ASCII 路径
+            byte[] dllPathBytes = Encoding.Unicode.GetBytes(dllPath);
+            remoteBuf = NativeMethods.VirtualAllocEx(hProcess, IntPtr.Zero,
+                (UIntPtr)(dllPathBytes.Length + 2),
+                NativeMethods.MEM_COMMIT | NativeMethods.MEM_RESERVE, NativeMethods.PAGE_READWRITE);
+            if (remoteBuf == IntPtr.Zero)
+            {
+                log("错误: 在目标进程分配内存失败 - " + NativeMethods.LastErrorText());
+                return false;
+            }
+
+            if (!NativeMethods.WriteProcessMemory(hProcess, remoteBuf, dllPathBytes,
+                    (UIntPtr)dllPathBytes.Length, out _))
+            {
+                log("错误: 写入 DLL 路径失败 - " + NativeMethods.LastErrorText());
+                return false;
+            }
+            log("DLL 路径已写入目标进程内存。");
+
+            IntPtr kernel32 = NativeMethods.GetModuleHandle("kernel32.dll");
+            IntPtr loadLibraryW = NativeMethods.GetProcAddress(kernel32, "LoadLibraryW");
+            if (loadLibraryW == IntPtr.Zero)
+            {
+                log("错误: 获取 LoadLibraryW 地址失败 - " + NativeMethods.LastErrorText());
+                return false;
+            }
+
+            hRemoteThread = NativeMethods.CreateRemoteThread(hProcess, IntPtr.Zero, UIntPtr.Zero,
+                loadLibraryW, remoteBuf, 0, out _);
+            if (hRemoteThread == IntPtr.Zero)
+            {
+                log("错误: 创建远程线程失败 - " + NativeMethods.LastErrorText());
+                return false;
+            }
+            log("已创建远程线程，等待 DLL 的 DllMain 初始化完成...");
+
+            uint wait = NativeMethods.WaitForSingleObject(hRemoteThread, 15000);
+            if (wait == NativeMethods.WAIT_TIMEOUT)
+            {
+                log("警告: 等待超时（15 秒），DLL 可能在 DllMain 中阻塞。");
+                return false;
+            }
+            if (wait == NativeMethods.WAIT_FAILED)
+            {
+                log("错误: WaitForSingleObject 失败 - " + NativeMethods.LastErrorText());
+                return false;
+            }
+            if (!NativeMethods.GetExitCodeThread(hRemoteThread, out uint code))
+            {
+                log("错误: GetExitCodeThread 失败 - " + NativeMethods.LastErrorText());
+                return false;
+            }
+            if (code == 0)
+            {
+                log("警告: LoadLibrary 返回 0，DLL 加载失败（检查依赖 / 位数是否匹配）。");
+                return false;
+            }
+            log($"注入成功！DLL 已加载（模块句柄 0x{code:X}）。");
+            return true;
         }
     }
 
@@ -545,15 +878,32 @@ namespace DllInjector
         [STAThread]
         static void Main(string[] args)
         {
-            // 无头命令行模式：DllInjector.exe -inject <exe路径> <dll路径> （用于自动化 / 测试）
-            if (args.Length >= 3 && string.Equals(args[0], "-inject", StringComparison.OrdinalIgnoreCase))
+            // 无头命令行模式（用于自动化 / 测试）：
+            //   -inject     <exe路径> <dll路径>   启动目标程序并注入
+            //   -injectpid  <pid> <dll路径>       向运行中的进程注入
+            //   -eject      <pid> <dll文件名>     从运行中的进程卸载 DLL
+            if (args.Length >= 1 &&
+                (string.Equals(args[0], "-inject", StringComparison.OrdinalIgnoreCase) ||
+                 string.Equals(args[0], "-injectpid", StringComparison.OrdinalIgnoreCase) ||
+                 string.Equals(args[0], "-eject", StringComparison.OrdinalIgnoreCase)))
             {
                 int code = 1;
                 try
                 {
                     string logPath = Path.Combine(AppContext.BaseDirectory, "inject_log.txt");
                     var lines = new System.Collections.Generic.List<string>();
-                    bool ok = InjectorCore.Run(args[1], args[2], s => { lines.Add(s); Console.WriteLine(s); });
+                    Action<string> log = s => { lines.Add(s); Console.WriteLine(s); };
+
+                    bool ok = false;
+                    if (string.Equals(args[0], "-inject", StringComparison.OrdinalIgnoreCase) && args.Length >= 3)
+                        ok = InjectorCore.Run(args[1], args[2], log);
+                    else if (string.Equals(args[0], "-injectpid", StringComparison.OrdinalIgnoreCase) && args.Length >= 3)
+                        ok = InjectorCore.InjectToProcess(int.Parse(args[1]), args[2], log);
+                    else if (string.Equals(args[0], "-eject", StringComparison.OrdinalIgnoreCase) && args.Length >= 3)
+                        ok = InjectorCore.EjectDll(int.Parse(args[1]), args[2], log);
+                    else
+                        Console.WriteLine("用法: DllInjector.exe -inject <exe> <dll> | -injectpid <pid> <dll> | -eject <pid> <dll名>");
+
                     File.WriteAllLines(logPath, lines);
                     code = ok ? 0 : 1;
                 }

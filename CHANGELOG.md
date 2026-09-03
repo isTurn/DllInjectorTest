@@ -5,6 +5,18 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 新增
+- 注入到运行中进程：枚举当前进程列表（名称 + PID），选中后一键向正在运行的进程注入
+- 卸载已注入 DLL：从运行中进程远程调用 FreeLibrary，形成「注入 / 卸载」闭环
+- 命令行模式新增 `-injectpid <pid> <dll>` 与 `-eject <pid> <dll名>`
+- 图形界面新增「刷新」按钮实时加载进程列表
+
+### 修复
+- 64 位进程卸载失败：远程线程退出码仅 32 位导致模块句柄截断，改为注入器侧枚举目标进程模块取得完整 64 位基址
+- 「刷新」按钮点击时的空引用异常（对象未设置为对象实例）
+
 ## [1.0.0] - 2026-09-01
 
 ### 新增

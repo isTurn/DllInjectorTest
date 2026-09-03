@@ -60,5 +60,16 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
-          generate_release_notes: true
+          # 固定 body：更新时整体覆盖，避免 generate_release_notes 重复追加 "Full Changelog"
+          body: |
+            ## DLL 注入器 v1.0.0
+
+            选择目标 exe 和 dll，以挂起方式启动目标程序，注入 DLL 后恢复运行。
+
+            - DllInjector-x64.exe — 64 位版本（用于 64 位目标程序）
+            - DllInjector-x86.exe — 32 位版本（用于 32 位目标程序）
+
+            自包含单文件，无需安装 .NET 环境即可直接运行。使用方法见仓库 README。
+
+            注入方式：CreateRemoteThread / NtCreateThreadEx / QueueUserAPC / 反射式注入（Reflective）。
 

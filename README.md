@@ -84,6 +84,12 @@ DllInjector-x64.exe -eject <pid> <dll文件名>
 - 退出码：`0` = 成功，`1` = 失败
 - 详细日志写入同目录下 `inject_log.txt`
 
+> 想快速体验「导出函数调用」？直接用仓库 `test/TestHookDll/` 里编译好的示例 DLL（导出 `InstallHook` / `Init`）：
+> ```
+> DllInjector-x64.exe -inject 你的目标.exe test\TestHookDll\TestHookDll-x64.dll -export InstallHook -exportarg "hello"
+> ```
+> 注入成功后，DLL 会在自身同目录生成 `hook_call_log.txt` 记录本次调用与参数，注入器日志会显示返回码。
+
 ## 注入方式对比
 
 | 方式 | 启动时注入 | 运行中进程 | 特点 |
@@ -197,9 +203,13 @@ DllInjectorTest/
 │   ├── Program.cs              # 入口 + 注入核心 + 命令行模式
 │   └── DllInjector.csproj
 ├── test/
-│   ├── TestDll/                # 自测用注入 DLL 源码（DllMain 写标记文件验证，支持前缀宏区分多 DLL）
-│   ├── TestTarget/             # 自测用目标程序源码（支持命令行参数回显）
-│   └── build_test.bat          # 编译测试素材的脚本（MSVC）
+│   ├── TestHookDll/             # 测试「导出函数调用」功能的示例 DLL（源码 + 已编译 x64/x86）
+│   │   ├── TestHookDll.c        #   导出 InstallHook(param) / Init()，调用后写 hook_call_log.txt
+│   │   ├── TestHookDll-x64.dll
+│   │   └── TestHookDll-x86.dll
+│   ├── TestDll/                 # 自测用注入 DLL 源码（DllMain 写标记文件验证，支持前缀宏区分多 DLL）
+│   ├── TestTarget/              # 自测用目标程序源码（支持命令行参数回显）
+│   └── build_test.bat           # 编译测试素材的脚本（MSVC）
 ├── screenshot.png              # 界面截图
 ├── build.bat                   # 一键构建脚本（x64 + x86）
 ├── CHANGELOG.md

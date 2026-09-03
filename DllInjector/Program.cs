@@ -722,7 +722,7 @@ namespace DllInjector
     internal class SettingsForm : Form
     {
         private readonly ComboBox _cboTheme;
-        private readonly NumericUpDown _numTimeout, _numLog;
+        private readonly TextBox _txtTimeout, _txtLog;
 
         public SettingsForm()
         {
@@ -732,27 +732,25 @@ namespace DllInjector
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false; MinimizeBox = false;
             StartPosition = FormStartPosition.CenterParent;
-            ClientSize = new Size(340, 188);
+            ClientSize = new Size(380, 188);
             BackColor = Theme.Back; ForeColor = Theme.Fore;
 
             int y = 16;
             var lblTheme = new Label { Text = "主题:", AutoSize = true, Location = new Point(16, y + 3), ForeColor = Theme.Fore };
-            _cboTheme = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, FlatStyle = FlatStyle.Flat, Location = new Point(130, y), Size = new Size(190, 24), BackColor = Theme.BoxBack, ForeColor = Theme.BoxFore };
+            _cboTheme = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, FlatStyle = FlatStyle.Flat, Location = new Point(130, y), Size = new Size(220, 24), BackColor = Theme.BoxBack, ForeColor = Theme.BoxFore };
             _cboTheme.Items.AddRange(new object[] { "亮色", "暗色" });
             _cboTheme.SelectedIndex = ConfigStore.Theme == "dark" ? 1 : 0;
             Controls.Add(lblTheme); Controls.Add(_cboTheme);
             y += 34;
 
-
-
             var lblTimeout = new Label { Text = "注入超时(秒):", AutoSize = true, Location = new Point(16, y + 3), ForeColor = Theme.Fore };
-            _numTimeout = new NumericUpDown { Location = new Point(130, y), Size = new Size(190, 24), Minimum = 3, Maximum = 120, Value = ConfigStore.TimeoutSec, BackColor = Theme.BoxBack, ForeColor = Theme.BoxFore };
-            Controls.Add(lblTimeout); Controls.Add(_numTimeout);
+            _txtTimeout = new TextBox { Text = ConfigStore.TimeoutSec.ToString(), Location = new Point(130, y), Size = new Size(220, 24), BackColor = Theme.BoxBack, ForeColor = Theme.BoxFore, BorderStyle = BorderStyle.FixedSingle };
+            Controls.Add(lblTimeout); Controls.Add(_txtTimeout);
             y += 34;
 
             var lblLog = new Label { Text = "日志最大行数:", AutoSize = true, Location = new Point(16, y + 3), ForeColor = Theme.Fore };
-            _numLog = new NumericUpDown { Location = new Point(130, y), Size = new Size(190, 24), Minimum = 50, Maximum = 10000, Increment = 100, Value = ConfigStore.MaxLogLines, BackColor = Theme.BoxBack, ForeColor = Theme.BoxFore };
-            Controls.Add(lblLog); Controls.Add(_numLog);
+            _txtLog = new TextBox { Text = ConfigStore.MaxLogLines.ToString(), Location = new Point(130, y), Size = new Size(220, 24), BackColor = Theme.BoxBack, ForeColor = Theme.BoxFore, BorderStyle = BorderStyle.FixedSingle };
+            Controls.Add(lblLog); Controls.Add(_txtLog);
             y += 44;
 
             var btnOk = new Button { Text = "确定", DialogResult = DialogResult.OK, FlatStyle = FlatStyle.Flat, BackColor = Theme.Accent, ForeColor = Color.White, Location = new Point(110, y), Size = new Size(90, 30) };
@@ -766,8 +764,13 @@ namespace DllInjector
             if (DialogResult == DialogResult.OK)
             {
                 ConfigStore.Theme = _cboTheme.SelectedIndex == 1 ? "dark" : "light";
-                ConfigStore.TimeoutSec = (int)_numTimeout.Value;
-                ConfigStore.MaxLogLines = (int)_numLog.Value;
+                // 输入框文本手动解析 + 范围校验，非法输入回退默认值
+                int t = 15;
+                if (int.TryParse(_txtTimeout.Text.Trim(), out int t2) && t2 >= 3 && t2 <= 120) t = t2;
+                int m = 1000;
+                if (int.TryParse(_txtLog.Text.Trim(), out int m2) && m2 >= 50 && m2 <= 10000) m = m2;
+                ConfigStore.TimeoutSec = t;
+                ConfigStore.MaxLogLines = m;
             }
             base.OnFormClosing(e);
         }

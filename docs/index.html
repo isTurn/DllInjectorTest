@@ -245,6 +245,8 @@
       <div class="feat"><div class="f-ico">🚀</div><h3>启动时注入</h3><p>以<code>CREATE_SUSPENDED</code>挂起方式启动目标 → 批量注入 DLL → 恢复主线程运行。</p></div>
       <div class="feat"><div class="f-ico">📦</div><h3>多 DLL 批量注入 + 排序</h3><p>DLL 输入框内用 <code>;</code> 分隔多个 DLL，一次全部注入；「⇅ 排序」对话框支持拖拽 / 上移 / 下移调整注入顺序。</p></div>
       <div class="feat"><div class="f-ico">🖥️</div><h3>注入到运行中进程</h3><p>刷新枚举进程（名称 + PID），选中后一键注入（OpenProcess + 远程 LoadLibraryW）。</p></div>
+      <div class="feat"><div class="f-ico">🎯</div><h3>批量注入（多进程）</h3><p>GUI「批量注入」勾选多个进程一次性注入并汇总结果；CLI 支持 <code>-injectname</code>（通配）与多 PID 逗号分隔，位数不符自动跳过。</p></div>
+      <div class="feat"><div class="f-ico">🩺</div><h3>注入前 PE 体检</h3><p>注入前自动体检每个 DLL（有效 PE / 位数 / 导出表 / 重定位 / 可执行段），不合格直接拦截；可用 <code>-checkdll</code> 单独体检。</p></div>
       <div class="feat"><div class="f-ico">🧩</div><h3>注入后调用导出函数</h3><p>注入成功后自动远程调用指定导出函数（如 <code>InstallHook</code> / <code>Init</code>）；可传单个字符串参数，<b>或用 <code>||</code> 传多个参数</b>（DLL 侧按字符串指针数组接收），并记录函数返回码。</p></div>
       <div class="feat"><div class="f-ico">📤</div><h3>卸载已注入 DLL</h3><p>远程调用 <code>FreeLibrary</code> 卸载，注入 / 卸载闭环；64 位进程基址完整枚举，卸载可靠。</p></div>
       <div class="feat"><div class="f-ico">✅</div><h3>注入结果核验</h3><p>注入后自动在目标进程模块列表核对 DLL 是否真正加载成功（带重试容忍枚举时序）。</p></div>
@@ -315,7 +317,10 @@
     </div>
     <pre><span class="c"># 命令行模式（自动化 / 脚本）</span>
 <span class="k">DllInjector-x64.exe</span> -inject <span class="s">&lt;exe路径&gt;</span> <span class="s">&lt;dll1&gt;</span> [dll2 ...] [-args <span class="s">&lt;参数&gt;</span>] [-method crt|ntc|apc] [-export <span class="s">&lt;函数&gt;</span>] [-exportarg <span class="s">&lt;参数&gt;</span>]
-<span class="k">DllInjector-x64.exe</span> -injectpid <span class="s">&lt;pid&gt;</span> <span class="s">&lt;dll1&gt;</span> [dll2 ...] [-method crt|ntc] [-export <span class="s">&lt;函数&gt;</span>] [-exportarg <span class="s">&lt;参数&gt;</span>]
+<span class="k">DllInjector-x64.exe</span> -injectpid <span class="s">&lt;pid1[,pid2...]&gt;</span> <span class="s">&lt;dll1&gt;</span> [dll2 ...] [-method crt|ntc] [-export <span class="s">&lt;函数&gt;</span>] [-exportarg <span class="s">&lt;参数&gt;</span>]
+<span class="k">DllInjector-x64.exe</span> -injectname <span class="s">&lt;进程名&gt;</span> <span class="s">&lt;dll1&gt;</span> [dll2 ...] [-method crt|ntc] [-export <span class="s">&lt;函数&gt;</span>] [-exportarg <span class="s">&lt;参数&gt;</span>]
+<span class="k">DllInjector-x64.exe</span> -eject <span class="s">&lt;pid&gt;</span> <span class="s">&lt;dll文件名&gt;</span>
+<span class="k">DllInjector-x64.exe</span> -checkdll <span class="s">&lt;dll1&gt;</span> [dll2 ...]
 <span class="k">DllInjector-x64.exe</span> -eject <span class="s">&lt;pid&gt;</span> <span class="s">&lt;dll文件名&gt;</span></pre>
   </div>
 </section>

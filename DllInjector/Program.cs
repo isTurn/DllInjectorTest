@@ -259,6 +259,101 @@ namespace DllInjector
             }
             return sb.ToString();
         }
+
+        /// <summary>PE 体检结果：注入前预检 DLL，提前判断"能否注入"</summary>
+        public sealed class PeInspect
+        {
+            public bool IsValidPe;      // 有效 MZ + PE 签名
+            public int Bitness;         // 32 / 64 / 0（0 = 未知机器类型）
+            public bool IsDll;          // Characteristics 含 IMAGE_FILE_DLL (0x2000)
+            public bool HasExportTable; // 导出表存在（RVA != 0）
+            public int ExportCount;     // 导出函数个数（按 EAT NumberOfFunctions，解析失败为 -1）
+            public bool HasRelocSection;// 有 .reloc 重定位段（x64 必须；x86 可内联）
+            public bool HasExecSection; // 有可执行段（IMAGE_SCN_MEM_EXECUTE 0x20000000）
+            public long FileSize;
+            public string Detail;       // 失败/异常说明
+        }
+
+        /// <summary>对 DLL 做注入前体检：结构完整性、位数、是否为 DLL、导出表、重定位、可执行段</summary>
+        public static PeInspect InspectDll(string path)
+        {
+            var r = new PeInspect { FileSize = -1, ExportCount = -1 };
+            try { r.FileSize = new FileInfo(path).Length; }
+            catch { }
+            try
+            {
+                using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                using var br = new BinaryReader(fs);
+                if (br.ReadUInt16() != 0x5A4D) { r.Detail = "不是有效的 PE 文件（缺少 MZ 头）"; return r; }
+                fs.Seek(0x3C, SeekOrigin.Begin);
+                int peOffset = br.ReadInt32();
+                fs.Seek(peOffset, SeekOrigin.Begin);
+                if (br.ReadUInt32() != 0x00004550) { r.Detail = "缺少 PE 签名"; return r; }
+                ushort machine = br.ReadUInt16();
+                r.Bitness = machine == 0x014C ? 32 : machine == 0x8664 ? 64 : 0;
+                ushort numberOfSections = br.ReadUInt16();
+                br.ReadUInt32(); br.ReadUInt32(); br.ReadUInt32();
+                ushort sizeOfOptionalHeader = br.ReadUInt16();
+                ushort characteristics = br.ReadUInt16();
+                r.IsDll = (characteristics & 0x2000) != 0;   // IMAGE_FILE_DLL
+                if (r.Bitness == 0) { r.Detail = "未知的机器类型"; return r; }
+
+                long optStart = fs.Position;
+                ushort magic = br.ReadUInt16();              // 0x10B PE32 / 0x20B PE32+
+                int dataDirOffset = magic == 0x20B ? 112 : 96;
+                fs.Seek(optStart + dataDirOffset, SeekOrigin.Begin);
+                uint exportRva = br.ReadUInt32();
+                br.ReadUInt32();                             // 导出表 Size
+                r.HasExportTable = exportRva != 0;
+
+                // 节表：重定位段 + 可执行段 + RVA->文件偏移 映射（用于读导出数量）
+                long sectionStart = optStart + sizeOfOptionalHeader;
+                var sections = new System.Collections.Generic.List<(uint va, uint rawPtr, uint rawSize)>();
+                fs.Seek(sectionStart, SeekOrigin.Begin);
+                for (int i = 0; i < numberOfSections; i++)
+                {
+                    byte[] nameBytes = br.ReadBytes(8);
+                    string secName = System.Text.Encoding.ASCII.GetString(nameBytes).TrimEnd('\0');
+                    br.ReadUInt32();                         // VirtualSize
+                    uint va = br.ReadUInt32();
+                    uint rawSize = br.ReadUInt32();
+                    uint rawPtr = br.ReadUInt32();
+                    br.ReadBytes(12);
+                    uint secChars = br.ReadUInt32();
+                    sections.Add((va, rawPtr, rawSize));
+                    if (secName == ".reloc") r.HasRelocSection = true;
+                    if ((secChars & 0x20000000) != 0) r.HasExecSection = true;   // IMAGE_SCN_MEM_EXECUTE
+                }
+
+                long RvaToOffset(uint rva)
+                {
+                    foreach (var s in sections)
+                        if (rva >= s.va && rva < s.va + s.rawSize)
+                            return s.rawPtr + (rva - s.va);
+                    return -1;
+                }
+
+                // 读取导出函数个数（EAT NumberOfFunctions）
+                if (r.HasExportTable)
+                {
+                    long expOff = RvaToOffset(exportRva);
+                    if (expOff >= 0)
+                    {
+                        fs.Seek(expOff + 20, SeekOrigin.Begin);   // Characteristics(4)+TimeDateStamp(4)+Major(2)+Minor(2)+Name(4)+Base(4)=20
+                        r.ExportCount = br.ReadInt32();           // NumberOfFunctions
+                    }
+                }
+
+                r.IsValidPe = true;
+                if (string.IsNullOrEmpty(r.Detail)) r.Detail = "结构完整";
+                return r;
+            }
+            catch (Exception ex)
+            {
+                r.Detail = "解析失败: " + ex.Message;
+                return r;
+            }
+        }
     }
 
     public class MainForm : Form
@@ -283,6 +378,7 @@ namespace DllInjector
         private Button _btnRefresh;
         private Button _btnInjectProc;
         private Button _btnEject;
+        private Button _btnBatch;   // 批量注入按钮（多进程勾选注入）
         private TextBox _log;
 
         // 96 DPI 逻辑布局基准值
@@ -454,6 +550,16 @@ namespace DllInjector
             };
             _btnInjectProc.Click += BtnInjectProc_Click;
 
+            _btnBatch = new Button
+            {
+                Text = "批量注入",
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Theme.Accent,
+                ForeColor = Color.White,
+                Cursor = Cursors.Hand
+            };
+            _btnBatch.Click += async (s, e) => await BtnBatchInject_Click(s, e);
+
             _btnEject = new Button
             {
                 Text = "卸载 DLL",
@@ -479,7 +585,7 @@ namespace DllInjector
 
             Controls.AddRange(new Control[] { _lblExe, _txtExe, _btnExe, _lblDll, _txtDll, _btnDll, _btnSort,
                 _lblArgs, _txtArgs, _lblExport, _txtExport, _lblExportArg, _txtExportArg, _btnInject, _tip,
-                _lblProc, _cboProc, _btnRefresh, _btnInjectProc, _btnEject, _lblMethod, _cboMethod,
+                _lblProc, _cboProc, _btnRefresh, _btnInjectProc, _btnEject, _btnBatch, _lblMethod, _cboMethod,
                 _lblLog, _log });
         }
 
@@ -547,11 +653,14 @@ namespace DllInjector
                 _btnRefresh.Size = new Size(refreshW, boxH);
                 y += rowH;
 
-                // 第 8 行：注入到进程 / 卸载 DLL
+                // 第 8 行：注入到进程 / 批量注入 / 卸载 DLL（三个等宽按钮）
+                int b3w = Scale(145), b3gap = Scale(8);
                 _btnInjectProc.Location = new Point(labelW, y);
-                _btnInjectProc.Size = new Size(Scale(150), btnH);
-                _btnEject.Location = new Point(labelW + Scale(160), y);
-                _btnEject.Size = new Size(Scale(150), btnH);
+                _btnInjectProc.Size = new Size(b3w, btnH);
+                _btnBatch.Location = new Point(labelW + b3w + b3gap, y);
+                _btnBatch.Size = new Size(b3w, btnH);
+                _btnEject.Location = new Point(labelW + 2 * (b3w + b3gap), y);
+                _btnEject.Size = new Size(b3w, btnH);
                 y += rowH + Scale(6);
 
                 // 第 9 行：注入方式（下拉框）
@@ -784,6 +893,45 @@ namespace DllInjector
             }
         }
 
+        /// <summary>批量注入：弹窗勾选多个进程后逐一注入，结果汇总到日志</summary>
+        private async Task BtnBatchInject_Click(object sender, EventArgs e)
+        {
+            string[] dlls = InjectorCore.SplitDlls(_txtDll.Text);
+            if (dlls.Length == 0)
+            {
+                MessageBox.Show("请先选择要注入的 dll 文件。", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            string exportFunc = _txtExport.Text.Trim();
+            string exportArg = _txtExportArg.Text.Trim();
+            int method = _cboMethod.SelectedIndex;
+            ConfigStore.Method = method;
+
+            using var dlg = new BatchInjectDialog(_scale);
+            if (dlg.ShowDialog(this) != DialogResult.OK) return;
+            int[] pids = dlg.SelectedPids;
+            if (pids.Length == 0)
+            {
+                MessageBox.Show("未勾选任何进程。", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            var btn = sender as Button;
+            btn.Enabled = false;
+            try
+            {
+                await Task.Run(() => InjectorCore.BatchInjectProcesses(pids, dlls, method, exportFunc, exportArg, Log));
+            }
+            catch (Exception ex)
+            {
+                Log("发生异常: " + ex.Message);
+            }
+            finally
+            {
+                btn.Enabled = true;
+            }
+        }
+
         /// <summary>从选中的运行中进程卸载 DLL（使用 DLL 输入框中的文件名）</summary>
         private async void BtnEject_Click(object sender, EventArgs e)
         {
@@ -964,11 +1112,190 @@ namespace DllInjector
                 _list.SelectedIndex = ni;
             }
         }
+
+        /// <summary>批量注入对话框：勾选多个进程（支持按名称筛选），确定后批量注入</summary>
+        private sealed class BatchInjectDialog : Form
+        {
+            private sealed class ProcEntry
+            {
+                public int Pid;
+                public string Name;
+                public string Bits;
+                public override string ToString() => $"{Name} [PID {Pid}]（{Bits}）";
+            }
+
+            private readonly CheckedListBox _list;
+            private readonly TextBox _filter;
+            private readonly System.Collections.Generic.List<ProcEntry> _all;
+
+            public int[] SelectedPids
+            {
+                get
+                {
+                    var r = new System.Collections.Generic.List<int>();
+                    foreach (ProcEntry e in _list.CheckedItems) r.Add(e.Pid);
+                    return r.ToArray();
+                }
+            }
+
+            public BatchInjectDialog(float scale)
+            {
+                Text = "批量注入 - 勾选目标进程";
+                FormBorderStyle = FormBorderStyle.FixedDialog;
+                MaximizeBox = false;
+                MinimizeBox = false;
+                StartPosition = FormStartPosition.CenterParent;
+                ShowInTaskbar = false;
+                ClientSize = new Size((int)(500 * scale), (int)(430 * scale));
+                BackColor = Color.FromArgb(45, 45, 48);
+                ForeColor = Color.White;
+                Font = new Font("Microsoft YaHei UI", 9f * scale);
+
+                var hint = new Label
+                {
+                    Text = "勾选要注入的进程（可多选），可按名称筛选；位数不符的进程会自动跳过。",
+                    AutoSize = true,
+                    ForeColor = Color.FromArgb(170, 170, 170),
+                    Location = new Point((int)(12 * scale), (int)(10 * scale))
+                };
+
+                _filter = new TextBox
+                {
+                    Location = new Point((int)(12 * scale), (int)(34 * scale)),
+                    Size = new Size((int)(300 * scale), (int)(26 * scale)),
+                    BackColor = Color.FromArgb(28, 28, 30),
+                    ForeColor = Color.FromArgb(230, 230, 230),
+                    BorderStyle = BorderStyle.FixedSingle
+                };
+                var lblFilter = new Label
+                {
+                    Text = "筛选:",
+                    AutoSize = true,
+                    Location = new Point((int)(318 * scale), (int)(38 * scale)),
+                    ForeColor = Color.FromArgb(170, 170, 170)
+                };
+
+                _list = new CheckedListBox
+                {
+                    Location = new Point((int)(12 * scale), (int)(68 * scale)),
+                    Size = new Size((int)(476 * scale), (int)(290 * scale)),
+                    CheckOnClick = true,
+                    IntegralHeight = false,
+                    BackColor = Color.FromArgb(28, 28, 30),
+                    ForeColor = Color.FromArgb(230, 230, 230),
+                    BorderStyle = BorderStyle.FixedSingle
+                };
+
+                _all = Enumerate();
+                _filter.TextChanged += (s, e) => Fill(_filter.Text);
+
+                var btnOk = MakeBtn("确定");
+                btnOk.BackColor = Theme.Accent;
+                btnOk.DialogResult = DialogResult.OK;
+                var btnCancel = MakeBtn("取消");
+                btnCancel.DialogResult = DialogResult.Cancel;
+
+                int by = (int)(372 * scale);
+                int bw = (int)(80 * scale), bh = (int)(32 * scale), gap = (int)(10 * scale);
+                btnOk.Location = new Point(ClientSize.Width - 2 * bw - gap - (int)(12 * scale), by);
+                btnCancel.Location = new Point(ClientSize.Width - bw - (int)(12 * scale), by);
+                foreach (var b in new Control[] { btnOk, btnCancel }) b.Size = new Size(bw, bh);
+
+                Controls.Add(hint);
+                Controls.Add(_filter);
+                Controls.Add(lblFilter);
+                Controls.Add(_list);
+                Controls.AddRange(new Control[] { btnOk, btnCancel });
+                AcceptButton = btnOk;
+                CancelButton = btnCancel;
+                Fill("");
+            }
+
+            private static Button MakeBtn(string text) => new Button
+            {
+                Text = text,
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.FromArgb(70, 70, 74),
+                ForeColor = Color.White,
+                Cursor = Cursors.Hand
+            };
+
+            private System.Collections.Generic.List<ProcEntry> Enumerate()
+            {
+                var list = new System.Collections.Generic.List<ProcEntry>();
+                foreach (var p in System.Diagnostics.Process.GetProcesses())
+                {
+                    try
+                    {
+                        if (p.Id <= 0) continue;
+                        string bits = "位数未知";
+                        IntPtr h = NativeMethods.OpenProcess(0x1000 /* PROCESS_QUERY_LIMITED_INFORMATION */, false, p.Id);
+                        if (h != IntPtr.Zero)
+                        {
+                            try
+                            {
+                                bool w64 = false;
+                                if (NativeMethods.IsWow64Process(h, out w64)) bits = w64 ? "32 位" : "64 位";
+                            }
+                            catch { }
+                            finally { NativeMethods.CloseHandle(h); }
+                        }
+                        list.Add(new ProcEntry { Pid = p.Id, Name = p.ProcessName, Bits = bits });
+                    }
+                    catch { }
+                }
+                list.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
+                return list;
+            }
+
+            private void Fill(string filter)
+            {
+                _list.Items.Clear();
+                foreach (var e in _all)
+                    if (string.IsNullOrEmpty(filter) || e.Name.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0)
+                        _list.Items.Add(e, false);
+            }
+        }
     }
 
     /// <summary>注入核心逻辑（GUI 与命令行模式共用）</summary>
     internal static class InjectorCore
     {
+        /// <summary>注入前 PE 体检：剔除不可用的 DLL（非 PE / 非 DLL / 位数不符），记录体检结论，返回可通过的 DLL 列表</summary>
+        public static string[] PreflightDlls(string[] dllPaths, int targetBits, Action<string> log)
+        {
+            var ok = new System.Collections.Generic.List<string>();
+            foreach (var dll in dllPaths)
+            {
+                string name = Path.GetFileName(dll);
+                var insp = PeHelper.InspectDll(dll);
+                if (!insp.IsValidPe)
+                {
+                    log("体检失败: " + name + " - " + (string.IsNullOrEmpty(insp.Detail) ? "不是有效的 PE 文件" : insp.Detail));
+                    continue;
+                }
+                if (!insp.IsDll)
+                {
+                    log("体检失败: " + name + " - 不是 DLL（缺少 IMAGE_FILE_DLL 标志）");
+                    continue;
+                }
+                if (insp.Bitness != targetBits)
+                {
+                    log($"体检失败: {name} - 位数不匹配（DLL 为 {insp.Bitness} 位，目标为 {targetBits} 位）");
+                    continue;
+                }
+                var warns = new System.Collections.Generic.List<string>();
+                if (!insp.HasExportTable) warns.Add("无导出表");
+                if (!insp.HasRelocSection) warns.Add("无 .reloc 重定位段");
+                if (insp.FileSize >= 0 && insp.FileSize < 1024) warns.Add("文件异常小");
+                string warn = warns.Count > 0 ? "（提示: " + string.Join("，", warns) + "）" : "";
+                string exp = insp.ExportCount >= 0 ? "导出函数 " + insp.ExportCount + " 个" : "无导出信息";
+                log($"体检通过: {name}（{insp.Bitness} 位, {exp}, 文件 {insp.FileSize} 字节）{warn}");
+                ok.Add(dll);
+            }
+            return ok.ToArray();
+        }
+
         /// <summary>核心注入流程：挂起启动 -> 逐个注入 DLL -> 恢复主线程 -> 调用导出函数 -> 注入结果核验</summary>
         public static bool Run(string exePath, string[] dllPaths, string args, int method, string exportFunc, string exportArg, Action<string> log)
         {
@@ -989,6 +1316,14 @@ namespace DllInjector
             if (targetBits != toolBits)
             {
                 log($"错误: 位数不匹配，无法注入。请使用与目标程序同位数（{targetBits} 位）的注入器版本。");
+                return false;
+            }
+
+            // 注入前 PE 体检：剔除不可用的 DLL
+            dllPaths = PreflightDlls(dllPaths, toolBits, log);
+            if (dllPaths.Length == 0)
+            {
+                log("错误: 所有 DLL 均未通过体检，无法注入。");
                 return false;
             }
 
@@ -1102,6 +1437,14 @@ namespace DllInjector
                     useMethod = NativeMethods.INJECT_CRT;
                 }
 
+                // 注入前 PE 体检：剔除不可用的 DLL
+                dllPaths = PreflightDlls(dllPaths, targetBits, log);
+                if (dllPaths.Length == 0)
+                {
+                    log("错误: 所有 DLL 均未通过体检，无法注入。");
+                    return false;
+                }
+
                 bool allOk = true;
                 var injected = new System.Collections.Generic.List<string>();
                 foreach (var dll in dllPaths)
@@ -1137,6 +1480,24 @@ namespace DllInjector
             {
                 NativeMethods.CloseHandle(hProcess);
             }
+        }
+
+        /// <summary>批量注入：向多个目标进程逐一注入同一组 DLL，最后汇总成功 / 失败结果；至少成功 1 个返回 true</summary>
+        public static bool BatchInjectProcesses(int[] pids, string[] dllPaths, int method, string exportFunc, string exportArg, Action<string> log)
+        {
+            log($"===== 批量注入 {pids.Length} 个进程（DLL {dllPaths.Length} 个）=====");
+            int okN = 0, failN = 0;
+            var failPids = new System.Collections.Generic.List<int>();
+            foreach (var pid in pids)
+            {
+                log($"----- 目标 PID={pid} -----");
+                bool r = InjectToProcess(pid, dllPaths, method, exportFunc, exportArg, log);
+                if (r) okN++;
+                else { failN++; failPids.Add(pid); }
+            }
+            log($"===== 批量注入汇总: 成功 {okN} 个，失败 {failN} 个 =====");
+            if (failN > 0) log("失败 PID: " + string.Join(", ", failPids));
+            return okN > 0;
         }
 
         /// <summary>从运行中的进程卸载 DLL（注入器侧枚举模块基址 + 远程 FreeLibrary）</summary>
@@ -1671,12 +2032,16 @@ namespace DllInjector
 
             // 无头命令行模式（用于自动化 / 测试）：
             //   -inject     <exe路径> <dll1> [dll2...] [-args <参数>] [-method crt|ntc|apc] [-export <函数>] [-exportarg <参数>]
-            //   -injectpid  <pid> <dll1> [dll2...] [-method crt|ntc] [-export <函数>] [-exportarg <参数>]
+            //   -injectpid  <pid1[,pid2...]> <dll1> [dll2...] [-method crt|ntc] [-export <函数>] [-exportarg <参数>]   （多 PID 用逗号分隔 = 批量）
+            //   -injectname <进程名> <dll1> [dll2...] [-method crt|ntc] [-export <函数>] [-exportarg <参数>]            （按进程名批量，支持 * ? 通配）
             //   -eject      <pid> <dll文件名>
+            //   -checkdll   <dll1> [dll2...]   （注入前 PE 体检，不执行注入）
             if (args.Length >= 1 &&
                 (string.Equals(args[0], "-inject", StringComparison.OrdinalIgnoreCase) ||
                  string.Equals(args[0], "-injectpid", StringComparison.OrdinalIgnoreCase) ||
-                 string.Equals(args[0], "-eject", StringComparison.OrdinalIgnoreCase)))
+                 string.Equals(args[0], "-injectname", StringComparison.OrdinalIgnoreCase) ||
+                 string.Equals(args[0], "-eject", StringComparison.OrdinalIgnoreCase) ||
+                 string.Equals(args[0], "-checkdll", StringComparison.OrdinalIgnoreCase)))
             {
                 int code = 1;
                 try
@@ -1710,8 +2075,10 @@ namespace DllInjector
                     }
                     else if (string.Equals(args[0], "-injectpid", StringComparison.OrdinalIgnoreCase) && args.Length >= 3)
                     {
-                        // -injectpid <pid> <dll...> [-method ...] [-export ...] [-exportarg ...]
-                        int pid = int.Parse(args[1]);
+                        // -injectpid <pid1[,pid2...]> <dll...> [-method ...] [-export ...] [-exportarg ...]
+                        var pidList = new System.Collections.Generic.List<int>();
+                        foreach (var pp in args[1].Split(','))
+                            if (int.TryParse(pp.Trim(), out int v) && v > 0) pidList.Add(v);
                         var dlls = new System.Collections.Generic.List<string>();
                         int method = NativeMethods.INJECT_CRT;
                         string exportFunc = "", exportArg = "";
@@ -1725,12 +2092,64 @@ namespace DllInjector
                             { if (i + 1 < args.Length) exportArg = args[++i]; continue; }
                             dlls.Add(args[i]);
                         }
-                        ok = InjectorCore.InjectToProcess(pid, dlls.ToArray(), method, exportFunc, exportArg, log);
+                        if (pidList.Count == 0) { log("错误: 无效 PID: " + args[1]); }
+                        else if (pidList.Count == 1)
+                            ok = InjectorCore.InjectToProcess(pidList[0], dlls.ToArray(), method, exportFunc, exportArg, log);
+                        else
+                            ok = InjectorCore.BatchInjectProcesses(pidList.ToArray(), dlls.ToArray(), method, exportFunc, exportArg, log);
+                    }
+                    else if (string.Equals(args[0], "-injectname", StringComparison.OrdinalIgnoreCase) && args.Length >= 3)
+                    {
+                        // -injectname <进程名> <dll...>：枚举匹配进程名的进程批量注入（支持 * ? 通配，位数不符自动跳过）
+                        string pattern = args[1].Trim();
+                        var dlls = new System.Collections.Generic.List<string>();
+                        int method = NativeMethods.INJECT_CRT;
+                        string exportFunc = "", exportArg = "";
+                        for (int i = 2; i < args.Length; i++)
+                        {
+                            if (string.Equals(args[i], "-method", StringComparison.OrdinalIgnoreCase))
+                            { if (i + 1 < args.Length) method = ParseMethod(args[++i]); continue; }
+                            if (string.Equals(args[i], "-export", StringComparison.OrdinalIgnoreCase))
+                            { if (i + 1 < args.Length) exportFunc = args[++i]; continue; }
+                            if (string.Equals(args[i], "-exportarg", StringComparison.OrdinalIgnoreCase))
+                            { if (i + 1 < args.Length) exportArg = args[++i]; continue; }
+                            dlls.Add(args[i]);
+                        }
+                        var pids = new System.Collections.Generic.List<int>();
+                        foreach (var p in System.Diagnostics.Process.GetProcesses())
+                        {
+                            try
+                            {
+                                if (p.Id > 0 && !string.IsNullOrEmpty(p.ProcessName) && WildcardMatch(pattern, p.ProcessName))
+                                    pids.Add(p.Id);
+                            }
+                            catch { }
+                        }
+                        if (pids.Count == 0) { log("未找到匹配的进程（名称模式: " + pattern + "）。"); }
+                        else
+                        {
+                            log($"按进程名匹配到 {pids.Count} 个进程: {string.Join(", ", pids)}");
+                            ok = InjectorCore.BatchInjectProcesses(pids.ToArray(), dlls.ToArray(), method, exportFunc, exportArg, log);
+                        }
                     }
                     else if (string.Equals(args[0], "-eject", StringComparison.OrdinalIgnoreCase) && args.Length >= 3)
                         ok = InjectorCore.EjectDll(int.Parse(args[1]), args[2], log);
+                    else if (string.Equals(args[0], "-checkdll", StringComparison.OrdinalIgnoreCase) && args.Length >= 2)
+                    {
+                        // -checkdll <dll...>：仅做注入前 PE 体检
+                        bool allValid = true;
+                        for (int i = 1; i < args.Length; i++)
+                        {
+                            string dll = args[i].Trim().Trim('"');
+                            if (!File.Exists(dll)) { log("文件不存在: " + dll); allValid = false; continue; }
+                            var insp = PeHelper.InspectDll(dll);
+                            log($"体检: {Path.GetFileName(dll)} -> 有效PE={insp.IsValidPe}, 位数={insp.Bitness}, DLL标志={insp.IsDll}, 导出表={insp.HasExportTable}（{insp.ExportCount}）, 重定位段={insp.HasRelocSection}, 可执行段={insp.HasExecSection}, 大小={insp.FileSize} 字节 | {insp.Detail}");
+                            if (!insp.IsValidPe || !insp.IsDll) allValid = false;
+                        }
+                        ok = allValid;
+                    }
                     else
-                        Console.WriteLine("用法: DllInjector.exe -inject <exe> <dll...> [-args ...] [-method crt|ntc|apc] [-export <函数>] [-exportarg <参数>] | -injectpid <pid> <dll...> [-method crt|ntc] [-export <函数>] [-exportarg <参数>] | -eject <pid> <dll名>");
+                        Console.WriteLine("用法: DllInjector.exe -inject <exe> <dll...> [-args ...] [-method crt|ntc|apc] [-export <函数>] [-exportarg <参数>] | -injectpid <pid1[,pid2...]> <dll...> [-method crt|ntc] [-export <函数>] [-exportarg <参数>] | -injectname <进程名> <dll...> [-method crt|ntc] [-export <函数>] [-exportarg <参数>] | -eject <pid> <dll名> | -checkdll <dll...>");
 
                     File.WriteAllLines(logPath, lines);
                     code = ok ? 0 : 1;
@@ -1755,6 +2174,18 @@ namespace DllInjector
             if (string.Equals(s, "ntc", StringComparison.OrdinalIgnoreCase)) return NativeMethods.INJECT_NTC;
             if (string.Equals(s, "apc", StringComparison.OrdinalIgnoreCase)) return NativeMethods.INJECT_APC;
             return NativeMethods.INJECT_CRT;
+        }
+
+        /// <summary>进程名通配匹配（支持 * 与 ?，大小写不敏感）</summary>
+        private static bool WildcardMatch(string pattern, string text)
+        {
+            try
+            {
+                string rx = "^" + System.Text.RegularExpressions.Regex.Escape(pattern)
+                    .Replace(@"\*", ".*").Replace(@"\?", ".") + "$";
+                return System.Text.RegularExpressions.Regex.IsMatch(text, rx, System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            }
+            catch { return string.Equals(pattern, text, StringComparison.OrdinalIgnoreCase); }
         }
 
         /// <summary>当前进程是否以管理员身份运行</summary>

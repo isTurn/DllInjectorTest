@@ -1183,10 +1183,10 @@ namespace DllInjector
 
                 var hint = new Label
                 {
-                    Text = "勾选要注入的进程（可多选），可按名称筛选；位数不符的进程会自动跳过。",
+                    Text = "勾选要注入的进程（可多选）；位数不符自动跳过。",
                     AutoSize = true,
                     ForeColor = Color.FromArgb(170, 170, 170),
-                    Location = new Point((int)(12 * scale), (int)(10 * scale))
+                    Location = new Point((int)(12 * scale), (int)(12 * scale))
                 };
 
                 _filter = new TextBox

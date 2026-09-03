@@ -44,7 +44,7 @@ namespace DllInjector
         public const int INJECT_CRT = 0;   // CreateRemoteThread（默认，兼容性最好）
         public const int INJECT_NTC = 1;   // NtCreateThreadEx（底层，隐蔽性较好）
         public const int INJECT_APC = 2;   // QueueUserAPC（仅启动时注入，需挂起主线程）
-        public const int INJECT_RFI = 3;   // 反射式注入（Reflective）：搬运 DLL 原始字节，由 DLL 自带 ReflectiveLoader 自行映射
+        public const int INJECT_RFI = 3;   // 反射式注入（Reflective）：按内存布局展开 DLL 映像并启动 ReflectiveLoader，由 DLL 自行完成 PE 映射
 
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
         public struct STARTUPINFO

@@ -62,6 +62,53 @@ __declspec(dllexport) DWORD WINAPI Init(LPVOID param)
     return 42;
 }
 
+// 导出函数 3：InstallConfig —— 演示"复杂参数（结构体）"用法
+// 注入器只能传一个字符串参数，所以约定用编码字符串表达结构化配置：
+//   格式：key1=value1|key2=value2|key3=value3   （| 分隔多个键值对，= 分隔键和值）
+// 本函数把字符串解析还原成多个字段（等价于填充结构体），逐个写日志。
+// 返回解析出的字段个数（0 = 失败）
+__declspec(dllexport) DWORD WINAPI InstallConfig(LPVOID param)
+{
+    wchar_t buf[2048];
+    if (!param) {
+        AppendLog(L"[InstallConfig] 未提供参数（NULL）\n");
+        return 0;
+    }
+
+    const wchar_t* s = (const wchar_t*)param;
+    swprintf_s(buf, 2048, L"[InstallConfig] 原始参数: \"%s\"\n", s);
+    AppendLog(buf);
+
+    wchar_t copy[1024];
+    wcscpy_s(copy, 1024, s);
+
+    int count = 0;
+    wchar_t* ctx = NULL;
+    wchar_t* pair = wcstok_s(copy, L"|", &ctx);
+    while (pair && count < 16) {
+        wchar_t key[256], val[512];
+        wchar_t* eq = wcschr(pair, L'=');
+        if (eq) {
+            *eq = 0;
+            wcscpy_s(key, 256, pair);
+            wcscpy_s(val, 512, eq + 1);
+        } else {
+            wcscpy_s(key, 256, pair);
+            wcscpy_s(val, 512, L"");
+        }
+        swprintf_s(buf, 2048, L"[InstallConfig]   [%d] %s = \"%s\"\n", count + 1, key, val);
+        AppendLog(buf);
+        count++;
+        pair = wcstok_s(NULL, L"|", &ctx);
+    }
+
+    if (count == 0) {
+        AppendLog(L"[InstallConfig]   (无有效键值对)\n");
+        return 0;
+    }
+    return count;   // 返回解析出的字段个数
+}
+
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 {
     if (fdwReason == DLL_PROCESS_ATTACH)

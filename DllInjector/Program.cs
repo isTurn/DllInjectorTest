@@ -175,7 +175,6 @@ namespace DllInjector
         private Button _btnRefresh;
         private Button _btnInjectProc;
         private Button _btnEject;
-        private Button _btnSettings;
         private TextBox _log;
 
         // 96 DPI 逻辑布局基准值
@@ -196,8 +195,6 @@ namespace DllInjector
             ClientSize = new Size(720, 640);
             MinimumSize = new Size(620, 600);
             StartPosition = FormStartPosition.CenterScreen;
-
-            Theme.Dark = ConfigStore.Theme == "dark";
 
             BuildUi();
             ApplyTheme();
@@ -345,14 +342,6 @@ namespace DllInjector
             };
             _btnEject.Click += BtnEject_Click;
 
-            _btnSettings = new Button
-            {
-                Text = "设置",
-                FlatStyle = FlatStyle.Flat,
-                Cursor = Cursors.Hand
-            };
-            _btnSettings.Click += BtnSettings_Click;
-
             _lblLog = new Label { Text = "运行日志:", AutoSize = true };
 
             _log = new TextBox
@@ -369,7 +358,7 @@ namespace DllInjector
             Controls.AddRange(new Control[] { _lblExe, _txtExe, _btnExe, _lblDll, _txtDll, _btnDll,
                 _lblArgs, _txtArgs, _btnInject, _tip,
                 _lblProc, _cboProc, _btnRefresh, _btnInjectProc, _btnEject, _lblMethod, _cboMethod,
-                _btnSettings, _lblLog, _log });
+                _lblLog, _log });
         }
 
         /// <summary>统一布局：以 96 DPI 逻辑坐标为准，按当前缩放系数与窗口尺寸摆放所有控件</summary>
@@ -434,11 +423,6 @@ namespace DllInjector
                 _cboMethod.Size = new Size(ClientSize.Width - padL - labelW - padL, boxH);
                 y += rowH + Scale(6);
 
-                // 第 8 行：设置按钮
-                _btnSettings.Location = new Point(labelW, y);
-                _btnSettings.Size = new Size(Scale(150), btnH);
-                y += rowH + Scale(6);
-
                 // 日志区
                 _lblLog.Location = new Point(padL, y);
                 y += Scale(22);
@@ -457,10 +441,9 @@ namespace DllInjector
             }
         }
 
-        /// <summary>应用当前主题（亮 / 暗）到窗体与全部控件</summary>
+        /// <summary>应用当前主题（固定暗色）到窗体与全部控件</summary>
         private void ApplyTheme()
         {
-            Theme.Dark = ConfigStore.Theme == "dark";
             BackColor = Theme.Back;
             ForeColor = Theme.Fore;
             ApplyThemeTo(this);
@@ -485,16 +468,6 @@ namespace DllInjector
                 else if (c is ComboBox cb) { cb.BackColor = Theme.BoxBack; cb.ForeColor = Theme.BoxFore; }
                 else if (c is Button b) { if (b != _btnInject && b != _btnInjectProc && b != _btnEject) { b.BackColor = Theme.ButtonBack; b.ForeColor = Theme.Fore; } }
                 if (c.HasChildren) ApplyThemeTo(c);
-            }
-        }
-
-        private void BtnSettings_Click(object sender, EventArgs e)
-        {
-            using var dlg = new SettingsForm();
-            if (dlg.ShowDialog(this) == DialogResult.OK)
-            {
-                ApplyTheme();
-                LayoutAll();
             }
         }
 
@@ -564,8 +537,8 @@ namespace DllInjector
         {
             if (InvokeRequired) { BeginInvoke(new Action<string>(Log), msg); return; }
             _log.AppendText($"[{DateTime.Now:HH:mm:ss}] {msg}{Environment.NewLine}");
-            // 日志最大行数控制（配置可调）
-            int max = ConfigStore.MaxLogLines;
+            // 日志最大行数控制（固定 1000 行）
+            int max = 1000;
             string[] lines = _log.Text.Split('\n');
             if (lines.Length > max)
                 _log.Text = string.Join("\n", lines, lines.Length - max, max);
@@ -715,64 +688,6 @@ namespace DllInjector
             public int Pid;
             public string Name;
             public override string ToString() => Name;
-        }
-    }
-
-    /// <summary>设置对话框：主题 / 语言 / 注入超时 / 日志行数</summary>
-    internal class SettingsForm : Form
-    {
-        private readonly ComboBox _cboTheme;
-        private readonly TextBox _txtTimeout, _txtLog;
-
-        public SettingsForm()
-        {
-            Text = "设置";
-            Font = new Font("Microsoft YaHei UI", 9F);
-            AutoScaleMode = AutoScaleMode.None;
-            FormBorderStyle = FormBorderStyle.FixedDialog;
-            MaximizeBox = false; MinimizeBox = false;
-            StartPosition = FormStartPosition.CenterParent;
-            ClientSize = new Size(380, 188);
-            BackColor = Theme.Back; ForeColor = Theme.Fore;
-
-            int y = 16;
-            var lblTheme = new Label { Text = "主题:", AutoSize = true, Location = new Point(16, y + 3), ForeColor = Theme.Fore };
-            _cboTheme = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, FlatStyle = FlatStyle.Flat, Location = new Point(130, y), Size = new Size(220, 24), BackColor = Theme.BoxBack, ForeColor = Theme.BoxFore };
-            _cboTheme.Items.AddRange(new object[] { "亮色", "暗色" });
-            _cboTheme.SelectedIndex = ConfigStore.Theme == "dark" ? 1 : 0;
-            Controls.Add(lblTheme); Controls.Add(_cboTheme);
-            y += 34;
-
-            var lblTimeout = new Label { Text = "注入超时(秒):", AutoSize = true, Location = new Point(16, y + 3), ForeColor = Theme.Fore };
-            _txtTimeout = new TextBox { Text = ConfigStore.TimeoutSec.ToString(), Location = new Point(130, y), Size = new Size(220, 24), BackColor = Theme.BoxBack, ForeColor = Theme.BoxFore, BorderStyle = BorderStyle.FixedSingle };
-            Controls.Add(lblTimeout); Controls.Add(_txtTimeout);
-            y += 34;
-
-            var lblLog = new Label { Text = "日志最大行数:", AutoSize = true, Location = new Point(16, y + 3), ForeColor = Theme.Fore };
-            _txtLog = new TextBox { Text = ConfigStore.MaxLogLines.ToString(), Location = new Point(130, y), Size = new Size(220, 24), BackColor = Theme.BoxBack, ForeColor = Theme.BoxFore, BorderStyle = BorderStyle.FixedSingle };
-            Controls.Add(lblLog); Controls.Add(_txtLog);
-            y += 44;
-
-            var btnOk = new Button { Text = "确定", DialogResult = DialogResult.OK, FlatStyle = FlatStyle.Flat, BackColor = Theme.Accent, ForeColor = Color.White, Location = new Point(110, y), Size = new Size(90, 30) };
-            var btnCancel = new Button { Text = "取消", DialogResult = DialogResult.Cancel, FlatStyle = FlatStyle.Flat, BackColor = Theme.ButtonBack, ForeColor = Theme.Fore, Location = new Point(210, y), Size = new Size(90, 30) };
-            Controls.Add(btnOk); Controls.Add(btnCancel);
-            AcceptButton = btnOk; CancelButton = btnCancel;
-        }
-
-        protected override void OnFormClosing(FormClosingEventArgs e)
-        {
-            if (DialogResult == DialogResult.OK)
-            {
-                ConfigStore.Theme = _cboTheme.SelectedIndex == 1 ? "dark" : "light";
-                // 输入框文本手动解析 + 范围校验，非法输入回退默认值
-                int t = 15;
-                if (int.TryParse(_txtTimeout.Text.Trim(), out int t2) && t2 >= 3 && t2 <= 120) t = t2;
-                int m = 1000;
-                if (int.TryParse(_txtLog.Text.Trim(), out int m2) && m2 >= 50 && m2 <= 10000) m = m2;
-                ConfigStore.TimeoutSec = t;
-                ConfigStore.MaxLogLines = m;
-            }
-            base.OnFormClosing(e);
         }
     }
 
@@ -1106,10 +1021,10 @@ namespace DllInjector
                 log("已创建远程线程，等待 DLL 的 DllMain 初始化完成...");
             }
 
-            uint wait = NativeMethods.WaitForSingleObject(hRemoteThread, (uint)(ConfigStore.TimeoutSec * 1000));
+            uint wait = NativeMethods.WaitForSingleObject(hRemoteThread, 15000);   // 注入等待超时固定 15 秒
             if (wait == NativeMethods.WAIT_TIMEOUT)
             {
-                log($"警告: 等待超时（{ConfigStore.TimeoutSec} 秒），DLL 可能在 DllMain 中阻塞。");
+                log("警告: 等待超时（15 秒），DLL 可能在 DllMain 中阻塞。");
                 return false;
             }
             if (wait == NativeMethods.WAIT_FAILED)
@@ -1264,22 +1179,6 @@ namespace DllInjector
             Flush();
         }
 
-        public static string Theme { get { var v = Get("theme", "light"); return v; } set { if (_path == null) return; Reload(); _data["theme"] = value; Flush(); } }
-
-        /// <summary>注入等待超时（秒），有效范围 3-120，默认 15</summary>
-        public static int TimeoutSec
-        {
-            get { int t; return int.TryParse(Get("timeout", "15"), out t) && t >= 3 && t <= 120 ? t : 15; }
-            set { if (_path == null) return; Reload(); _data["timeout"] = value.ToString(); Flush(); }
-        }
-
-        /// <summary>日志最大行数，有效范围 50-10000，默认 1000</summary>
-        public static int MaxLogLines
-        {
-            get { int m; return int.TryParse(Get("maxlog", "1000"), out m) && m >= 50 && m <= 10000 ? m : 1000; }
-            set { if (_path == null) return; Reload(); _data["maxlog"] = value.ToString(); Flush(); }
-        }
-
         /// <summary>上次使用的注入方式（0/1/2），默认 0（CreateRemoteThread）</summary>
         public static int Method
         {
@@ -1295,10 +1194,10 @@ namespace DllInjector
         }
     }
 
-    /// <summary>主题色板（亮 / 暗）</summary>
+    /// <summary>主题色板（固定暗色）</summary>
     internal static class Theme
     {
-        public static bool Dark;
+        public static bool Dark = true;
         public static Color Back => Dark ? Color.FromArgb(32, 32, 36) : Color.White;
         public static Color Fore => Dark ? Color.FromArgb(232, 232, 232) : Color.FromArgb(20, 20, 20);
         public static Color BoxBack => Dark ? Color.FromArgb(45, 45, 48) : Color.White;

@@ -109,6 +109,25 @@ __declspec(dllexport) DWORD WINAPI InstallConfig(LPVOID param)
     return count;   // 返回解析出的字段个数
 }
 
+// 导出函数 4：InstallMulti —— 演示"多参数"用法
+// 注入器把调用参数用 "||" 分隔成多个，在目标进程构造 NULL 结尾的字符串指针数组
+//   （LPVOID* args：args[0]..args[n-1] 各指向一个 UTF-16 字符串，args[n] = NULL）。
+// 导出函数直接按数组访问每个参数，返回参数个数。
+// 对应注入器用法：-export InstallMulti -exportarg "张三||2024-01-01||admin"
+__declspec(dllexport) DWORD WINAPI InstallMulti(LPVOID* args)
+{
+    wchar_t buf[2048];
+    AppendLog(L"[InstallMulti] 按数组访问多个参数:\n");
+    int n = 0;
+    while (args && args[n]) {
+        swprintf_s(buf, 2048, L"[InstallMulti]   arg[%d] = \"%s\"\n", n, (const wchar_t*)args[n]);
+        AppendLog(buf);
+        n++;
+    }
+    if (n == 0) AppendLog(L"[InstallMulti]   (无参数)\n");
+    return n;   // 返回参数个数
+}
+
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 {
     if (fdwReason == DLL_PROCESS_ATTACH)

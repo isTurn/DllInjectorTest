@@ -268,6 +268,7 @@ namespace DllInjector
         private TextBox _txtDll;
         private Button _btnExe;
         private Button _btnDll;
+        private Button _btnSort;   // DLL 排序按钮（多 DLL 时调整注入顺序）
         private Button _btnInject;
         private Label _lblProc;
         private ComboBox _cboProc;
@@ -392,6 +393,8 @@ namespace DllInjector
             _txtDll = MakeBox();
             _btnDll = MakeBrowseButton("浏览",
                 () => { string f = PickFiles("DLL 文件 (*.dll)|*.dll|所有文件 (*.*)|*.*"); if (f != null) _txtDll.Text = f; });
+            _btnSort = MakeBrowseButton("⇅ 排序",
+                () => { if (OpenDllSortDialog()) Log("已按新顺序更新 DLL 列表。"); });
 
             _btnInject = new Button
             {
@@ -474,7 +477,7 @@ namespace DllInjector
                 BorderStyle = BorderStyle.FixedSingle
             };
 
-            Controls.AddRange(new Control[] { _lblExe, _txtExe, _btnExe, _lblDll, _txtDll, _btnDll,
+            Controls.AddRange(new Control[] { _lblExe, _txtExe, _btnExe, _lblDll, _txtDll, _btnDll, _btnSort,
                 _lblArgs, _txtArgs, _lblExport, _txtExport, _lblExportArg, _txtExportArg, _btnInject, _tip,
                 _lblProc, _cboProc, _btnRefresh, _btnInjectProc, _btnEject, _lblMethod, _cboMethod,
                 _lblLog, _log });
@@ -500,11 +503,14 @@ namespace DllInjector
                 _btnExe.Size = new Size(browseW, boxH);
                 y += rowH;
 
-                // 第 2 行：DLL 文件
+                // 第 2 行：DLL 文件（输入框 + 排序 + 浏览）
                 _lblDll.Location = new Point(padL, y + Scale(6));
                 _txtDll.Location = new Point(labelW, y);
+                int sortW = Scale(78);
+                _btnSort.Location = new Point(ClientSize.Width - padL - browseW - gap - sortW, y);
+                _btnSort.Size = new Size(sortW, boxH);
                 _btnDll.Location = new Point(ClientSize.Width - padL - browseW, y);
-                _txtDll.Size = new Size(ClientSize.Width - padL - labelW - gap - browseW - padL, boxH);
+                _txtDll.Size = new Size(ClientSize.Width - padL - labelW - gap - sortW - gap - browseW - padL, boxH);
                 _btnDll.Size = new Size(browseW, boxH);
                 y += rowH + Scale(4);
 
@@ -823,6 +829,140 @@ namespace DllInjector
             public int Pid;
             public string Name;
             public override string ToString() => Name;
+        }
+
+        /// <summary>打开 DLL 排序对话框（支持拖拽重排 / 上移 / 下移 / 删除）；确定后回写输入框</summary>
+        private bool OpenDllSortDialog()
+        {
+            var dlls = InjectorCore.SplitDlls(_txtDll.Text);
+            if (dlls.Length == 0)
+            {
+                MessageBox.Show("当前没有可排序的 DLL，请先在「DLL 文件」中填写（多个用 ; 分隔）。",
+                    "提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return false;
+            }
+            using var dlg = new DllSortDialog(dlls, _scale);
+            if (dlg.ShowDialog(this) == DialogResult.OK)
+            {
+                _txtDll.Text = string.Join(";", dlg.Result);
+                return true;
+            }
+            return false;
+        }
+
+        /// <summary>DLL 排序对话框：列表支持鼠标拖拽重排，附 上移 / 下移 / 删除 与 确定 / 取消</summary>
+        private sealed class DllSortDialog : Form
+        {
+            private readonly ListBox _list;
+
+            public string[] Result => _list.Items.Cast<string>().ToArray();
+
+            public DllSortDialog(string[] items, float scale)
+            {
+                Text = "DLL 注入顺序（拖拽调整）";
+                FormBorderStyle = FormBorderStyle.FixedDialog;
+                MaximizeBox = false;
+                MinimizeBox = false;
+                StartPosition = FormStartPosition.CenterParent;
+                ShowInTaskbar = false;
+                ClientSize = new Size((int)(450 * scale), (int)(360 * scale));
+                BackColor = Color.FromArgb(45, 45, 48);
+                ForeColor = Color.White;
+                Font = new Font("Microsoft YaHei UI", 9f * scale);
+
+                _list = new ListBox
+                {
+                    Location = new Point((int)(12 * scale), (int)(12 * scale)),
+                    Size = new Size((int)(426 * scale), (int)(250 * scale)),
+                    AllowDrop = true,
+                    BackColor = Color.FromArgb(28, 28, 30),
+                    ForeColor = Color.FromArgb(230, 230, 230),
+                    BorderStyle = BorderStyle.FixedSingle,
+                    IntegralHeight = false,
+                    DrawMode = DrawMode.OwnerDrawFixed,
+                    ItemHeight = (int)(22 * scale)
+                };
+                _list.Items.AddRange(items);
+                _list.DrawItem += (s, e) =>
+                {
+                    e.DrawBackground();
+                    using var br = new SolidBrush(
+                        (e.State & DrawItemState.Selected) != 0 ? Color.White : Color.FromArgb(230, 230, 230));
+                    e.Graphics.DrawString(
+                        _list.Items[e.Index].ToString(),
+                        e.Font,
+                        br,
+                        e.Bounds.X + 4,
+                        e.Bounds.Y + 2);
+                };
+
+                // 拖拽重排（ListBox 用 MouseDown 发起拖拽）
+                _list.MouseDown += (s, e) =>
+                {
+                    if (e.Button != MouseButtons.Left) return;
+                    int idx = _list.IndexFromPoint(e.Location);
+                    if (idx >= 0) _list.DoDragDrop(_list.Items[idx], DragDropEffects.Move);
+                };
+                _list.DragOver += (s, e) => e.Effect = DragDropEffects.Move;
+                _list.DragDrop += (s, e) =>
+                {
+                    if (!(e.Data.GetData(typeof(string)) is string item)) return;
+                    var pt = _list.PointToClient(new Point(e.X, e.Y));
+                    int idx = _list.IndexFromPoint(pt);
+                    _list.Items.Remove(item);
+                    if (idx < 0 || idx >= _list.Items.Count) _list.Items.Add(item);
+                    else _list.Items.Insert(idx, item);
+                };
+
+                var btnUp = MakeBtn("上移");
+                var btnDown = MakeBtn("下移");
+                var btnDel = MakeBtn("删除");
+                btnUp.Click += (s, e) => MoveSelected(-1);
+                btnDown.Click += (s, e) => MoveSelected(1);
+                btnDel.Click += (s, e) => { if (_list.SelectedIndex >= 0) _list.Items.RemoveAt(_list.SelectedIndex); };
+
+                var btnOk = MakeBtn("确定");
+                btnOk.BackColor = Theme.Accent;
+                btnOk.DialogResult = DialogResult.OK;
+                var btnCancel = MakeBtn("取消");
+                btnCancel.DialogResult = DialogResult.Cancel;
+
+                int by = (int)(272 * scale);
+                int bw = (int)(72 * scale), bh = (int)(32 * scale), gap = (int)(8 * scale);
+                btnUp.Location = new Point((int)(12 * scale), by);
+                btnDown.Location = new Point((int)(12 * scale) + bw + gap, by);
+                btnDel.Location = new Point((int)(12 * scale) + 2 * (bw + gap), by);
+                btnOk.Location = new Point(ClientSize.Width - 2 * bw - gap - (int)(12 * scale), by);
+                btnCancel.Location = new Point(ClientSize.Width - bw - (int)(12 * scale), by);
+                foreach (var b in new Control[] { btnUp, btnDown, btnDel, btnOk, btnCancel })
+                    b.Size = new Size(bw, bh);
+
+                Controls.Add(_list);
+                Controls.AddRange(new Control[] { btnUp, btnDown, btnDel, btnOk, btnCancel });
+                AcceptButton = btnOk;
+                CancelButton = btnCancel;
+            }
+
+            private static Button MakeBtn(string text) => new Button
+            {
+                Text = text,
+                FlatStyle = FlatStyle.Flat,
+                BackColor = Color.FromArgb(70, 70, 74),
+                ForeColor = Color.White,
+                Cursor = Cursors.Hand
+            };
+
+            private void MoveSelected(int delta)
+            {
+                int i = _list.SelectedIndex;
+                if (i < 0) return;
+                int ni = i + delta;
+                if (ni < 0 || ni >= _list.Items.Count) return;
+                object it = _list.Items[i];
+                _list.Items.RemoveAt(i);
+                _list.Items.Insert(ni, it);
+                _list.SelectedIndex = ni;
+            }
         }
     }
 
@@ -1271,8 +1411,63 @@ namespace DllInjector
             log($"模块基址 0x{moduleBase.ToInt64():X} + 导出 RVA 0x{rva:X} = 0x{targetAddr:X}");
 
             // 可选参数内存（UTF-16）
+            // 约定：调用参数内用 "||" 分隔多个参数；>1 个时在目标进程构造
+            //   NULL 结尾的字符串指针数组（LPVOID* args），导出函数用 args[i] 访问；
+            //   单参数（无 ||）时保持原行为（直接传字符串指针，兼容 InstallHook 等）。
             IntPtr argBuf = IntPtr.Zero;
+            string[] multiParts = null;
             if (!string.IsNullOrEmpty(callArg))
+            {
+                var parts = callArg.Split(new[] { "||" }, StringSplitOptions.None);
+                if (parts.Length > 1) multiParts = parts;
+            }
+
+            if (multiParts != null)
+            {
+                int ptrSize = IntPtr.Size;
+                int arrSize = (multiParts.Length + 1) * ptrSize;   // 含结尾 NULL
+                var enc = Encoding.Unicode;
+                var strBytes = new System.Collections.Generic.List<byte[]>(multiParts.Length);
+                int strTotal = 0;
+                foreach (var p in multiParts)
+                {
+                    var b = enc.GetBytes(p);
+                    strBytes.Add(b);
+                    strTotal += b.Length + 2;
+                }
+                long total = (long)arrSize + strTotal;
+                IntPtr buf = NativeMethods.VirtualAllocEx(hProcess, IntPtr.Zero, (UIntPtr)total,
+                    NativeMethods.MEM_COMMIT | NativeMethods.MEM_RESERVE, NativeMethods.PAGE_READWRITE);
+                if (buf == IntPtr.Zero)
+                {
+                    log("错误: 在目标进程分配多参数内存失败 - " + NativeMethods.LastErrorText());
+                    return false;
+                }
+                long strBase = buf.ToInt64() + arrSize;
+                byte[] arr = new byte[arrSize];   // 零初始化（含结尾 NULL）
+                long off = 0;
+                bool writeOk = true;
+                for (int i = 0; i < multiParts.Length; i++)
+                {
+                    var b = strBytes[i];
+                    if (!NativeMethods.WriteProcessMemory(hProcess, new IntPtr(strBase + off), b, (UIntPtr)b.Length, out _)
+                        || !NativeMethods.WriteProcessMemory(hProcess, new IntPtr(strBase + off + b.Length), new byte[2], (UIntPtr)2, out _))
+                    { writeOk = false; break; }
+                    long pv = strBase + off;
+                    byte[] pb = ptrSize == 8 ? BitConverter.GetBytes(pv) : BitConverter.GetBytes((int)pv);
+                    Buffer.BlockCopy(pb, 0, arr, i * ptrSize, ptrSize);
+                    off += b.Length + 2;
+                }
+                if (!writeOk || !NativeMethods.WriteProcessMemory(hProcess, buf, arr, (UIntPtr)arrSize, out _))
+                {
+                    log("错误: 写入多参数失败 - " + NativeMethods.LastErrorText());
+                    NativeMethods.VirtualFreeEx(hProcess, buf, UIntPtr.Zero, NativeMethods.MEM_RELEASE);
+                    return false;
+                }
+                argBuf = buf;
+                log("参数已写入目标进程（UTF-16 参数数组，共 " + multiParts.Length + " 个）：" + string.Join(" | ", multiParts));
+            }
+            else if (!string.IsNullOrEmpty(callArg))
             {
                 byte[] bytes = Encoding.Unicode.GetBytes(callArg);
                 argBuf = NativeMethods.VirtualAllocEx(hProcess, IntPtr.Zero, (UIntPtr)(bytes.Length + 2),

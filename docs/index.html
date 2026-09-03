@@ -3,82 +3,423 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>DLL 注入器 (DLL Injector)</title>
+<title>DLL 注入器 (DLL Injector) — 可视化 DLL 注入工具</title>
+<meta name="description" content="一个带图形界面的 Windows 工具：选择目标 exe 和要注入的 dll，一键「挂起启动 → 注入 → 恢复运行」。支持 x64/x86、多 DLL 批量注入、三种注入方式与注入结果核验。">
+<meta name="theme-color" content="#0b1220">
+<meta property="og:title" content="DLL 注入器 (DLL Injector)">
+<meta property="og:description" content="选择目标 exe 和 dll，一键注入。支持 x64/x86、多 DLL、三种注入方式与注入结果核验。">
+<meta property="og:type" content="website">
 <style>
-  :root { color-scheme: light dark; }
+  :root {
+    --bg: #0b1220;
+    --bg-soft: #0f172a;
+    --card: #151f36;
+    --card-hover: #1a2744;
+    --border: #233252;
+    --border-soft: #1c2a47;
+    --text: #e6edf7;
+    --text-dim: #93a3bd;
+    --text-faint: #64748b;
+    --accent: #1677ff;
+    --accent-2: #4096ff;
+    --green: #3ddc84;
+    --amber: #f5b942;
+    --red: #ff6b6b;
+    --radius: 16px;
+    --shadow: 0 20px 60px rgba(0,0,0,.45);
+    --mono: "Cascadia Code","JetBrains Mono",Consolas,"Courier New",monospace;
+  }
   * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
   body {
-    font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
-    background: #0f172a; color: #e2e8f0;
-    min-height: 100vh; display: flex; flex-direction: column;
-    align-items: center; justify-content: center; padding: 40px 20px;
+    font-family: "Segoe UI","PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+    background: var(--bg); color: var(--text);
+    line-height: 1.7;
+    -webkit-font-smoothing: antialiased;
   }
-  .card {
-    max-width: 760px; width: 100%; text-align: center;
-    background: #1e293b; border: 1px solid #334155; border-radius: 16px;
-    padding: 48px 40px; box-shadow: 0 20px 60px rgba(0,0,0,.4);
+  ::selection { background: rgba(22,119,255,.35); }
+  a { color: var(--accent-2); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 0 24px; }
+
+  /* ===== Nav ===== */
+  nav {
+    position: sticky; top: 0; z-index: 50;
+    background: rgba(11,18,32,.82); backdrop-filter: blur(12px);
+    border-bottom: 1px solid var(--border-soft);
   }
-  .logo {
-    font-size: 52px; line-height: 1;
-    width: 88px; height: 88px; margin: 0 auto 24px;
+  .nav-inner { display: flex; align-items: center; gap: 18px; height: 60px; }
+  .nav-logo {
+    width: 34px; height: 34px; border-radius: 9px; flex: none;
     display: flex; align-items: center; justify-content: center;
-    background: #1677ff; color: #fff; border-radius: 22px;
-    box-shadow: 0 10px 30px rgba(22,119,255,.4);
+    background: linear-gradient(135deg,#1677ff,#0e5fd8); color: #fff; font-weight: 800; font-size: 17px;
   }
-  h1 { font-size: 32px; font-weight: 700; color: #fff; margin-bottom: 12px; }
-  .sub { font-size: 16px; color: #94a3b8; line-height: 1.7; margin-bottom: 28px; }
-  .features {
-    list-style: none; text-align: left; margin: 0 auto 32px; max-width: 560px;
-    display: grid; gap: 10px;
+  .nav-title { font-weight: 700; font-size: 15px; color: #fff; white-space: nowrap; }
+  .nav-links { margin-left: auto; display: flex; gap: 20px; align-items: center; }
+  .nav-links a { color: var(--text-dim); font-size: 14px; }
+  .nav-links a:hover { color: #fff; text-decoration: none; }
+
+  /* ===== Hero ===== */
+  .hero { padding: 84px 0 60px; text-align: center; position: relative; overflow: hidden; }
+  .hero::before {
+    content: ""; position: absolute; inset: 0; pointer-events: none;
+    background:
+      radial-gradient(600px 260px at 20% 0%, rgba(22,119,255,.16), transparent 60%),
+      radial-gradient(560px 240px at 82% 10%, rgba(64,150,255,.10), transparent 60%),
+      radial-gradient(700px 320px at 50% 110%, rgba(22,119,255,.08), transparent 60%);
   }
-  .features li {
-    background: #334155; border-radius: 10px; padding: 12px 16px;
-    font-size: 14px; color: #cbd5e1;
+  .hero .wrap { position: relative; }
+  .hero-badges { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; margin-bottom: 26px; }
+  .hero-badges img { height: 24px; border-radius: 6px; }
+  .hero h1 { font-size: clamp(34px, 5vw, 54px); font-weight: 800; letter-spacing: -0.5px; line-height: 1.15; }
+  .hero h1 .grad {
+    background: linear-gradient(90deg,#4aa5ff,#8ecbff 50%,#4aa5ff);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
   }
-  .features b { color: #fff; }
-  .btns { display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; }
+  .hero .sub { max-width: 640px; margin: 18px auto 0; color: var(--text-dim); font-size: 16.5px; }
+  .hero .cta { margin-top: 34px; display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; }
   .btn {
-    display: inline-block; padding: 12px 26px; border-radius: 10px;
-    font-size: 15px; font-weight: 600; text-decoration: none; transition: .2s;
+    display: inline-flex; align-items: center; gap: 9px;
+    padding: 13px 28px; border-radius: 12px; font-size: 15px; font-weight: 600;
+    transition: transform .15s ease, box-shadow .15s ease, background .15s ease;
   }
-  .btn-primary { background: #1677ff; color: #fff; }
-  .btn-primary:hover { background: #4096ff; }
-  .btn-ghost { background: transparent; color: #94a3b8; border: 1px solid #475569; }
-  .btn-ghost:hover { color: #e2e8f0; border-color: #64748b; }
-  .footer { margin-top: 32px; font-size: 13px; color: #64748b; }
-  .footer a { color: #94a3b8; }
-  @media (prefers-color-scheme: light) {
-    body { background: #f1f5f9; color: #1e293b; }
-    .card { background: #fff; border-color: #e2e8f0; }
-    .features li { background: #f1f5f9; color: #334155; }
-    .features b { color: #0f172a; }
-    .sub { color: #64748b; }
-    .btn-ghost { color: #64748b; border-color: #cbd5e1; }
-    .btn-ghost:hover { color: #0f172a; border-color: #94a3b8; }
-    .footer { color: #94a3b8; }
-    .footer a { color: #475569; }
+  .btn:hover { text-decoration: none; transform: translateY(-2px); }
+  .btn-primary {
+    background: linear-gradient(135deg,#1677ff,#0e5fd8); color: #fff;
+    box-shadow: 0 12px 30px rgba(22,119,255,.35);
+  }
+  .btn-primary:hover { background: linear-gradient(135deg,#2a86ff,#1677ff); box-shadow: 0 16px 38px rgba(22,119,255,.45); }
+  .btn-ghost { background: rgba(255,255,255,.04); color: var(--text); border: 1px solid var(--border); }
+  .btn-ghost:hover { background: rgba(255,255,255,.08); border-color: #3b5285; }
+  .btn .ico { font-size: 17px; }
+  .hero .meta { margin-top: 22px; font-size: 13px; color: var(--text-faint); }
+
+  /* ===== Sections ===== */
+  section { padding: 56px 0; }
+  .sec-head { text-align: center; margin-bottom: 40px; }
+  .sec-head .kicker {
+    display: inline-block; font-size: 12px; font-weight: 700; letter-spacing: 2px;
+    color: var(--accent-2); text-transform: uppercase; margin-bottom: 10px;
+  }
+  .sec-head h2 { font-size: clamp(24px, 3vw, 32px); font-weight: 800; letter-spacing: -0.3px; }
+  .sec-head p { color: var(--text-dim); max-width: 620px; margin: 10px auto 0; font-size: 15px; }
+
+  /* ===== Features ===== */
+  .feat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+  .feat {
+    background: var(--card); border: 1px solid var(--border-soft); border-radius: var(--radius);
+    padding: 22px 22px; transition: transform .15s ease, border-color .15s ease, background .15s ease;
+  }
+  .feat:hover { transform: translateY(-3px); border-color: #3b5285; background: var(--card-hover); }
+  .feat .f-ico {
+    width: 42px; height: 42px; border-radius: 11px; margin-bottom: 14px;
+    display: flex; align-items: center; justify-content: center; font-size: 20px;
+    background: rgba(22,119,255,.14); border: 1px solid rgba(22,119,255,.25);
+  }
+  .feat h3 { font-size: 16px; font-weight: 700; margin-bottom: 6px; color: #fff; }
+  .feat p { font-size: 13.5px; color: var(--text-dim); }
+  .feat code { font-family: var(--mono); font-size: 12px; background: rgba(255,255,255,.07); padding: 1px 6px; border-radius: 5px; }
+
+  /* ===== Preview ===== */
+  .shot-frame {
+    border: 1px solid var(--border); border-radius: 18px; overflow: hidden;
+    box-shadow: var(--shadow); background: #000;
+  }
+  .shot-frame img { display: block; width: 100%; height: auto; }
+  .shot-cap { text-align: center; color: var(--text-faint); font-size: 13px; margin-top: 14px; }
+
+  /* ===== How-to ===== */
+  .how-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+  .how {
+    background: var(--card); border: 1px solid var(--border-soft); border-radius: var(--radius);
+    padding: 24px; display: flex; flex-direction: column;
+  }
+  .how .h-num {
+    width: 30px; height: 30px; border-radius: 9px; flex: none; margin-bottom: 14px;
+    display: flex; align-items: center; justify-content: center;
+    background: linear-gradient(135deg,#1677ff,#0e5fd8); color: #fff; font-weight: 800; font-size: 14px;
+  }
+  .how h3 { font-size: 16px; font-weight: 700; margin-bottom: 8px; color: #fff; }
+  .how p { font-size: 13.5px; color: var(--text-dim); }
+  .how ol { margin: 10px 0 0 18px; font-size: 13.5px; color: var(--text-dim); }
+  .how ol li { margin-bottom: 5px; }
+  pre {
+    font-family: var(--mono); font-size: 12.5px; line-height: 1.7;
+    background: #0a101f; border: 1px solid var(--border-soft); border-radius: 12px;
+    padding: 18px 20px; overflow-x: auto; margin-top: 16px;
+  }
+  pre .c { color: #5b6b85; }
+  pre .k { color: #7fc7ff; }
+  pre .s { color: #9ee08a; }
+
+  /* ===== Flow ===== */
+  .flow { display: flex; flex-direction: column; align-items: center; gap: 0; }
+  .fnode {
+    background: var(--card); border: 1px solid var(--border); border-radius: 13px;
+    padding: 14px 26px; min-width: 280px; text-align: center;
+    font-size: 14px; position: relative;
+  }
+  .fnode b { color: #fff; }
+  .fnode .step { color: var(--accent-2); font-family: var(--mono); font-size: 12px; display: block; margin-bottom: 3px; }
+  .fnode .d { color: var(--text-faint); font-size: 12px; display: block; margin-top: 3px; }
+  .farrow { color: var(--accent-2); font-size: 22px; line-height: 1; padding: 8px 0; opacity: .9; }
+  .flow-branch { display: flex; flex-direction: column; align-items: center; }
+  @media (min-width: 820px) {
+    .flow-branch { flex-direction: row; gap: 20px; align-items: flex-start; }
+    .fnode { min-width: 300px; }
+  }
+
+  /* ===== Table ===== */
+  .tbl-wrap { overflow-x: auto; border: 1px solid var(--border-soft); border-radius: var(--radius); }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; min-width: 620px; }
+  th, td { padding: 13px 16px; text-align: left; border-bottom: 1px solid var(--border-soft); }
+  th { background: var(--card); color: var(--text-dim); font-size: 12.5px; letter-spacing: .5px; text-transform: uppercase; }
+  td { background: var(--bg-soft); }
+  tr:last-child td { border-bottom: none; }
+  .yes { color: var(--green); font-weight: 700; }
+  .no { color: var(--red); font-weight: 700; }
+  td code, th code { font-family: var(--mono); font-size: 12.5px; background: rgba(255,255,255,.07); padding: 1px 6px; border-radius: 5px; }
+
+  /* ===== Notice ===== */
+  .notice { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; }
+  .note { background: rgba(245,185,66,.06); border: 1px solid rgba(245,185,66,.25); border-radius: 13px; padding: 16px 18px; font-size: 13px; color: var(--text-dim); }
+  .note b { color: var(--amber); }
+
+  /* ===== Footer ===== */
+  footer { border-top: 1px solid var(--border-soft); padding: 36px 0 44px; text-align: center; color: var(--text-faint); font-size: 13px; }
+  footer a { color: var(--text-dim); }
+  footer .f-links { display: flex; gap: 20px; justify-content: center; flex-wrap: wrap; margin-bottom: 12px; }
+
+  /* ===== Responsive ===== */
+  @media (max-width: 640px) {
+    .hero { padding: 56px 0 40px; }
+    .nav-links .hide-m { display: none; }
+    .fnode { min-width: 0; width: 100%; }
   }
 </style>
 </head>
 <body>
-  <div class="card">
-    <div class="logo">D</div>
-    <h1>DLL 注入器</h1>
-    <p class="sub">选择目标程序与 DLL，一键「挂起启动 → 注入 → 恢复运行」。支持 Windows x64 / x86 双架构。</p>
-    <ul class="features">
-      <li><b>图形界面</b> — WinForms 界面，支持拖拽选择文件</li>
-      <li><b>命令行模式</b> — <code>-inject &lt;exe&gt; &lt;dll&gt;</code> 便于自动化</li>
-      <li><b>位数自动校验</b> — x64 / x86 不匹配时拦截提示</li>
-      <li><b>支持中文路径</b> — UTF-16 写入远程进程</li>
-    </ul>
-    <div class="btns">
-      <a class="btn btn-primary" href="https://github.com/isTurn/DllInjectorTest/releases" target="_blank" rel="noopener">下载 EXE</a>
-      <a class="btn btn-ghost" href="https://github.com/isTurn/DllInjectorTest" target="_blank" rel="noopener">查看源码</a>
-    </div>
-    <div class="footer">
-      开源 · <a href="https://github.com/isTurn/DllInjectorTest/blob/main/README.md" target="_blank" rel="noopener">使用文档</a> ·
-      <a href="https://github.com/isTurn/DllInjectorTest/blob/main/LICENSE" target="_blank" rel="noopener">MIT License</a>
+
+<nav>
+  <div class="wrap nav-inner">
+    <div class="nav-logo">D</div>
+    <span class="nav-title">DLL 注入器</span>
+    <div class="nav-links">
+      <a href="#features">特性</a>
+      <a href="#preview">界面</a>
+      <a href="#usage">使用</a>
+      <a href="#principle">原理</a>
+      <a class="hide-m" href="https://github.com/isTurn/DllInjectorTest" target="_blank" rel="noopener">GitHub</a>
     </div>
   </div>
+</nav>
+
+<header class="hero">
+  <div class="wrap">
+    <div class="hero-badges">
+      <img alt="Release" src="https://img.shields.io/github/v/release/isTurn/DllInjectorTest?style=flat-square&logo=github&color=1677ff">
+      <img alt="Build" src="https://img.shields.io/github/actions/workflow/status/isTurn/DllInjectorTest/build.yml?style=flat-square&logo=githubactions&logoColor=white&label=build">
+      <img alt="License" src="https://img.shields.io/github/license/isTurn/DllInjectorTest?style=flat-square&color=3ddc84">
+      <img alt=".NET" src="https://img.shields.io/badge/.NET-8.0-512BD4?style=flat-square&logo=dotnet">
+      <img alt="Platform" src="https://img.shields.io/badge/Windows-x64%20%7C%20x86-0078D6?style=flat-square&logo=windows">
+    </div>
+    <h1>DLL <span class="grad">注入器</span></h1>
+    <p class="sub">一个带图形界面的 Windows 工具：选择目标 exe 与要注入的 dll，一键「<b>挂起启动 → 注入 → 恢复运行</b>」。也支持向运行中的进程直接注入、卸载已注入的 DLL，内置注入结果自动核验。</p>
+    <div class="cta">
+      <a class="btn btn-primary" href="https://github.com/isTurn/DllInjectorTest/releases" target="_blank" rel="noopener"><span class="ico">⬇</span> 下载 EXE</a>
+      <a class="btn btn-ghost" href="https://github.com/isTurn/DllInjectorTest" target="_blank" rel="noopener"><span class="ico">⌥</span> 查看源码</a>
+    </div>
+    <p class="meta">自包含单文件 · 免安装 .NET 运行时 · MIT License</p>
+  </div>
+</header>
+
+<section id="features">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="kicker">Features</span>
+      <h2>功能特性</h2>
+      <p>从启动时注入到运行中进程管理，覆盖完整的注入 / 卸载闭环。</p>
+    </div>
+    <div class="feat-grid">
+      <div class="feat"><div class="f-ico">🎛️</div><h3>图形界面</h3><p>直观的 WinForms 界面，支持直接把文件<code>拖拽</code>进输入框（多文件一次拖入）。</p></div>
+      <div class="feat"><div class="f-ico">🚀</div><h3>启动时注入</h3><p>以<code>CREATE_SUSPENDED</code>挂起方式启动目标 → 批量注入 DLL → 恢复主线程运行。</p></div>
+      <div class="feat"><div class="f-ico">📦</div><h3>多 DLL 批量注入</h3><p>DLL 输入框内用 <code>;</code> 分隔多个 DLL，一次全部注入（GUI / CLI 均支持）。</p></div>
+      <div class="feat"><div class="f-ico">🖥️</div><h3>注入到运行中进程</h3><p>刷新枚举进程（名称 + PID），选中后一键注入（OpenProcess + 远程 LoadLibraryW）。</p></div>
+      <div class="feat"><div class="f-ico">📤</div><h3>卸载已注入 DLL</h3><p>远程调用 <code>FreeLibrary</code> 卸载，注入 / 卸载闭环；64 位进程基址完整枚举，卸载可靠。</p></div>
+      <div class="feat"><div class="f-ico">✅</div><h3>注入结果核验</h3><p>注入后自动在目标进程模块列表核对 DLL 是否真正加载成功（带重试容忍枚举时序）。</p></div>
+      <div class="feat"><div class="f-ico">🧬</div><h3>三种注入方式</h3><p><code>CreateRemoteThread</code>（兼容）· <code>NtCreateThreadEx</code>（隐蔽）· <code>QueueUserAPC</code>（仅启动时）。</p></div>
+      <div class="feat"><div class="f-ico">🖥️</div><h3>x64 / x86 双架构</h3><p>注入器按目标位数分版，位数自动校验，不匹配时拦截并给出清晰提示。</p></div>
+      <div class="feat"><div class="f-ico">🛡️</div><h3>自动 UAC 提权</h3><p>非管理员启动自动弹出 UAC 提权；取消则按普通权限继续，注入普通进程无需提权。</p></div>
+      <div class="feat"><div class="f-ico">💾</div><h3>记忆上次选择</h3><p>自动记住上次的 exe / dll（多 DLL 完整记忆）、注入方式与窗口位置，下次启动直接带出。</p></div>
+      <div class="feat"><div class="f-ico">🌐</div><h3>支持中文路径</h3><p>DLL 路径以 UTF-16 写入远程进程，中文目录 / 文件名完全兼容。</p></div>
+      <div class="feat"><div class="f-ico">⚙️</div><h3>命令行模式</h3><p><code>-inject</code> / <code>-injectpid</code> / <code>-eject</code>，支持多 DLL 与注入方式选择，退出码明确区分成败。</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="preview" style="background:var(--bg-soft);border-top:1px solid var(--border-soft);border-bottom:1px solid var(--border-soft);">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="kicker">Preview</span>
+      <h2>界面预览</h2>
+      <p>深色主题界面：输入区、功能按钮区、进程选择区、注入方式区与运行日志区一目了然。</p>
+    </div>
+    <div class="shot-frame">
+      <img src="screenshot.png" alt="DLL 注入器界面截图">
+    </div>
+    <p class="shot-cap">界面截图 · 暗色主题 · 运行日志实时显示每一步注入结果</p>
+  </div>
+</section>
+
+<section id="usage">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="kicker">Usage</span>
+      <h2>快速上手</h2>
+      <p>从 Releases 下载对应位数版本，把目标 exe / dll 与注入器放在同一目录即可使用。</p>
+    </div>
+    <div class="how-grid">
+      <div class="how">
+        <div class="h-num">1</div>
+        <h3>启动时注入</h3>
+        <p>启动目标程序并注入 DLL，适用于插件 / MOD / 调试等场景。</p>
+        <ol>
+          <li>「目标程序」选择要启动的 exe</li>
+          <li>「DLL 文件」选择要注入的 dll（多个用 <code>;</code> 分隔）</li>
+          <li>（可选）填写「启动参数」</li>
+          <li>选择「注入方式」→ 点击<b>注入并启动</b></li>
+        </ol>
+      </div>
+      <div class="how">
+        <div class="h-num">2</div>
+        <h3>注入到运行中进程</h3>
+        <p>向已运行的进程注入，无需重启目标程序。</p>
+        <ol>
+          <li>点击「刷新」加载进程列表</li>
+          <li>下拉选择目标进程（名称 + PID）</li>
+          <li>点击<b>注入到进程</b></li>
+        </ol>
+      </div>
+      <div class="how">
+        <div class="h-num">3</div>
+        <h3>卸载 DLL</h3>
+        <p>把目标进程中已加载的 DLL 卸载掉，形成闭环。</p>
+        <ol>
+          <li>在「DLL 文件」输入框填写模块名或路径</li>
+          <li>选择目标进程</li>
+          <li>点击<b>卸载 DLL</b></li>
+        </ol>
+      </div>
+    </div>
+    <pre><span class="c"># 命令行模式（自动化 / 脚本）</span>
+<span class="k">DllInjector-x64.exe</span> -inject <span class="s">&lt;exe路径&gt;</span> <span class="s">&lt;dll1&gt;</span> [dll2 ...] [-args <span class="s">&lt;参数&gt;</span>] [-method crt|ntc|apc]
+<span class="k">DllInjector-x64.exe</span> -injectpid <span class="s">&lt;pid&gt;</span> <span class="s">&lt;dll1&gt;</span> [dll2 ...] [-method crt|ntc]
+<span class="k">DllInjector-x64.exe</span> -eject <span class="s">&lt;pid&gt;</span> <span class="s">&lt;dll文件名&gt;</span></pre>
+  </div>
+</section>
+
+<section id="principle" style="background:var(--bg-soft);border-top:1px solid var(--border-soft);border-bottom:1px solid var(--border-soft);">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="kicker">How it works</span>
+      <h2>注入原理</h2>
+      <p>经典远程线程注入流程：进程外分配内存 → 写入 DLL 路径 → 远程加载 → 恢复运行 → 核验。</p>
+    </div>
+    <div class="flow">
+      <div class="fnode"><span class="step">1 · CreateProcess</span>以 <b>CREATE_SUSPENDED</b> 挂起启动目标<b class="d">不执行入口，主线程挂起</b></div>
+      <div class="farrow">↓</div>
+      <div class="fnode"><span class="step">2 · 远程内存</span><b>VirtualAllocEx + WriteProcessMemory</b><span class="d">写入每个 DLL 的绝对路径（UTF-16，支持中文）</span></div>
+      <div class="farrow">↓</div>
+      <div class="fnode"><span class="step">3 · 远程加载</span><b>CreateRemoteThread / NtCreateThreadEx / QueueUserAPC</b><span class="d">远程执行 LoadLibraryW，触发 DllMain</span></div>
+      <div class="farrow">↓</div>
+      <div class="fnode"><span class="step">4 · 等待完成</span><b>WaitForSingleObject(15s)</b><span class="d">等待 DLL 初始化完成（APC 方式跳过，改为恢复后核验）</span></div>
+      <div class="farrow">↓</div>
+      <div class="fnode"><span class="step">5 · 恢复运行</span><b>ResumeThread</b><span class="d">恢复目标进程主线程，程序正常运行</span></div>
+      <div class="farrow">↓</div>
+      <div class="fnode"><span class="step">6 · 核验</span><b>模块列表检查</b><span class="d">确认每个 DLL 已出现在目标进程模块列表</span></div>
+    </div>
+  </div>
+</section>
+
+<section id="compare">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="kicker">Compare</span>
+      <h2>注入方式对比</h2>
+      <p>三种注入方式在不同场景下的适用性与特性差异。</p>
+    </div>
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr><th>方式</th><th>启动时注入</th><th>运行中进程</th><th>特点</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>CreateRemoteThread</code></td>
+            <td class="yes">✔</td>
+            <td class="yes">✔</td>
+            <td>兼容性最好，最常见的注入手法，较易被检测</td>
+          </tr>
+          <tr>
+            <td><code>NtCreateThreadEx</code></td>
+            <td class="yes">✔</td>
+            <td class="yes">✔</td>
+            <td>直接调用 ntdll 底层线程创建，绕过部分 API 钩子，隐蔽性较好</td>
+          </tr>
+          <tr>
+            <td><code>QueueUserAPC</code></td>
+            <td class="yes">✔（推荐）</td>
+            <td class="no">✘（自动降级 CRT）</td>
+            <td>不创建新线程，隐蔽性最好；要求目标主线程处于可告警等待，否则 APC 不会执行</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section id="build" style="background:var(--bg-soft);border-top:1px solid var(--border-soft);border-bottom:1px solid var(--border-soft);">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="kicker">Build</span>
+      <h2>从源码构建</h2>
+      <p>需要 <b>.NET 8 SDK</b>，一条命令构建 x64 / x86 双版本；也可使用仓库内置 GitHub Actions 自动构建。</p>
+    </div>
+    <pre><span class="c"># 一键构建（x64 + x86）</span>
+build.bat
+
+<span class="c"># 或使用 CI：打 v* 标签自动构建并发布 Release</span>
+git tag v1.0.0 <span class="s">&amp;&amp;</span> git push origin v1.0.0</pre>
+  </div>
+</section>
+
+<section id="notice">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="kicker">Notice</span>
+      <h2>注意事项</h2>
+    </div>
+    <div class="notice">
+      <div class="note"><b>位数必须一致</b> — DLL 必须与目标程序同为 32 位或 64 位，否则会拒绝注入。</div>
+      <div class="note"><b>仅支持原生 DLL</b> — 需为含 DllMain 的 C/C++ 编译产物，托管 .NET DLL 无法以此方式执行代码。</div>
+      <div class="note"><b>QueueUserAPC 局限</b> — 仅适用于启动时注入，且目标主线程需处于可告警等待，否则不会执行。</div>
+      <div class="note"><b>杀软可能告警</b> — CreateRemoteThread 注入是常见手法，部分杀毒软件会报毒。</div>
+      <div class="note"><b>请合法使用</b> — 仅对你有权操作的软件使用（插件、MOD、调试、内部工具等场景）。</div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div class="f-links">
+      <a href="https://github.com/isTurn/DllInjectorTest" target="_blank" rel="noopener">GitHub 仓库</a>
+      <a href="https://github.com/isTurn/DllInjectorTest/blob/main/README.md" target="_blank" rel="noopener">使用文档</a>
+      <a href="https://github.com/isTurn/DllInjectorTest/releases" target="_blank" rel="noopener">Releases</a>
+      <a href="https://github.com/isTurn/DllInjectorTest/blob/main/LICENSE" target="_blank" rel="noopener">MIT License</a>
+    </div>
+    <div>DLL 注入器 (DLL Injector) · 开源项目 · MIT License © 2026 isTurn</div>
+  </div>
+</footer>
+
 </body>
 </html>

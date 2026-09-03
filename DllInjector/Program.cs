@@ -29,6 +29,12 @@ namespace DllInjector
         public const uint PROCESS_VM_WRITE          = 0x0020;
         public const uint PROCESS_QUERY_INFORMATION = 0x0400;
 
+        // 令牌权限
+        public const uint TOKEN_QUERY               = 0x0008;
+        public const uint TOKEN_ADJUST_PRIVILEGES   = 0x0020;
+        public const uint SE_PRIVILEGE_ENABLED      = 0x00000002;
+        public const uint ERROR_NOT_ALL_ASSIGNED    = 1300;   // AdjustTokenPrivileges 返回 true 但权限未生效
+
         /// <summary>注入 / 卸载所需的最小权限组合</summary>
         public const uint PROCESS_ACCESS_FOR_INJECT =
             PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION;
@@ -59,6 +65,21 @@ namespace DllInjector
             public IntPtr hThread;
             public int dwProcessId;
             public int dwThreadId;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct LUID
+        {
+            public uint LowPart;
+            public int HighPart;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct TOKEN_PRIVILEGES
+        {
+            public uint PrivilegeCount;
+            public LUID Luid;
+            public uint Attributes;
         }
 
         [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
@@ -126,6 +147,15 @@ namespace DllInjector
 
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern uint QueueUserAPC(IntPtr pfnAPC, IntPtr hThread, UIntPtr dwData);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        public static extern bool OpenProcessToken(IntPtr processHandle, uint desiredAccess, out IntPtr tokenHandle);
+
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        public static extern bool LookupPrivilegeValue(string lpSystemName, string lpName, out LUID lpLuid);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        public static extern bool AdjustTokenPrivileges(IntPtr tokenHandle, bool disableAllPrivileges, ref TOKEN_PRIVILEGES newState, uint bufferLength, IntPtr previousState, IntPtr returnLength);
 
         public static string LastErrorText()
         {
@@ -1261,6 +1291,51 @@ namespace DllInjector
     /// <summary>注入核心逻辑（GUI 与命令行模式共用）</summary>
     internal static class InjectorCore
     {
+        /// <summary>启用当前进程的 SeDebugPrivilege（调试权限），便于打开/注入 SYSTEM 等高权限或其它会话的进程。
+        /// 普通权限令牌下会失败（当前令牌不含该权限），仅提示、不阻断后续尝试。</summary>
+        public static bool EnableSeDebugPrivilege(Action<string> log)
+        {
+            IntPtr token;
+            if (!NativeMethods.OpenProcessToken(System.Diagnostics.Process.GetCurrentProcess().Handle,
+                NativeMethods.TOKEN_ADJUST_PRIVILEGES | NativeMethods.TOKEN_QUERY, out token))
+            {
+                log("提示: 打开进程令牌失败，未启用 SeDebugPrivilege - " + NativeMethods.LastErrorText());
+                return false;
+            }
+            try
+            {
+                NativeMethods.LUID luid;
+                if (!NativeMethods.LookupPrivilegeValue(null, "SeDebugPrivilege", out luid))
+                {
+                    log("提示: 查询 SeDebugPrivilege 失败 - " + NativeMethods.LastErrorText());
+                    return false;
+                }
+                var tp = new NativeMethods.TOKEN_PRIVILEGES
+                {
+                    PrivilegeCount = 1,
+                    Luid = luid,
+                    Attributes = NativeMethods.SE_PRIVILEGE_ENABLED
+                };
+                if (!NativeMethods.AdjustTokenPrivileges(token, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero))
+                {
+                    log("提示: 调整令牌权限失败，未启用 SeDebugPrivilege - " + NativeMethods.LastErrorText());
+                    return false;
+                }
+                // AdjustTokenPrivileges 成功返回 true 但可能"未全部授予"（当前令牌本就不含该权限，常见于普通权限运行）
+                if (Marshal.GetLastWin32Error() == (int)NativeMethods.ERROR_NOT_ALL_ASSIGNED)
+                {
+                    log("提示: 当前令牌不含 SeDebugPrivilege（需以管理员/特权账户运行），对 SYSTEM 等高权限进程的注入可能失败。");
+                    return false;
+                }
+                log("已启用 SeDebugPrivilege（调试权限），可尝试访问 SYSTEM 等高权限 / 其他会话进程。");
+                return true;
+            }
+            finally
+            {
+                NativeMethods.CloseHandle(token);
+            }
+        }
+
         /// <summary>注入前 PE 体检：剔除不可用的 DLL（非 PE / 非 DLL / 位数不符），记录体检结论，返回可通过的 DLL 列表</summary>
         public static string[] PreflightDlls(string[] dllPaths, int targetBits, Action<string> log)
         {
@@ -1300,6 +1375,7 @@ namespace DllInjector
         public static bool Run(string exePath, string[] dllPaths, string args, int method, string exportFunc, string exportArg, Action<string> log)
         {
             log("================ 开始注入 ================");
+            EnableSeDebugPrivilege(log);
             if (!File.Exists(exePath)) { log("错误: 目标程序不存在: " + exePath); return false; }
             if (dllPaths == null || dllPaths.Length == 0) { log("错误: 未指定要注入的 DLL。"); return false; }
             foreach (var dll in dllPaths)
@@ -1402,6 +1478,7 @@ namespace DllInjector
         public static bool InjectToProcess(int pid, string[] dllPaths, int method, string exportFunc, string exportArg, Action<string> log)
         {
             log("================ 注入到运行中进程 ================");
+            EnableSeDebugPrivilege(log);
             if (pid <= 0) { log("错误: 无效 PID: " + pid); return false; }
             if (dllPaths == null || dllPaths.Length == 0) { log("错误: 未指定要注入的 DLL。"); return false; }
             foreach (var dll in dllPaths)
@@ -1504,6 +1581,7 @@ namespace DllInjector
         public static bool EjectDll(int pid, string dllNameOrPath, Action<string> log)
         {
             log("================ 卸载 DLL ================");
+            EnableSeDebugPrivilege(log);
             if (pid <= 0) { log("错误: 无效 PID"); return false; }
             string moduleName = Path.GetFileName(dllNameOrPath.Trim().Trim('"'));
             if (string.IsNullOrEmpty(moduleName)) { log("错误: 未指定要卸载的 DLL 文件名"); return false; }

@@ -253,6 +253,7 @@
       <div class="feat"><div class="f-ico">🧬</div><h3>三种注入方式</h3><p><code>CreateRemoteThread</code>（兼容）· <code>NtCreateThreadEx</code>（隐蔽）· <code>QueueUserAPC</code>（仅启动时）。</p></div>
       <div class="feat"><div class="f-ico">🖥️</div><h3>x64 / x86 双架构</h3><p>注入器按目标位数分版，位数自动校验，不匹配时拦截并给出清晰提示。</p></div>
       <div class="feat"><div class="f-ico">🛡️</div><h3>自动 UAC 提权</h3><p>非管理员启动自动弹出 UAC 提权；取消则按普通权限继续，注入普通进程无需提权。</p></div>
+      <div class="feat"><div class="f-ico">👑</div><h3>SeDebugPrivilege 提权</h3><p>注入 / 卸载前自动启用调试权限，以管理员运行时即可注入 SYSTEM 等高权限 / 其他会话进程；普通权限仅提示不阻断。</p></div>
       <div class="feat"><div class="f-ico">💾</div><h3>记忆上次选择</h3><p>自动记住上次的 exe / dll（多 DLL 完整记忆）、注入方式与窗口位置，下次启动直接带出。</p></div>
       <div class="feat"><div class="f-ico">🌐</div><h3>支持中文路径</h3><p>DLL 路径以 UTF-16 写入远程进程，中文目录 / 文件名完全兼容。</p></div>
       <div class="feat"><div class="f-ico">⚙️</div><h3>命令行模式</h3><p><code>-inject</code> / <code>-injectpid</code> / <code>-eject</code>，支持多 DLL、注入方式与 <code>-export</code> 导出函数调用，退出码明确区分成败。</p></div>

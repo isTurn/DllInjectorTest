@@ -18,6 +18,7 @@ namespace DllInjector
         public const uint MEM_RESERVE       = 0x2000;
         public const uint MEM_RELEASE       = 0x8000;
         public const uint PAGE_READWRITE    = 0x04;
+        public const uint PAGE_EXECUTE_READWRITE = 0x40;
         public const uint INFINITE          = 0xFFFFFFFF;
         public const uint WAIT_TIMEOUT      = 0x00000102;
         public const uint WAIT_FAILED       = 0xFFFFFFFF;
@@ -43,6 +44,7 @@ namespace DllInjector
         public const int INJECT_CRT = 0;   // CreateRemoteThread（默认，兼容性最好）
         public const int INJECT_NTC = 1;   // NtCreateThreadEx（底层，隐蔽性较好）
         public const int INJECT_APC = 2;   // QueueUserAPC（仅启动时注入，需挂起主线程）
+        public const int INJECT_RFI = 3;   // 反射式注入（Reflective）：搬运 DLL 原始字节，由 DLL 自带 ReflectiveLoader 自行映射
 
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
         public struct STARTUPINFO
@@ -438,7 +440,7 @@ namespace DllInjector
             Log($"{"注入器已启动"}（{IntPtr.Size * 8} 位）。");
             Log("使用方式①：选择目标 exe 和 dll（多个用 ; 分隔），可填启动参数，点击\"注入并启动\"。");
             Log("使用方式②：在下方选择运行中的进程，点击\"注入到进程\"或\"卸载 DLL\"。");
-            Log("注入方式：CreateRemoteThread / NtCreateThreadEx / QueueUserAPC（仅启动时）。");
+            Log("注入方式：CreateRemoteThread / NtCreateThreadEx / QueueUserAPC（仅启动时）/ 反射式注入（需 DLL 自带 ReflectiveLoader）。");
         }
 
         protected override void OnLoad(EventArgs e)
@@ -557,7 +559,8 @@ namespace DllInjector
             {
                 "CreateRemoteThread（兼容）",
                 "NtCreateThreadEx（隐蔽）",
-                "QueueUserAPC（仅启动时）"
+                "QueueUserAPC（仅启动时）",
+                "反射式注入（Reflective）"
             });
             _cboMethod.SelectedIndex = 0;
 
@@ -1426,12 +1429,13 @@ namespace DllInjector
                 {
                     log("----- 注入: " + Path.GetFileName(dll) + " -----");
                     IntPtr remoteBuf, hRemoteThread;
-                    if (LoadLibraryIntoProcess(pi.hProcess, pi.hThread, dll, method, log, out remoteBuf, out hRemoteThread))
+                    if (LoadLibraryIntoProcess(pi.hProcess, pi.hThread, dll, method, log, out remoteBuf, out hRemoteThread, out _))
                     {
                         injected.Add(dll);
                         // CRT/NTC 为同步等待（LoadLibraryW 已完成），路径内存可立即释放；
-                        // APC 为异步排队（LoadLibraryW 要等主线程可告警后才执行），其路径内存保留在目标进程内，随进程退出回收。
-                        if (method != NativeMethods.INJECT_APC && remoteBuf != IntPtr.Zero)
+                        // APC 为异步排队（LoadLibraryW 要等主线程可告警后才执行），其路径内存保留在目标进程内，随进程退出回收；
+                        // RFI 的原始字节缓冲区保留在目标进程（供 ReflectiveLoader 回溯定位，映射已由其完成）。
+                        if (method != NativeMethods.INJECT_APC && method != NativeMethods.INJECT_RFI && remoteBuf != IntPtr.Zero)
                             NativeMethods.VirtualFreeEx(pi.hProcess, remoteBuf, UIntPtr.Zero, NativeMethods.MEM_RELEASE);
                     }
                     else if (remoteBuf != IntPtr.Zero)
@@ -1453,8 +1457,11 @@ namespace DllInjector
             {
                 if (method == NativeMethods.INJECT_APC)
                     log("提示: QueueUserAPC 为异步加载，DLL 可能尚未加载完成，导出函数调用可能失败。");
-                foreach (var dll in injected)
-                    CallExport(pi.hProcess, pi.dwProcessId, dll, exportFunc, exportArg, log);
+                if (method == NativeMethods.INJECT_RFI)
+                    log("提示: 反射式注入不自动调用导出函数（反射 DLL 不进入进程模块列表，且 Loader 返回句柄经线程退出码截断无法可靠定位），初始化请由 DLL 在 ReflectiveLoader / DllMain 内自行完成。");
+                else
+                    foreach (var dll in injected)
+                        CallExport(pi.hProcess, pi.dwProcessId, dll, exportFunc, exportArg, log);
             }
 
             NativeMethods.CloseHandle(pi.hProcess);
@@ -1465,7 +1472,11 @@ namespace DllInjector
                 log("----- 注入结果核验 -----");
                 bool verifyOk = true;
                 foreach (var dll in injected)
-                    if (!VerifyModuleLoaded(pi.dwProcessId, dll, log)) verifyOk = false;
+                {
+                    if (method == NativeMethods.INJECT_RFI)
+                        log($"核验通过：{Path.GetFileName(dll)} 反射映射成功（ReflectiveLoader 返回句柄非零；反射 DLL 不进入进程模块列表属正常）。");
+                    else if (!VerifyModuleLoaded(pi.dwProcessId, dll, log)) verifyOk = false;
+                }
                 if (!verifyOk && method == NativeMethods.INJECT_APC)
                     log("提示: QueueUserAPC 需要目标主线程处于可告警(alertable)等待（如 SleepEx / GetMessage 消息循环），否则 APC 不会执行；失败请改用 CreateRemoteThread 或 NtCreateThreadEx。");
             }
@@ -1528,26 +1539,44 @@ namespace DllInjector
                 {
                     log("----- 注入: " + Path.GetFileName(dll) + " -----");
                     IntPtr remoteBuf, hThread;
-                    if (LoadLibraryIntoProcess(hProcess, IntPtr.Zero, dll, useMethod, log, out remoteBuf, out hThread))
+                    bool injectOk = LoadLibraryIntoProcess(hProcess, IntPtr.Zero, dll, useMethod, log, out remoteBuf, out hThread, out _);
+                    if (injectOk)
+                    {
                         injected.Add(dll);
+                        // RFI 的原始字节缓冲区保留在目标进程（供 ReflectiveLoader 回溯定位），其余方式成功后即可释放路径内存
+                        if (useMethod != NativeMethods.INJECT_RFI && remoteBuf != IntPtr.Zero)
+                            NativeMethods.VirtualFreeEx(hProcess, remoteBuf, UIntPtr.Zero, NativeMethods.MEM_RELEASE);
+                    }
                     else
+                    {
                         allOk = false;
-                    if (remoteBuf != IntPtr.Zero)
-                        NativeMethods.VirtualFreeEx(hProcess, remoteBuf, UIntPtr.Zero, NativeMethods.MEM_RELEASE);
+                        if (remoteBuf != IntPtr.Zero)   // RFI 失败也释放已分配缓冲
+                            NativeMethods.VirtualFreeEx(hProcess, remoteBuf, UIntPtr.Zero, NativeMethods.MEM_RELEASE);
+                    }
                     if (hThread != IntPtr.Zero)
                         NativeMethods.CloseHandle(hThread);
                 }
 
                 // 注入后调用 DLL 导出函数
                 if (!string.IsNullOrEmpty(exportFunc) && injected.Count > 0)
-                    foreach (var dll in injected)
-                        CallExport(hProcess, pid, dll, exportFunc, exportArg, log);
+                {
+                    if (useMethod == NativeMethods.INJECT_RFI)
+                        log("提示: 反射式注入不自动调用导出函数（反射 DLL 不进模块列表且句柄截断无法可靠定位），请由 DLL 自行完成初始化。");
+                    else
+                        foreach (var dll in injected)
+                            CallExport(hProcess, pid, dll, exportFunc, exportArg, log);
+                }
 
                 if (injected.Count > 0)
                 {
                     log("----- 注入结果核验 -----");
                     foreach (var dll in injected)
-                        VerifyModuleLoaded(pid, dll, log);
+                    {
+                        if (useMethod == NativeMethods.INJECT_RFI)
+                            log($"核验通过：{Path.GetFileName(dll)} 反射映射成功（ReflectiveLoader 返回句柄非零）。");
+                        else
+                            VerifyModuleLoaded(pid, dll, log);
+                    }
                 }
 
                 log(allOk ? "===== 注入到进程完成 =====" : "===== 注入到进程结束（部分 DLL 未成功）=====");
@@ -1673,12 +1702,21 @@ namespace DllInjector
             }
         }
 
-        /// <summary>在目标进程内远程调用 LoadLibraryW 加载 DLL。失败时通过 out 返回已分配资源，由调用方负责清理。</summary>
+        /// <summary>在目标进程内远程调用 LoadLibraryW 加载 DLL。失败时通过 out 返回已分配资源，由调用方负责清理。
+        /// <paramref name="rfiModule"/>：反射式注入成功后返回的映射模块句柄（非 RFI 时为 IntPtr.Zero）。</summary>
         private static bool LoadLibraryIntoProcess(IntPtr hProcess, IntPtr hTargetThread, string dllPath, int method, Action<string> log,
-            out IntPtr remoteBuf, out IntPtr hRemoteThread)
+            out IntPtr remoteBuf, out IntPtr hRemoteThread, out IntPtr rfiModule)
         {
             remoteBuf = IntPtr.Zero;
             hRemoteThread = IntPtr.Zero;
+            rfiModule = IntPtr.Zero;
+
+            // 反射式注入：不写路径、不调 LoadLibraryW，直接搬运原始字节 + 调用 DLL 自带 ReflectiveLoader
+            if (method == NativeMethods.INJECT_RFI)
+            {
+                rfiModule = ReflectiveInjectIntoProcess(hProcess, dllPath, log, out remoteBuf, out hRemoteThread);
+                return rfiModule != IntPtr.Zero;
+            }
 
             // 使用 LoadLibraryW，支持中文等非 ASCII 路径
             byte[] dllPathBytes = Encoding.Unicode.GetBytes(dllPath);
@@ -1773,6 +1811,119 @@ namespace DllInjector
             }
             log($"注入成功！DLL 已加载（模块句柄 0x{code:X}）。");
             return true;
+        }
+
+        /// <summary>反射式注入（Reflective DLL Injection）：把 DLL 的原始文件字节直接搬运进目标进程内存，
+        /// 创建远程线程调用 DLL 自带的 ReflectiveLoader 导出函数，由 DLL 自身在目标进程内完成 PE 映射、
+        /// 重定位、导入表填充与 DllMain 调用。注入器只负责"搬运内存 + 启动 Loader"，不在目标进程执行任何注入器代码。
+        /// <returns>ReflectiveLoader 返回的映射模块句柄；0 表示失败。注：64 位下该句柄经线程退出码返回会被截断为低 32 位，
+        /// 仅用于成功判断（非 0 即映射成功），完整基址由反射 DLL 自行管理。</returns></summary>
+        private static IntPtr ReflectiveInjectIntoProcess(IntPtr hProcess, string dllPath, Action<string> log,
+            out IntPtr remoteBuf, out IntPtr hRemoteThread)
+        {
+            remoteBuf = IntPtr.Zero;
+            hRemoteThread = IntPtr.Zero;
+
+            // 1. 读取 DLL 文件字节
+            byte[] raw;
+            try { raw = File.ReadAllBytes(dllPath); }
+            catch (Exception ex) { log("错误: 读取反射 DLL 文件失败 - " + ex.Message); return IntPtr.Zero; }
+            if (raw.Length < 0x40 || BitConverter.ToUInt16(raw, 0) != 0x5A4D)
+            { log("错误: 文件不是有效的 PE 文件（缺少 MZ 头）。"); return IntPtr.Zero; }
+
+            // 2. 解析 PE 头，取得镜像尺寸/映像基址/节表，用于"内存布局展开"
+            int peOff = BitConverter.ToInt32(raw, 0x3C);
+            if (peOff + 0x40 > raw.Length || BitConverter.ToUInt32(raw, peOff) != 0x4550)
+            { log("错误: PE 头无效。"); return IntPtr.Zero; }
+            ushort magic = BitConverter.ToUInt16(raw, peOff + 0x18);
+            int fileHeader = peOff + 4;
+            ushort numSections = BitConverter.ToUInt16(raw, fileHeader + 2);
+            ushort optSize = BitConverter.ToUInt16(raw, fileHeader + 16);
+            int opt = fileHeader + 20;
+            long imageBase;
+            if (magic == 0x20B) imageBase = BitConverter.ToInt64(raw, opt + 0x18);      // PE32+
+            else if (magic == 0x10B) imageBase = BitConverter.ToUInt32(raw, opt + 0x1C); // PE32
+            else { log("错误: 不支持的 PE 格式。"); return IntPtr.Zero; }
+            uint sizeOfImage = BitConverter.ToUInt32(raw, opt + 0x38);
+            uint sizeOfHeaders = BitConverter.ToUInt32(raw, opt + 0x3C);
+            int sectionStart = opt + optSize;
+            if (sizeOfImage == 0 || sectionStart + numSections * 40 > raw.Length)
+            { log("错误: PE 节表无效。"); return IntPtr.Zero; }
+            bool is32 = (magic == 0x10B);
+
+            // 3. 定位 ReflectiveLoader 导出 RVA（必须在 DLL 自带该导出，普通 DLL 无法反射注入）
+            long loaderRva = PeHelper.GetExportRva(dllPath, "ReflectiveLoader");
+            if (loaderRva < 0)
+            {
+                log("错误: 反射式注入要求 DLL 自带 ReflectiveLoader 导出函数，但 " + Path.GetFileName(dllPath) + " 中未找到（普通 LoadLibrary 型 DLL 请改用 CRT/NTC/APC 方式）。");
+                return IntPtr.Zero;
+            }
+
+            // 4. 分配"内存布局"镜像（SizeOfImage）。x86 反射 DLL 对全局量/常量采用绝对寻址，必须落在映像基址；
+            //    x64 走 RIP 相对寻址，映像基址分配失败时可回退任意地址。
+            IntPtr baseAddr = NativeMethods.VirtualAllocEx(hProcess, new IntPtr(imageBase), (UIntPtr)sizeOfImage,
+                NativeMethods.MEM_COMMIT | NativeMethods.MEM_RESERVE, NativeMethods.PAGE_EXECUTE_READWRITE);
+            if (baseAddr == IntPtr.Zero && !is32)
+            {
+                log($"提示: 映像基址 0x{imageBase:X} 分配失败，回退任意地址（x64 反射允许任意基址）。");
+                baseAddr = NativeMethods.VirtualAllocEx(hProcess, IntPtr.Zero, (UIntPtr)sizeOfImage,
+                    NativeMethods.MEM_COMMIT | NativeMethods.MEM_RESERVE, NativeMethods.PAGE_EXECUTE_READWRITE);
+            }
+            if (baseAddr == IntPtr.Zero)
+            {
+                if (is32)
+                    log($"错误: 32 位反射要求映像基址 0x{imageBase:X} 在目标进程空闲可分配（x86 反射 DLL 用绝对寻址），但分配失败 - " + NativeMethods.LastErrorText());
+                else
+                    log("错误: 在目标进程分配反射 DLL 镜像内存失败 - " + NativeMethods.LastErrorText());
+                return IntPtr.Zero;
+            }
+
+            // 5. 写入内存布局：头部 + 各节复制到各自的 VirtualAddress（而非文件偏移）
+            if (!NativeMethods.WriteProcessMemory(hProcess, baseAddr, raw, (UIntPtr)sizeOfHeaders, out _))
+            { log("错误: 写入镜像头失败 - " + NativeMethods.LastErrorText()); return IntPtr.Zero; }
+            for (int i = 0; i < numSections; i++)
+            {
+                int s = sectionStart + i * 40;
+                uint vaddr = BitConverter.ToUInt32(raw, s + 12);
+                uint rsize = BitConverter.ToUInt32(raw, s + 16);
+                uint roff = BitConverter.ToUInt32(raw, s + 20);
+                if (rsize > 0 && roff + rsize <= raw.Length)
+                {
+                    byte[] sec = new byte[rsize];
+                    Array.Copy(raw, (long)roff, sec, 0, (long)rsize);
+                    if (!NativeMethods.WriteProcessMemory(hProcess, new IntPtr(baseAddr.ToInt64() + vaddr), sec, (UIntPtr)rsize, out _))
+                    { log($"错误: 写入节 [{i}] (RVA 0x{vaddr:X}) 失败 - " + NativeMethods.LastErrorText()); return IntPtr.Zero; }
+                }
+            }
+            remoteBuf = baseAddr;
+            log($"已按内存布局展开反射 DLL（{numSections} 节，镜像 {sizeOfImage} 字节）到目标进程基址 0x{baseAddr.ToInt64():X}（映像基址 0x{imageBase:X}）。");
+
+            // 6. 计算 ReflectiveLoader 在目标进程中的地址（base + RVA）并创建远程线程（参数 NULL，Loader 通过返回地址自行定位基址）
+            IntPtr loaderAddr = new IntPtr(baseAddr.ToInt64() + loaderRva);
+            log($"ReflectiveLoader RVA 0x{loaderRva:X} -> 目标地址 0x{loaderAddr.ToInt64():X}，创建远程线程...");
+
+            hRemoteThread = NativeMethods.CreateRemoteThread(hProcess, IntPtr.Zero, UIntPtr.Zero, loaderAddr, IntPtr.Zero, 0, out _);
+            if (hRemoteThread == IntPtr.Zero)
+            {
+                log("错误: 创建反射注入远程线程失败 - " + NativeMethods.LastErrorText());
+                return IntPtr.Zero;
+            }
+
+            uint wait = NativeMethods.WaitForSingleObject(hRemoteThread, 15000);
+            if (wait == NativeMethods.WAIT_TIMEOUT) { log("警告: 反射加载超时（15 秒），DLL 可能在映射过程中阻塞。"); return IntPtr.Zero; }
+            if (wait == NativeMethods.WAIT_FAILED) { log("错误: WaitForSingleObject 失败 - " + NativeMethods.LastErrorText()); return IntPtr.Zero; }
+            if (!NativeMethods.GetExitCodeThread(hRemoteThread, out uint code))
+            {
+                log("错误: GetExitCodeThread 失败 - " + NativeMethods.LastErrorText());
+                return IntPtr.Zero;
+            }
+            if (code == 0)
+            {
+                log("警告: ReflectiveLoader 返回 0，反射映射失败（检查 DLL 的 ReflectiveLoader 实现是否完整）。");
+                return IntPtr.Zero;
+            }
+            log($"反射加载成功！DLL 已由 ReflectiveLoader 自行映射执行（模块句柄 0x{code:X}）。");
+            return new IntPtr(code);
         }
 
         /// <summary>注入结果核验：按文件名在目标进程模块列表中查找（带重试容忍枚举时序延迟）</summary>
@@ -2246,11 +2397,14 @@ namespace DllInjector
             Application.Run(new MainForm());
         }
 
-        /// <summary>解析 CLI 注入方式参数（crt / ntc / apc，默认 crt）</summary>
+        /// <summary>解析 CLI 注入方式参数（crt / ntc / apc / rfi，默认 crt）</summary>
         private static int ParseMethod(string s)
         {
             if (string.Equals(s, "ntc", StringComparison.OrdinalIgnoreCase)) return NativeMethods.INJECT_NTC;
             if (string.Equals(s, "apc", StringComparison.OrdinalIgnoreCase)) return NativeMethods.INJECT_APC;
+            if (string.Equals(s, "rfi", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(s, "reflect", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(s, "reflective", StringComparison.OrdinalIgnoreCase)) return NativeMethods.INJECT_RFI;
             return NativeMethods.INJECT_CRT;
         }
 

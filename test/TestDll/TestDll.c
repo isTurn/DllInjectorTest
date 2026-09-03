@@ -6,13 +6,18 @@
 #define MARKER_DIR "D:\\Download\\ToDLL\\test_output\\"
 #endif
 
+// marker filename prefix (distinguish DLL variants: TestDllA -> attachA, TestDllB -> attachB)
+#ifndef MARKER_PREFIX
+#define MARKER_PREFIX "attach"
+#endif
+
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved)
 {
     if (ul_reason_for_call == DLL_PROCESS_ATTACH)
     {
         DisableThreadLibraryCalls(hModule);
         char path[MAX_PATH];
-        sprintf_s(path, MAX_PATH, "%sattach_%lu.txt", MARKER_DIR, GetCurrentProcessId());
+        sprintf_s(path, MAX_PATH, "%s%s_%lu.txt", MARKER_DIR, MARKER_PREFIX, GetCurrentProcessId());
         HANDLE h = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, NULL,
                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
         if (h != INVALID_HANDLE_VALUE)

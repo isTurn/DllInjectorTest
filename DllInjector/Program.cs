@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.ComponentModel;
 using System.Drawing;
 using System.IO;
@@ -175,6 +175,7 @@ namespace DllInjector
         private Button _btnRefresh;
         private Button _btnInjectProc;
         private Button _btnEject;
+        private Button _btnSettings;
         private TextBox _log;
 
         // 96 DPI 逻辑布局基准值
@@ -192,15 +193,18 @@ namespace DllInjector
             Font = new Font("Microsoft YaHei UI", 9F);
             // 关闭框架自动缩放（.NET 8 下对代码构建的窗体不会按 DPI 缩放），改为手动精确缩放
             AutoScaleMode = AutoScaleMode.None;
-            ClientSize = new Size(720, 590);
-            MinimumSize = new Size(620, 550);
+            ClientSize = new Size(720, 640);
+            MinimumSize = new Size(620, 600);
             StartPosition = FormStartPosition.CenterScreen;
-            BackColor = Color.White;
+
+            Theme.Dark = ConfigStore.Theme == "dark";
 
             BuildUi();
+            ApplyTheme();
             LoadLastSelection();
+            _cboMethod.SelectedIndex = ConfigStore.Method;   // 记忆上次注入方式
             Resize += (s, e) => LayoutAll();
-            Log($"注入器已启动（当前为 {IntPtr.Size * 8} 位版本）。");
+            Log($"{"注入器已启动"}（{IntPtr.Size * 8} 位）。");
             Log("使用方式①：选择目标 exe 和 dll（多个用 ; 分隔），可填启动参数，点击\"注入并启动\"。");
             Log("使用方式②：在下方选择运行中的进程，点击\"注入到进程\"或\"卸载 DLL\"。");
             Log("注入方式：CreateRemoteThread / NtCreateThreadEx / QueueUserAPC（仅启动时）。");
@@ -210,6 +214,37 @@ namespace DllInjector
         {
             base.OnLoad(e);
             ApplyDpiScale();
+            RestoreWindowPos();
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            // 记忆窗口位置（含边框的窗口矩形）
+            try { ConfigStore.WindowPos = $"{Bounds.X},{Bounds.Y},{Bounds.Width},{Bounds.Height}"; } catch { }
+            base.OnFormClosing(e);
+        }
+
+        /// <summary>恢复上次记忆的窗口位置（仅当位置仍落在某个屏幕内）</summary>
+        private void RestoreWindowPos()
+        {
+            string wp = ConfigStore.WindowPos;
+            if (string.IsNullOrEmpty(wp)) return;
+            var parts = wp.Split(',');
+            if (parts.Length == 4 &&
+                int.TryParse(parts[0], out int x) && int.TryParse(parts[1], out int y) &&
+                int.TryParse(parts[2], out int w) && int.TryParse(parts[3], out int h) &&
+                w >= MinimumSize.Width && h >= MinimumSize.Height)
+            {
+                var rect = new Rectangle(x, y, w, h);
+                bool visible = false;
+                foreach (var s in Screen.AllScreens)
+                    if (s.WorkingArea.IntersectsWith(rect)) { visible = true; break; }
+                if (visible)
+                {
+                    StartPosition = FormStartPosition.Manual;
+                    Bounds = rect;
+                }
+            }
         }
 
         protected override void OnDpiChanged(DpiChangedEventArgs e)
@@ -227,7 +262,7 @@ namespace DllInjector
             if (Math.Abs(_scale - 1f) > 0.01f)
             {
                 SuspendLayout();
-                ClientSize = new Size(Scale(720), Scale(590));
+                ClientSize = new Size(Scale(720), Scale(640));
                 ResumeLayout(true);
             }
             LayoutAll();
@@ -251,7 +286,7 @@ namespace DllInjector
             {
                 Text = "注入并启动",
                 FlatStyle = FlatStyle.Flat,
-                BackColor = Color.FromArgb(22, 119, 255),
+                BackColor = Theme.Accent,
                 ForeColor = Color.White,
                 Cursor = Cursors.Hand
             };
@@ -261,7 +296,7 @@ namespace DllInjector
             {
                 Text = "多 DLL 用 ; 分隔；挂起启动 -> 注入 -> 恢复",
                 AutoSize = true,
-                ForeColor = Color.Gray
+                ForeColor = Theme.TipFore
             };
 
             _lblArgs = MakeLabel("启动参数:");
@@ -294,7 +329,7 @@ namespace DllInjector
             {
                 Text = "注入到进程",
                 FlatStyle = FlatStyle.Flat,
-                BackColor = Color.FromArgb(22, 119, 255),
+                BackColor = Theme.Accent,
                 ForeColor = Color.White,
                 Cursor = Cursors.Hand
             };
@@ -304,11 +339,19 @@ namespace DllInjector
             {
                 Text = "卸载 DLL",
                 FlatStyle = FlatStyle.Flat,
-                BackColor = Color.FromArgb(120, 120, 128),
+                BackColor = Theme.ButtonBack,
                 ForeColor = Color.White,
                 Cursor = Cursors.Hand
             };
             _btnEject.Click += BtnEject_Click;
+
+            _btnSettings = new Button
+            {
+                Text = "设置",
+                FlatStyle = FlatStyle.Flat,
+                Cursor = Cursors.Hand
+            };
+            _btnSettings.Click += BtnSettings_Click;
 
             _lblLog = new Label { Text = "运行日志:", AutoSize = true };
 
@@ -325,7 +368,8 @@ namespace DllInjector
 
             Controls.AddRange(new Control[] { _lblExe, _txtExe, _btnExe, _lblDll, _txtDll, _btnDll,
                 _lblArgs, _txtArgs, _btnInject, _tip,
-                _lblProc, _cboProc, _btnRefresh, _btnInjectProc, _btnEject, _lblMethod, _cboMethod, _lblLog, _log });
+                _lblProc, _cboProc, _btnRefresh, _btnInjectProc, _btnEject, _lblMethod, _cboMethod,
+                _btnSettings, _lblLog, _log });
         }
 
         /// <summary>统一布局：以 96 DPI 逻辑坐标为准，按当前缩放系数与窗口尺寸摆放所有控件</summary>
@@ -390,6 +434,11 @@ namespace DllInjector
                 _cboMethod.Size = new Size(ClientSize.Width - padL - labelW - padL, boxH);
                 y += rowH + Scale(6);
 
+                // 第 8 行：设置按钮
+                _btnSettings.Location = new Point(labelW, y);
+                _btnSettings.Size = new Size(Scale(150), btnH);
+                y += rowH + Scale(6);
+
                 // 日志区
                 _lblLog.Location = new Point(padL, y);
                 y += Scale(22);
@@ -397,7 +446,7 @@ namespace DllInjector
                 _log.Size = new Size(ClientSize.Width - 2 * padL, ClientSize.Height - y - padL);
 
                 // 最小尺寸随缩放
-                MinimumSize = new Size(Scale(620), Scale(550));
+                MinimumSize = new Size(Scale(620), Scale(600));
 
                 ResumeLayout(true);
                 PerformLayout();
@@ -405,6 +454,47 @@ namespace DllInjector
             finally
             {
                 _layouting = false;
+            }
+        }
+
+        /// <summary>应用当前主题（亮 / 暗）到窗体与全部控件</summary>
+        private void ApplyTheme()
+        {
+            Theme.Dark = ConfigStore.Theme == "dark";
+            BackColor = Theme.Back;
+            ForeColor = Theme.Fore;
+            ApplyThemeTo(this);
+            // 日志区固定深色终端风格
+            _log.BackColor = Color.FromArgb(28, 28, 30);
+            _log.ForeColor = Color.FromArgb(230, 230, 230);
+            _tip.ForeColor = Theme.TipFore;
+            // 主操作按钮固定为强调蓝
+            _btnInject.BackColor = Theme.Accent; _btnInject.ForeColor = Color.White;
+            _btnInjectProc.BackColor = Theme.Accent; _btnInjectProc.ForeColor = Color.White;
+            // 卸载按钮使用次要按钮色
+            _btnEject.BackColor = Theme.ButtonBack; _btnEject.ForeColor = Color.White;
+            Invalidate(true);
+        }
+
+        private void ApplyThemeTo(Control parent)
+        {
+            foreach (Control c in parent.Controls)
+            {
+                if (c is Label lbl) lbl.ForeColor = Theme.Fore;
+                else if (c is TextBox tb) { if (tb != _log) { tb.BackColor = Theme.BoxBack; tb.ForeColor = Theme.BoxFore; } }
+                else if (c is ComboBox cb) { cb.BackColor = Theme.BoxBack; cb.ForeColor = Theme.BoxFore; }
+                else if (c is Button b) { if (b != _btnInject && b != _btnInjectProc && b != _btnEject) { b.BackColor = Theme.ButtonBack; b.ForeColor = Theme.Fore; } }
+                if (c.HasChildren) ApplyThemeTo(c);
+            }
+        }
+
+        private void BtnSettings_Click(object sender, EventArgs e)
+        {
+            using var dlg = new SettingsForm();
+            if (dlg.ShowDialog(this) == DialogResult.OK)
+            {
+                ApplyTheme();
+                LayoutAll();
             }
         }
 
@@ -474,6 +564,11 @@ namespace DllInjector
         {
             if (InvokeRequired) { BeginInvoke(new Action<string>(Log), msg); return; }
             _log.AppendText($"[{DateTime.Now:HH:mm:ss}] {msg}{Environment.NewLine}");
+            // 日志最大行数控制（配置可调）
+            int max = ConfigStore.MaxLogLines;
+            string[] lines = _log.Text.Split('\n');
+            if (lines.Length > max)
+                _log.Text = string.Join("\n", lines, lines.Length - max, max);
             _log.SelectionStart = _log.TextLength;
             _log.ScrollToCaret();
         }
@@ -484,6 +579,7 @@ namespace DllInjector
             string[] dlls = InjectorCore.SplitDlls(_txtDll.Text);
             string args = _txtArgs.Text.Trim();
             int method = _cboMethod.SelectedIndex;
+            ConfigStore.Method = method;   // 记忆注入方式
             if (string.IsNullOrEmpty(exe) || dlls.Length == 0)
             {
                 MessageBox.Show("请先选择目标 exe 和 dll 文件。", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
@@ -557,6 +653,7 @@ namespace DllInjector
                 return;
             }
             int method = _cboMethod.SelectedIndex;
+            ConfigStore.Method = method;   // 记忆注入方式
             var btn = sender as Button;
             btn.Enabled = false;
             try
@@ -618,6 +715,61 @@ namespace DllInjector
             public int Pid;
             public string Name;
             public override string ToString() => Name;
+        }
+    }
+
+    /// <summary>设置对话框：主题 / 语言 / 注入超时 / 日志行数</summary>
+    internal class SettingsForm : Form
+    {
+        private readonly ComboBox _cboTheme;
+        private readonly NumericUpDown _numTimeout, _numLog;
+
+        public SettingsForm()
+        {
+            Text = "设置";
+            Font = new Font("Microsoft YaHei UI", 9F);
+            AutoScaleMode = AutoScaleMode.None;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false; MinimizeBox = false;
+            StartPosition = FormStartPosition.CenterParent;
+            ClientSize = new Size(340, 188);
+            BackColor = Theme.Back; ForeColor = Theme.Fore;
+
+            int y = 16;
+            var lblTheme = new Label { Text = "主题:", AutoSize = true, Location = new Point(16, y + 3), ForeColor = Theme.Fore };
+            _cboTheme = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, FlatStyle = FlatStyle.Flat, Location = new Point(130, y), Size = new Size(190, 24), BackColor = Theme.BoxBack, ForeColor = Theme.BoxFore };
+            _cboTheme.Items.AddRange(new object[] { "亮色", "暗色" });
+            _cboTheme.SelectedIndex = ConfigStore.Theme == "dark" ? 1 : 0;
+            Controls.Add(lblTheme); Controls.Add(_cboTheme);
+            y += 34;
+
+
+
+            var lblTimeout = new Label { Text = "注入超时(秒):", AutoSize = true, Location = new Point(16, y + 3), ForeColor = Theme.Fore };
+            _numTimeout = new NumericUpDown { Location = new Point(130, y), Size = new Size(190, 24), Minimum = 3, Maximum = 120, Value = ConfigStore.TimeoutSec, BackColor = Theme.BoxBack, ForeColor = Theme.BoxFore };
+            Controls.Add(lblTimeout); Controls.Add(_numTimeout);
+            y += 34;
+
+            var lblLog = new Label { Text = "日志最大行数:", AutoSize = true, Location = new Point(16, y + 3), ForeColor = Theme.Fore };
+            _numLog = new NumericUpDown { Location = new Point(130, y), Size = new Size(190, 24), Minimum = 50, Maximum = 10000, Increment = 100, Value = ConfigStore.MaxLogLines, BackColor = Theme.BoxBack, ForeColor = Theme.BoxFore };
+            Controls.Add(lblLog); Controls.Add(_numLog);
+            y += 44;
+
+            var btnOk = new Button { Text = "确定", DialogResult = DialogResult.OK, FlatStyle = FlatStyle.Flat, BackColor = Theme.Accent, ForeColor = Color.White, Location = new Point(110, y), Size = new Size(90, 30) };
+            var btnCancel = new Button { Text = "取消", DialogResult = DialogResult.Cancel, FlatStyle = FlatStyle.Flat, BackColor = Theme.ButtonBack, ForeColor = Theme.Fore, Location = new Point(210, y), Size = new Size(90, 30) };
+            Controls.Add(btnOk); Controls.Add(btnCancel);
+            AcceptButton = btnOk; CancelButton = btnCancel;
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            if (DialogResult == DialogResult.OK)
+            {
+                ConfigStore.Theme = _cboTheme.SelectedIndex == 1 ? "dark" : "light";
+                ConfigStore.TimeoutSec = (int)_numTimeout.Value;
+                ConfigStore.MaxLogLines = (int)_numLog.Value;
+            }
+            base.OnFormClosing(e);
         }
     }
 
@@ -951,10 +1103,10 @@ namespace DllInjector
                 log("已创建远程线程，等待 DLL 的 DllMain 初始化完成...");
             }
 
-            uint wait = NativeMethods.WaitForSingleObject(hRemoteThread, 15000);
+            uint wait = NativeMethods.WaitForSingleObject(hRemoteThread, (uint)(ConfigStore.TimeoutSec * 1000));
             if (wait == NativeMethods.WAIT_TIMEOUT)
             {
-                log("警告: 等待超时（15 秒），DLL 可能在 DllMain 中阻塞。");
+                log($"警告: 等待超时（{ConfigStore.TimeoutSec} 秒），DLL 可能在 DllMain 中阻塞。");
                 return false;
             }
             if (wait == NativeMethods.WAIT_FAILED)
@@ -1023,10 +1175,11 @@ namespace DllInjector
         }
     }
 
-    /// <summary>记忆上次选择的 exe / dll 路径：配置文件优先放注入器同目录，目录不可写时回退到 %AppData%</summary>
+    /// <summary>配置存储：键值对格式（兼容旧的两行 exe/dll 格式），配置文件优先放注入器同目录，目录不可写时回退到 %AppData%</summary>
     internal static class ConfigStore
     {
         private static string _path;
+        private static readonly Dictionary<string, string> _data = new();
 
         static ConfigStore()
         {
@@ -1055,32 +1208,101 @@ namespace DllInjector
         /// <summary>配置文件路径（用于日志展示）</summary>
         public static string ConfigPath => _path ?? "";
 
+        /// <summary>重新从磁盘读取全部配置</summary>
+        private static void Reload()
+        {
+            _data.Clear();
+            if (_path == null || !File.Exists(_path)) return;
+            var lines = File.ReadAllLines(_path);
+            if (lines.Length == 0) return;
+            // 兼容旧格式：第一行不含 '=' 时视为纯 exe/dll 两行
+            if (!lines[0].Contains('='))
+            {
+                _data["exe"] = lines[0].Trim();
+                if (lines.Length > 1) _data["dll"] = lines[1].Trim();
+                return;
+            }
+            foreach (var line in lines)
+            {
+                int i = line.IndexOf('=');
+                if (i > 0) _data[line.Substring(0, i).Trim()] = line.Substring(i + 1).Trim();
+            }
+        }
+
+        private static void Flush()
+        {
+            if (_path == null) return;
+            var lines = new System.Collections.Generic.List<string>();
+            foreach (var kv in _data)
+                lines.Add(kv.Key + "=" + kv.Value);
+            File.WriteAllLines(_path, lines, new UTF8Encoding(false));
+        }
+
+        private static string Get(string key, string def = "")
+        {
+            Reload();
+            return _data.TryGetValue(key, out var v) ? v : def;
+        }
+
         /// <summary>读取上次记忆的 exe / dll 路径；不存在则返回 null。</summary>
         public static void Load(out string exe, out string dll)
         {
-            exe = null; dll = null;
-            try
-            {
-                if (_path == null || !File.Exists(_path)) return;
-                var lines = File.ReadAllLines(_path);
-                if (lines.Length > 0) exe = lines[0].Trim();
-                if (lines.Length > 1) dll = lines[1].Trim();
-                if (string.IsNullOrEmpty(exe)) exe = null;
-                if (string.IsNullOrEmpty(dll)) dll = null;
-            }
-            catch { exe = null; dll = null; }
+            exe = Get("exe"); if (string.IsNullOrEmpty(exe)) exe = null;
+            dll = Get("dll"); if (string.IsNullOrEmpty(dll)) dll = null;
         }
 
-        /// <summary>保存本次选择的 exe / dll 路径</summary>
+        /// <summary>保存本次选择的 exe / dll 路径（保留其它配置项）</summary>
         public static void Save(string exe, string dll)
         {
-            try
-            {
-                if (_path == null) return;
-                File.WriteAllLines(_path, new[] { exe ?? "", dll ?? "" }, new UTF8Encoding(false));
-            }
-            catch { }
+            if (_path == null) return;
+            Reload();
+            _data["exe"] = exe ?? "";
+            _data["dll"] = dll ?? "";
+            Flush();
         }
+
+        public static string Theme { get { var v = Get("theme", "light"); return v; } set { if (_path == null) return; Reload(); _data["theme"] = value; Flush(); } }
+
+        /// <summary>注入等待超时（秒），有效范围 3-120，默认 15</summary>
+        public static int TimeoutSec
+        {
+            get { int t; return int.TryParse(Get("timeout", "15"), out t) && t >= 3 && t <= 120 ? t : 15; }
+            set { if (_path == null) return; Reload(); _data["timeout"] = value.ToString(); Flush(); }
+        }
+
+        /// <summary>日志最大行数，有效范围 50-10000，默认 1000</summary>
+        public static int MaxLogLines
+        {
+            get { int m; return int.TryParse(Get("maxlog", "1000"), out m) && m >= 50 && m <= 10000 ? m : 1000; }
+            set { if (_path == null) return; Reload(); _data["maxlog"] = value.ToString(); Flush(); }
+        }
+
+        /// <summary>上次使用的注入方式（0/1/2），默认 0（CreateRemoteThread）</summary>
+        public static int Method
+        {
+            get { int m; return int.TryParse(Get("method", "0"), out m) && m >= 0 && m <= 2 ? m : 0; }
+            set { if (_path == null) return; Reload(); _data["method"] = value.ToString(); Flush(); }
+        }
+
+        /// <summary>窗口位置 "x,y,w,h"，空表示未记忆</summary>
+        public static string WindowPos
+        {
+            get { return Get("winpos", ""); }
+            set { if (_path == null) return; Reload(); _data["winpos"] = value; Flush(); }
+        }
+    }
+
+    /// <summary>主题色板（亮 / 暗）</summary>
+    internal static class Theme
+    {
+        public static bool Dark;
+        public static Color Back => Dark ? Color.FromArgb(32, 32, 36) : Color.White;
+        public static Color Fore => Dark ? Color.FromArgb(232, 232, 232) : Color.FromArgb(20, 20, 20);
+        public static Color BoxBack => Dark ? Color.FromArgb(45, 45, 48) : Color.White;
+        public static Color BoxFore => Dark ? Color.FromArgb(240, 240, 240) : Color.Black;
+        public static Color TipFore => Dark ? Color.FromArgb(160, 160, 160) : Color.Gray;
+        public static Color ButtonBack => Dark ? Color.FromArgb(63, 63, 70) : Color.FromArgb(240, 240, 240);
+        public static Color Accent => Color.FromArgb(22, 119, 255);
     }
 
     internal static class Program

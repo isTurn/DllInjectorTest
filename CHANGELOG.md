@@ -5,6 +5,20 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## v1.0.0（2026-09-07）
+
+### 新增：第 5 种注入方式——手动映射注入（Manual Map）
+
+- 新增注入方式 `mm`（GUI「注入方式」下拉框 + CLI `-method mm`）：不调用 `LoadLibrary`，
+  由注入器内置的 shellcode 在目标进程内完成全部 PE 映射（校验 PE → PEB 定位 kernel32 →
+  解析导出表 → VirtualAlloc 镜像 → 拷节 + BSS 补零 → 重定位 → 填 IAT → 调用 DllMain）。
+- **普通 LoadLibrary 型 DLL 即可注入**，能绕开基于 LoadLibrary 挂钩的检测（EDR / 杀软常监控 LoadLibrary）。
+- shellcode 为纯汇编手写：x64 1202 字节 / x86 956 字节，源码在 `test/ManualMap/`；
+  64 位下模块基址经结果区完整回传（线程退出码只有 32 位，会截断）。
+- 导出函数调用在手动映射模式下改用 shellcode 返回的完整模块基址 + 导出 RVA 直接计算地址
+  （该模块不在目标进程模块列表，属正常）；x86 stdcall 导出名自动兼容 `_函数名@N` 装饰名。
+- 实机验证：x64 / x86 双架构注入普通进程，`Init` 返回 42、`InstallHook` 返回 1。
+
 ## [Unreleased]
 
 ### 新增

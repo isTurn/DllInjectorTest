@@ -1,4 +1,4 @@
-﻿name: build
+name: build
 
 on:
   push:
@@ -71,5 +71,5 @@ jobs:
 
             自包含单文件，无需安装 .NET 环境即可直接运行。使用方法见仓库 README。
 
-            注入方式：CreateRemoteThread / NtCreateThreadEx / QueueUserAPC / 反射式注入（Reflective）。
+            注入方式：CreateRemoteThread / NtCreateThreadEx / QueueUserAPC / 反射式注入（Reflective）/ 手动映射注入（Manual Map）。
 

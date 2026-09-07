@@ -7,7 +7,7 @@
 [![.NET](https://img.shields.io/badge/.NET-8.0-512BD4?style=flat-square&logo=dotnet)](https://dotnet.microsoft.com/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20x64%20%7C%20x86-0078D6?style=flat-square&logo=windows)]()
 
-一个带图形界面的 Windows 工具：选择目标 exe 和要注入的 dll，点击「注入并启动」，工具会以**挂起方式启动目标程序 → 批量注入 DLL → 恢复运行**；也可以**向运行中的进程直接注入**，或**卸载已注入的 DLL**。支持 **x64 / x86** 双架构、**多 DLL 批量注入**、**启动参数透传**、**四种注入方式**、**注入后调用 DLL 导出函数**与**注入结果自动核验**。
+一个带图形界面的 Windows 工具：选择目标 exe 和要注入的 dll，点击「注入并启动」，工具会以**挂起方式启动目标程序 → 批量注入 DLL → 恢复运行**；也可以**向运行中的进程直接注入**，或**卸载已注入的 DLL**。支持 **x64 / x86** 双架构、**多 DLL 批量注入**、**启动参数透传**、**五种注入方式**、**注入后调用 DLL 导出函数**与**注入结果自动核验**。
 
 ## 界面预览
 
@@ -20,7 +20,7 @@
 - **多 DLL 批量注入**：DLL 输入框内用 `;` 分隔多个 DLL，一次性全部注入（GUI / CLI 均支持）；GUI 提供「⇅ 排序」对话框（支持拖拽重排 / 上移 / 下移 / 删除），可自由调整多 DLL 的注入顺序
 - **启动参数透传**：启动目标程序时可附加命令行参数（GUI「启动参数」输入框 / CLI `-args`）
 - **注入后调用 DLL 导出函数**：注入成功后自动远程调用指定导出函数（如 `InstallHook` / `Init`），可传入一个字符串参数，**也支持多参数**（调用参数内用 `||` 分隔，DLL 侧以字符串指针数组接收）；「启动时注入」与「注入到运行中进程」均支持（GUI「导出函数」「调用参数」输入框 / CLI `-export` / `-exportarg`）
-- **注入方式可选**：`CreateRemoteThread`（兼容性最好）、`NtCreateThreadEx`（底层、隐蔽性较好）、`QueueUserAPC`（仅启动时注入，隐蔽性最好）、**反射式注入**（Reflective：针对自带 `ReflectiveLoader` 导出的反射 DLL，由 DLL 自行在目标进程内完成 PE 映射，不落盘更隐蔽）
+- **注入方式可选**：`CreateRemoteThread`（兼容性最好）、`NtCreateThreadEx`（底层、隐蔽性较好）、`QueueUserAPC`（仅启动时注入，隐蔽性最好）、**反射式注入**（Reflective：针对自带 `ReflectiveLoader` 导出的反射 DLL，由 DLL 自行在目标进程内完成 PE 映射，不落盘更隐蔽）、**手动映射注入**（Manual Map：注入器内置 shellcode 在目标进程内完成全部 PE 映射，不调用 LoadLibrary，普通 DLL 即可用，能绕开基于 LoadLibrary 挂钩的检测）
 - **注入到运行中进程**：点击「刷新」枚举当前进程（名称 + PID），选中后一键注入（OpenProcess + 远程 LoadLibraryW）
 - **批量注入（多进程）**：GUI「批量注入」弹出进程多选对话框（支持按名称筛选），勾选多个进程一次性注入并**汇总成功/失败结果**；CLI 用 `-injectname <进程名>`（支持 `*` `?` 通配）或 `-injectpid <pid1,pid2,...>`（逗号分隔多 PID）批量注入，位数不符的进程自动跳过
 - **注入前 PE 体检**：注入前自动对每个 DLL 做结构体检（有效 PE、位数、是否为 DLL、导出表、重定位段、可执行段），不合格直接拦截并给出原因；也可用 `-checkdll <dll...>` 单独体检
@@ -85,7 +85,7 @@ DllInjector-x64.exe -checkdll <dll1> [dll2 ...]
 ```
 
 - `-args`：附加给目标程序的命令行参数（可含空格）
-- `-method`：注入方式，`crt`（默认，CreateRemoteThread）/ `ntc`（NtCreateThreadEx）/ `apc`（QueueUserAPC，仅启动时）/ `rfi`（反射式注入，DLL 需自带 `ReflectiveLoader` 导出）
+- `-method`：注入方式，`crt`（默认，CreateRemoteThread）/ `ntc`（NtCreateThreadEx）/ `apc`（QueueUserAPC，仅启动时）/ `rfi`（反射式注入，DLL 需自带 `ReflectiveLoader` 导出）/ `mm`（手动映射注入，不调用 LoadLibrary，普通 DLL 即可用）
 - `-export`：注入成功后要调用的 DLL 导出函数名（可空）
 - `-exportarg`：传给该导出函数的参数；多个参数用 `||` 分隔（UTF-16，可空）
 - `-injectpid`：支持**多个 PID 用逗号分隔**，逐个批量注入并汇总结果
@@ -112,6 +112,7 @@ DllInjector-x64.exe -checkdll <dll1> [dll2 ...]
 | `NtCreateThreadEx` | ✅ | ✅ | 直接调用 ntdll 底层线程创建，绕过部分 API 钩子，隐蔽性较好 |
 | `QueueUserAPC` | ✅（推荐） | ❌（自动降级 CRT） | 不创建新线程，隐蔽性最好；要求目标主线程处于**可告警等待**（SleepEx / 消息循环），否则 APC 不会执行 |
 | `反射式注入 (Reflective)` | ✅ | ✅ | 不把 DLL 落盘、不调用 LoadLibrary，由 DLL 自带 `ReflectiveLoader` 在目标进程内完成 PE 映射/重定位/填 IAT，磁盘无痕迹，隐蔽性最强；要求 DLL 本身是**反射 DLL** |
+| `手动映射注入 (Manual Map)` | ✅ | ✅ | 不调用 LoadLibrary：注入器把 shellcode 写进目标进程，由它在进程内完成 PE 映射/重定位/填 IAT/调 DllMain；**普通 DLL 即可用**，能绕开基于 LoadLibrary 挂钩的检测 |
 
 > 说明：`QueueUserAPC` 仅适用于「启动时注入」——注入器在挂起状态下把 `LoadLibraryW` 排入目标主线程的 APC 队列，目标程序恢复运行并进入可告警等待时执行。若目标程序主线程从不进入可告警等待，该方式不会生效，此时请改用另两种方式。
 > 说明：反射式注入的 DLL 必须自带 `ReflectiveLoader` 导出函数（普通 `LoadLibrary` 型 DLL 请改用 CRT/NTC/APC 方式）。x86 反射 DLL 对全局量采用绝对寻址，要求目标进程的映像基址（通常 `0x10000000`）空闲可分配。
@@ -191,6 +192,33 @@ WaitForSingleObject(15s) → 线程退出码非 0 即成功（返回映射模块
 > 反射 DLL 的 `ReflectiveLoader` 全部工作在**目标进程内**：先通过 PEB 的模块链手工找到 kernel32（x86 从 `FS:[0x30]` 取 PEB，x64 从 `GS:[0x60]` 取），再解析其导出表拿到 `VirtualAlloc / LoadLibraryA / GetProcAddress` 等函数；随后为镜像分配新内存、逐节复制、按基址增量重定位、填充导入表，最后调用 `DllMain(DLL_PROCESS_ATTACH)`。整个过程不产生任何磁盘文件。
 > 仓库 `test/TestReflectiveDll/` 提供**自包含反射加载器**示例（`ReflectiveLoader_x64.asm` / `ReflectiveLoader_x86.asm` + C 源码），已编译 x64/x86 两个反射 DLL，可直接配合反射式注入使用。
 
+### 手动映射注入（Manual Map）
+
+```
+PeHelper 校验 PE（MZ/PE 签名/位数）
+      │  注入器本地解析 DLL 文件头
+      ▼
+VirtualAllocEx：rawBuf(DLL 字节) + argsBuf(MmArgs + 结果区) + scBuf(shellcode, RWX)
+      │  shellcode = 注入器内置的手动映射器（x64 1202B / x86 956B）
+      ▼
+CreateRemoteThread(scBuf, argsBuf)
+      │  远程线程在目标进程内执行 shellcode
+      ▼
+shellcode 在目标进程内完成：
+      │  校验 MZ/PE32(32/64) → PEB 定位 kernel32（x86 FS:[0x30] / x64 GS:[0x60]）
+      │  → 解析导出表拿 VirtualAlloc / LoadLibraryA / GetProcAddress
+      │  → VirtualAlloc(SizeOfImage, RWX) → 拷头 + 逐节按 PointerToRawData 拷贝 + BSS 补零
+      │  → 按基址增量应用重定位 → 填 IAT（名字/序数双路径）→ 调用 DllMain(PROCESS_ATTACH)
+      │  → 把完整模块基址写回结果区（64 位下线程退出码会截断，基址经结果区完整回传）
+      ▼
+WaitForSingleObject(15s) → 注入器读回结果区模块基址
+      │
+      ▼
+  手动映射注入完成（不调用 LoadLibrary，LoadLibrary 链路被完全绕开）
+```
+
+> 与反射式注入的区别：反射式要求 DLL 自带 `ReflectiveLoader`，由 DLL 自己完成映射；手动映射由**注入器提供的 shellcode** 在目标进程内完成全部 PE 映射工作，因此**普通 LoadLibrary 型 DLL 也能注入**，同时同样绕开基于 LoadLibrary 挂钩的检测（EDR / 杀软常监控 LoadLibrary）。shellcode 源码在 `test/ManualMap/`（`ManualMap_x64.asm` / `ManualMap_x86.asm`），经 ml64 / ml 编译后由脚本提取字节内嵌进注入器。
+
 ### 注入后调用 DLL 导出函数
 
 ```
@@ -264,6 +292,9 @@ DllInjectorTest/
 │   │   ├── Reflective.def / build.bat
 │   │   ├── TestReflectiveDll-x64.dll  #   加载成功后写 C:\Windows\Temp\rfi_call_log.txt 两行日志
 │   │   └── TestReflectiveDll-x86.dll
+│   ├── ManualMap/               # 手动映射注入 shellcode（源码 + 编译中间物，字节已内嵌注入器）
+│   │   ├── ManualMap_x64.asm    #   x64 手动映射器（1202 字节，已实机验证 Init=42 / InstallHook=1）
+│   │   └── ManualMap_x86.asm    #   x86 手动映射器（956 字节，已实机验证 Init=42 / InstallHook=1）
 │   ├── TestDll/                 # 自测用注入 DLL 源码（DllMain 写标记文件验证，支持前缀宏区分多 DLL）
 │   ├── TestTarget/              # 自测用目标程序源码（支持命令行参数回显）
 │   └── build_test.bat           # 编译测试素材的脚本（MSVC）
@@ -282,6 +313,7 @@ DllInjectorTest/
 - **仅支持原生 DLL**：需为含 `DllMain` 的 C/C++ 编译产物，托管 .NET DLL 无法以此方式执行代码；
 - **导出函数调用约定**：被调用的导出函数应接受**一个指针参数**——单参数时指向目标进程内 UTF-16 文本（未填参数时为 `NULL`）；多参数（`||` 分隔）时指向 **NULL 结尾的字符串指针数组**，DLL 侧用 `LPVOID* args` 逐个访问；函数若阻塞超过 15 秒会被判定超时；QueueUserAPC 为异步加载，调用导出函数时 DLL 可能尚未加载完成，建议使用 CRT/NTC 方式；
 - **反射式注入的要求**：DLL 必须自带 `ReflectiveLoader` 导出；x86 反射 DLL 用绝对寻址，要求目标进程映像基址（通常 `0x10000000`）空闲，若被占用注入会失败（x64 无此限制）；反射映射成功后注入器保留映射内存直至目标进程退出；
+- **手动映射注入的说明**：不调用 LoadLibrary，模块**不会出现在目标进程模块列表**（属正常）；调用导出函数时用 shellcode 返回的模块基址 + 导出 RVA 直接计算地址；要求目标进程位数与注入器一致；x86 的 stdcall 导出函数在查找时自动兼容 `_函数名@N` 装饰名；
 - **QueueUserAPC 的局限**：仅适用于启动时注入，且目标主线程需处于可告警等待（SleepEx / GetMessage 循环），否则不会执行（核验会提示）；
 - **UAC 提权**：图形界面非管理员启动时自动请求管理员权限；若不希望每次弹 UAC，可取消后按普通权限使用（普通进程注入无需提权）；
 - **SeDebugPrivilege**：以管理员运行时会自动启用调试权限，从而能打开/注入 SYSTEM 等高权限或其它会话的进程；普通权限令牌下该权限不存在，注入这类进程会提示权限不足；

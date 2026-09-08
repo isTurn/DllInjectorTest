@@ -19,6 +19,19 @@
   （该模块不在目标进程模块列表，属正常）；x86 stdcall 导出名自动兼容 `_函数名@N` 装饰名。
 - 实机验证：x64 / x86 双架构注入普通进程，`Init` 返回 42、`InstallHook` 返回 1。
 
+### 新增：手动映射注入（MM）的卸载
+
+- 「卸载 DLL」对手动映射注入的模块生效：MM DLL 不在目标进程模块列表（`FreeLibrary` 无效），
+  卸载时改为在目标进程内执行**卸载 shellcode**——调用 `DllMain(DLL_PROCESS_DETACH)` 后按镜像整体 `VirtualFree` 释放。
+- 卸载 shellcode 为纯汇编手写：x64 520 字节 / x86 451 字节（源码 `test/ManualMap/UnmapDll_*.asm`），
+  复用已验证的 PEB → kernel32 → 导出表解析模式；入口参数仅为模块基址。
+- **基址跨进程持久化**：手动映射注入成功后把 `PID | DLL 路径 → 模块基址` 写入同目录 `DllInjector.mmmap`，
+  注入器进程重启后仍能按文件卸载（CLI 注入与卸载分属两次进程也可正常工作）；卸载成功后自动清理记录。
+- 修复：x86 手动映射注入调用 `DllMain` 时 `hinst` 参数偏移错误（多 4 字节读到 delta 槽），
+  修正为直接取映射基址——不影响 Init/InstallHook 返回值，但会让使用 `hinst` 定位自身路径的 DLL 行为异常。
+- 实机验证：x64 / x86 双架构注入 32/64 位 `cmd.exe` 后卸载，shellcode 返回 1，
+  `ReadProcessMemory` 读取原模块基址返回 `ERROR_PARTIAL_COPY`（内存已释放）。
+
 ## [Unreleased]
 
 ### 新增

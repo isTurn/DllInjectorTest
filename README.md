@@ -163,6 +163,11 @@ CreateRemoteThread(LoadLibraryW)            CreateRemoteThread(FreeLibrary)
 
 > 说明：64 位进程中模块句柄是 64 位值，而远程线程退出码只有 32 位，直接把退出码当句柄传给 `FreeLibrary` 会导致卸载失败；本工具改为在注入器侧枚举目标进程模块取得完整基址，因此 x64 / x86 卸载均可靠。
 
+> **手动映射（`mm`）注入的 DLL 卸载**：MM DLL 不在目标进程模块列表，枚举与 `FreeLibrary` 均无效。
+> 「卸载 DLL」会先查手动映射基址记录（注入时写入同目录 `DllInjector.mmmap`，支持跨进程 / 重启注入器后卸载），
+> 命中后在目标进程内执行卸载 shellcode：调用 `DllMain(DLL_PROCESS_DETACH)` → 按镜像整体 `VirtualFree` 释放，
+> 全程不调 `FreeLibrary`。x64 520 字节 / x86 451 字节，源码见 `test/ManualMap/UnmapDll_*.asm`。
+
 ### 反射式注入（Reflective）
 
 ```

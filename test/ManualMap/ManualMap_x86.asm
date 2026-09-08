@@ -318,7 +318,7 @@ $skip_iat:
     add  eax, [esp+04h]         ; entry = newBase + entryRVA
     push 0                      ; reserved
     push 1                      ; DLL_PROCESS_ATTACH
-    push dword ptr [esp+04h+0Ch] ; hinst = newBase (3 pushes -> [esp+0Ch])
+    push dword ptr [esp+0Ch]     ; hinst = newBase (3 pushes -> [esp+0Ch])
     call eax
 $no_entry:
 

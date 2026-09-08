@@ -1,10 +1,11 @@
 # gen_shellcode.py -- extract .text$mn machine code from COFF obj -> C# byte[]
-import struct
+# Usage: python gen_shellcode.py [ManualMap_x64] [ManualMap_x86] [UnmapDll_x64] [UnmapDll_x86]
+#   (defaults to all four; args are obj basenames without .obj)
+import struct, sys
 
 def extract_text(path):
     with open(path, 'rb') as f:
         data = f.read()
-    # COFF object: no DOS/PE header, direct COFF format
     num_sections = struct.unpack_from('<H', data, 2)[0]
     opt_size = struct.unpack_from('<H', data, 16)[0]
     sec_off = 20 + opt_size
@@ -14,7 +15,6 @@ def extract_text(path):
         _, _, rawsize, rawptr = struct.unpack_from('<IIII', data, off + 8)
         if name.startswith('.text'):
             blob = data[rawptr:rawptr+rawsize]
-            # strip trailing zero padding (COFF aligns raw to 4)
             while len(blob) > 0 and blob[-1] == 0:
                 blob = blob[:-1]
             return blob
@@ -27,13 +27,23 @@ def fmt(blob):
         lines.append('        ' + ', '.join('0x%02X' % b for b in chunk) + ',')
     return '\n'.join(lines)
 
-x64 = extract_text('ManualMap_x64.obj')
-x86 = extract_text('ManualMap_x86.obj')
-print('x64 bytes:', len(x64))
-print('x86 bytes:', len(x86))
+jobs = [
+    ('ManualMap_x64.obj', 'ManualMapX64', 'shellcode_x64.cs'),
+    ('ManualMap_x86.obj', 'ManualMapX86', 'shellcode_x86.cs'),
+    ('UnmapDll_x64.obj',  'UnmapDllX64',  'unmap_x64.cs'),
+    ('UnmapDll_x86.obj',  'UnmapDllX86',  'unmap_x86.cs'),
+]
 
-with open('shellcode_x64.cs', 'w', encoding='utf-8') as f:
-    f.write('        public static readonly byte[] ManualMapX64 =\n        {\n' + fmt(x64) + '\n        };\n')
-with open('shellcode_x86.cs', 'w', encoding='utf-8') as f:
-    f.write('        public static readonly byte[] ManualMapX86 =\n        {\n' + fmt(x86) + '\n        };\n')
-print('written: shellcode_x64.cs / shellcode_x86.cs')
+names = sys.argv[1:] or [j[0][:-4] for j in jobs]
+out = []
+for obj, cname, csfile in jobs:
+    if obj[:-4] not in names:
+        continue
+    blob = extract_text(obj)
+    out.append((cname, blob))
+    with open(csfile, 'w', encoding='utf-8') as f:
+        f.write('        public static readonly byte[] %s =\n        {\n%s\n        };\n' % (cname, fmt(blob)))
+    print('%s -> %s (%d bytes)' % (obj, csfile, len(blob)))
+
+# print a one-line size summary for the caller
+print('SUMMARY: ' + ', '.join('%s=%d' % (n, len(b)) for n, b in out))

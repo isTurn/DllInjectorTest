@@ -1301,24 +1301,102 @@ namespace DllInjector
     /// <summary>注入核心逻辑（GUI 与命令行模式共用）</summary>
     internal static class InjectorCore
     {
-        /// <summary>手动映射注入的 DLL 基址记录（dll 路径 → 完整模块基址），供「卸载 DLL」使用。
-        /// 仅本注入器进程内有效：注入器退出后丢失（手动映射 DLL 不在目标进程模块列表，无法重新枚举）。</summary>
-        public static readonly System.Collections.Concurrent.ConcurrentDictionary<string, long> MmBases = new();
+        /// <summary>一条手动映射注入记录。</summary>
+        public readonly struct MmRecord
+        {
+            /// <summary>目标进程内的完整模块基址（手动映射的映像不进模块列表，只能靠这个记住）。</summary>
+            public readonly long Base;
+            /// <summary>记录时目标进程的启动时间（Ticks）。0 = 未知（旧格式记录），此时无法识别 PID 复用。</summary>
+            public readonly long StartTicks;
+            public MmRecord(long moduleBase, long startTicks) { Base = moduleBase; StartTicks = startTicks; }
+        }
 
-        /// <summary>手动映射基址的跨进程持久化文件（key = "pid|dll路径"，value = 基址十六进制）。
+        /// <summary>手动映射注入的 DLL 基址记录（key = "pid|dll路径"），供「卸载 DLL」使用。
+        /// 仅本注入器进程内有效：注入器退出后丢失（手动映射 DLL 不在目标进程模块列表，无法重新枚举）。</summary>
+        public static readonly System.Collections.Concurrent.ConcurrentDictionary<string, MmRecord> MmBases = new();
+
+        /// <summary>手动映射基址的跨进程持久化文件（key = "pid|dll路径"，
+        /// value = "基址十六进制|进程启动时间十六进制"；启动时间用于识别 PID 复用）。
         /// 注入器进程退出后，只要目标进程还活着，重启注入器仍可按此文件卸载手动映射 DLL。</summary>
         private static readonly string MmMapPath = System.IO.Path.Combine(AppContext.BaseDirectory, "DllInjector.mmmap");
+
+        /// <summary>取进程启动时间（Ticks）。进程不存在或无权查询时返回 0。</summary>
+        private static long GetProcessStartTicks(int pid)
+        {
+            try
+            {
+                using (var p = System.Diagnostics.Process.GetProcessById(pid))
+                    return p.StartTime.Ticks;
+            }
+            catch { return 0; }
+        }
+
+        private static bool ProcessExists(int pid)
+        {
+            try
+            {
+                using (var p = System.Diagnostics.Process.GetProcessById(pid)) { return true; }
+            }
+            catch { return false; }
+        }
+
+        /// <summary>校验一条手动映射记录是否仍然可信。
+        /// 进程已退出 → 记录必然失效（映像随进程一起消失）。
+        /// 进程还在但启动时间对不上 → PID 被复用，这是**另一个**进程，按旧基址去卸载会破坏无关进程。
+        /// 启动时间未知（旧格式记录）或读不到时保守保留，只做「进程是否存在」这一层判断。</summary>
+        private static bool IsMmRecordValid(int pid, long recordedStartTicks, out string reason)
+        {
+            reason = null;
+            if (!ProcessExists(pid)) { reason = $"目标进程 {pid} 已退出"; return false; }
+            if (recordedStartTicks != 0)
+            {
+                long current = GetProcessStartTicks(pid);
+                if (current != 0 && current != recordedStartTicks)
+                { reason = $"PID {pid} 已被其它进程复用"; return false; }
+            }
+            return true;
+        }
+
+        private static bool TryParseMmKey(string key, out int pid, out string dllPath)
+        {
+            pid = 0; dllPath = null;
+            if (string.IsNullOrEmpty(key)) return false;
+            int sep = key.IndexOf('|');
+            if (sep <= 0 || sep >= key.Length - 1) return false;
+            if (!int.TryParse(key.Substring(0, sep), out pid) || pid <= 0) return false;
+            dllPath = key.Substring(sep + 1);
+            return true;
+        }
+
+        private static string EncodeMmValue(long moduleBase, long startTicks)
+            => moduleBase.ToString("X") + "|" + startTicks.ToString("X");
+
+        /// <summary>解析记录值。兼容旧格式（只有基址、没有启动时间）。</summary>
+        private static bool TryDecodeMmValue(string value, out long moduleBase, out long startTicks)
+        {
+            moduleBase = 0; startTicks = 0;
+            if (string.IsNullOrEmpty(value)) return false;
+            string[] parts = value.Split('|');
+            if (!long.TryParse(parts[0], System.Globalization.NumberStyles.HexNumber,
+                    System.Globalization.CultureInfo.InvariantCulture, out moduleBase) || moduleBase == 0)
+                return false;
+            if (parts.Length > 1)
+                long.TryParse(parts[1], System.Globalization.NumberStyles.HexNumber,
+                    System.Globalization.CultureInfo.InvariantCulture, out startTicks);
+            return true;
+        }
 
         /// <summary>记录手动映射注入的 DLL 基址（内存 + 落盘）。</summary>
         public static void RecordMmBase(int pid, string dllPath, long baseAddr)
         {
             string key = pid + "|" + dllPath;
-            MmBases[key] = baseAddr;
+            long startTicks = GetProcessStartTicks(pid);
+            MmBases[key] = new MmRecord(baseAddr, startTicks);
             try
             {
                 var map = LoadMmMapFile();
-                map[key] = baseAddr.ToString("X");
-                File.WriteAllText(MmMapPath, System.Text.Json.JsonSerializer.Serialize(map));
+                map[key] = EncodeMmValue(baseAddr, startTicks);
+                SaveMmMapFile(map);
             }
             catch { /* 落盘失败不影响注入本身 */ }
         }
@@ -1331,19 +1409,40 @@ namespace DllInjector
             try
             {
                 var map = LoadMmMapFile();
-                if (map.Remove(key)) File.WriteAllText(MmMapPath, System.Text.Json.JsonSerializer.Serialize(map));
+                if (map.Remove(key)) SaveMmMapFile(map);
             }
             catch { }
         }
 
-        /// <summary>启动时把上次的持久化记录读入内存，供跨进程卸载使用。</summary>
+        /// <summary>启动时把上次的持久化记录读入内存，供跨进程卸载使用。
+        /// 顺带剔除失效记录——进程已退出的、以及 PID 被复用的（后者尤其危险：
+        /// 命中陈旧基址会去卸载无关进程）。清理结果写回文件，避免记录只增不减。</summary>
         public static void LoadMmMap()
         {
             try
             {
-                foreach (var kv in LoadMmMapFile())
-                    MmBases[kv.Key] = Convert.ToInt64(kv.Value, 16);
+                var file = LoadMmMapFile();
+                var kept = new System.Collections.Generic.Dictionary<string, string>();
+                int dropped = 0;
+                foreach (var kv in file)
+                {
+                    if (!TryParseMmKey(kv.Key, out int pid, out _) ||
+                        !TryDecodeMmValue(kv.Value, out long moduleBase, out long startTicks))
+                    { dropped++; continue; }
+
+                    if (!IsMmRecordValid(pid, startTicks, out _)) { dropped++; continue; }
+
+                    MmBases[kv.Key] = new MmRecord(moduleBase, startTicks);
+                    kept[kv.Key] = kv.Value;
+                }
+                if (dropped > 0) SaveMmMapFile(kept);
             }
+            catch { }
+        }
+
+        private static void SaveMmMapFile(System.Collections.Generic.Dictionary<string, string> map)
+        {
+            try { File.WriteAllText(MmMapPath, System.Text.Json.JsonSerializer.Serialize(map)); }
             catch { }
         }
 
@@ -1537,7 +1636,7 @@ namespace DllInjector
                 else
                     foreach (var dll in injected)
                         CallExport(pi.hProcess, pi.dwProcessId, dll, exportFunc, exportArg, log,
-                            InjectorCore.MmBases.TryGetValue(pi.dwProcessId + "|" + dll, out long mmBase) ? mmBase : 0);
+                            InjectorCore.MmBases.TryGetValue(pi.dwProcessId + "|" + dll, out MmRecord mmRec) ? mmRec.Base : 0);
             }
 
             NativeMethods.CloseHandle(pi.hProcess);
@@ -1552,7 +1651,7 @@ namespace DllInjector
                     if (method == NativeMethods.INJECT_RFI)
                         log($"核验通过：{Path.GetFileName(dll)} 反射映射成功（ReflectiveLoader 返回句柄非零；反射 DLL 不进入进程模块列表属正常）。");
                     else if (method == NativeMethods.INJECT_MM)
-                        log($"核验通过：{Path.GetFileName(dll)} 手动映射成功（shellcode 返回完整基址 0x{(InjectorCore.MmBases.TryGetValue(pi.dwProcessId + "|" + dll, out long mmb) ? mmb : 0):X}；手动映射 DLL 不进入进程模块列表属正常）。");
+                        log($"核验通过：{Path.GetFileName(dll)} 手动映射成功（shellcode 返回完整基址 0x{(InjectorCore.MmBases.TryGetValue(pi.dwProcessId + "|" + dll, out MmRecord mmb) ? mmb.Base : 0):X}；手动映射 DLL 不进入进程模块列表属正常）。");
                     else if (!VerifyModuleLoaded(pi.dwProcessId, dll, log)) verifyOk = false;
                 }
                 if (!verifyOk && method == NativeMethods.INJECT_APC)
@@ -1646,7 +1745,7 @@ namespace DllInjector
                     else
                         foreach (var dll in injected)
                             CallExport(hProcess, pid, dll, exportFunc, exportArg, log,
-                                InjectorCore.MmBases.TryGetValue(pid + "|" + dll, out long mmBase) ? mmBase : 0);
+                                InjectorCore.MmBases.TryGetValue(pid + "|" + dll, out MmRecord mmRec) ? mmRec.Base : 0);
                 }
 
                 if (injected.Count > 0)
@@ -1657,7 +1756,7 @@ namespace DllInjector
                         if (useMethod == NativeMethods.INJECT_RFI)
                             log($"核验通过：{Path.GetFileName(dll)} 反射映射成功（ReflectiveLoader 返回句柄非零）。");
                         else if (useMethod == NativeMethods.INJECT_MM)
-                            log($"核验通过：{Path.GetFileName(dll)} 手动映射成功（shellcode 返回完整基址 0x{(InjectorCore.MmBases.TryGetValue(pid + "|" + dll, out long mmb) ? mmb : 0):X}；手动映射 DLL 不进入进程模块列表属正常）。");
+                            log($"核验通过：{Path.GetFileName(dll)} 手动映射成功（shellcode 返回完整基址 0x{(InjectorCore.MmBases.TryGetValue(pid + "|" + dll, out MmRecord mmb) ? mmb.Base : 0):X}；手动映射 DLL 不进入进程模块列表属正常）。");
                         else
                             VerifyModuleLoaded(pid, dll, log);
                     }
@@ -1744,14 +1843,23 @@ namespace DllInjector
                 {
                     // 枚举不到模块：可能是手动映射注入的 DLL（不在目标进程模块列表）。
                     // 查本注入器进程内记录的手动映射基址，命中则走卸载 shellcode（DllMain(DETACH) + VirtualFree）。
+                    // 用之前必须再校验一次记录是否仍然可信：进程可能已退出，或 PID 已被别的进程复用。
+                    // 拿陈旧基址去执行卸载，会在一个无关进程里调 DllMain(DETACH) 并 VirtualFree，破坏它。
                     long mmBase = 0;
                     string mmKey = null;
                     foreach (var kv in InjectorCore.MmBases)
                     {
-                        string[] parts = kv.Key.Split('|');
-                        if (parts.Length == 2 && parts[0] == pid.ToString()
-                            && string.Equals(Path.GetFileName(parts[1]), moduleName, StringComparison.OrdinalIgnoreCase))
-                        { mmBase = kv.Value; mmKey = kv.Key; break; }
+                        if (!TryParseMmKey(kv.Key, out int recPid, out string recPath)) continue;
+                        if (recPid != pid) continue;
+                        if (!string.Equals(Path.GetFileName(recPath), moduleName, StringComparison.OrdinalIgnoreCase)) continue;
+
+                        if (!IsMmRecordValid(pid, kv.Value.StartTicks, out string staleReason))
+                        {
+                            log($"忽略并清理失效的手动映射记录：{staleReason}。");
+                            InjectorCore.UnrecordMmBase(kv.Key);
+                            continue;
+                        }
+                        mmBase = kv.Value.Base; mmKey = kv.Key; break;
                     }
                     if (mmBase != 0)
                     {

@@ -39,6 +39,10 @@
   - 逐变量二分验证：只补 `APPDATA` → `UserSettingsDirectory` 恢复；只补 `ProgramFiles` → `MachineWideSettingsBaseDirectory` 恢复；两者齐备后 `dotnet restore` 立即成功
   - 已让 `build.bat` 在启动时**防御性补回**缺失的 `APPDATA` / `ProgramFiles` / `ProgramW6432` / `ALLUSERSPROFILE`
   - **已验证**：`build.bat` 的两条 publish 命令（x64 + x86）均成功产出 `out\x64` / `out\x86`，复制出的 `dist\DllInjector-x64.exe` / `dist\DllInjector-x86.exe` 经 `dumpbin -headers` 确认位数分别为 x64 / x86；两个位数版本执行 `-checkdll` 均正确报告目标 DLL 的结构与**导出数量 4**
+- **手动映射基址记录只增不减，PID 被复用时会去卸载无关进程**：`DllInjector.mmmap` 以 `pid|dll路径` 为键记住手动映射 DLL 的基址，供「卸载 DLL」跨进程使用。原实现 `LoadMmMap()` 启动时**全量载入、从不校验、从不清理**，而 `EjectDll` 在目标进程模块列表里找不到模块时（这正是手动映射的典型特征）会**直接按该基址执行卸载 shellcode**——`DllMain(DLL_PROCESS_DETACH)` + `VirtualFree`。一旦 PID 被复用，就会在一个**无关进程**里执行这套操作并破坏它
+  - 现在记录中额外保存**目标进程的启动时间**（值格式 `基址十六进制|启动时间十六进制`，兼容只有基址的旧格式），并在两处校验：`LoadMmMap()` 启动时剔除失效记录并把清理结果写回文件；`EjectDll` 命中记录后、执行卸载前**再校验一次**（进程已退出或 PID 已被复用则拒绝，并顺手清掉该记录）
+  - 启动时间读不到（旧格式记录、无权限）时**保守保留**，只做「进程是否存在」这一层判断，避免误删仍然有效的记录
+  - **已验证**：构造 8 条记录（死 PID、PID 复用、旧格式+存活、旧格式+死 PID、key 格式错误、pid≤0、基址为 0、完全有效）跑 `-checkdll` 触发 `LoadMmMap()`，结果**只保留 2 条应有的记录**（有效的 + 旧格式但进程存活的），其余全部清理
 - **测试素材中残留的硬编码绝对路径 `D:\Download\ToDLL\...` 已全部清除**：`test/TestTarget/TestTarget.c`（标记目录 `MARKER_DIR`）、`test/TestDll/TestDll.c`（同一 `MARKER_DIR`）、`test/TestReflectiveDll/TestLoader.c`（默认反射 DLL 路径）三处均改为运行时按自身模块位置推导，并在写入失败时打印警告而非静默失败。原缺陷的后果是：仓库一旦换目录，测试目标会静默写不出 `args_<pid>.txt` / `attach<A|B>_<pid>.txt`，导致「启动参数透传」「DllMain 是否在目标进程执行」这些功能看起来正常、实际根本没验证到
   - `TestDll.c` 的目录推导采用三级回退：**DLL 自身路径 → 宿主 EXE 路径 → `%TEMP%`**。中间一级是必需的：手动映射注入不会把映像注册进 PEB 模块列表，`GetModuleFileNameA(hModule)` 在该方式下会失败，而测试目标 EXE 与测试 DLL 同处 `test_output\`，回退后标记文件仍落在预期位置
   - 仍保留编译期 `MARKER_DIR` 覆盖能力（`/DMARKER_DIR=...`），只是不再有绝对路径的默认值

@@ -25,8 +25,29 @@
 - **`test/TestHookDll/` 补齐构建入口并统一导出名**：此前该目录只有源码与已编译 DLL，没有任何构建脚本，且 x86 DLL 的导出名带 `__stdcall` 修饰。新增 `TestHookDll.def`（统一导出无修饰名）与 `build.bat`（`vswhere` 定位任意版本 VS、双架构编译、`/utf-8`、`/DEF`、结束后清理中间文件并打印验证命令），并重新编译提交 x64 / x86 两个 DLL
   - **已验证**：`dumpbin -exports` 两个架构都输出 `Init` / `InstallHook` / `InstallConfig` / `InstallMulti`；不带 `.def` 的对照组在 x86 上输出的是 `_Init@4` / `_InstallConfig@4` …，证实修复有效
   - **已验证（功能级，不只是看导出表）**：进程内加载后按**无修饰名** `GetProcAddress` 四个导出全部命中，实际调用返回码正确（`Init`→42、`InstallHook`→1、`InstallConfig`→3 组键值对、`InstallMulti`→3 个参数），并正确写出 `hook_call_log.txt`（含 `张三` 等宽字符参数）。x64 与 x86 均通过
+- **引擎适配表外部化（S3）**：`TextHookDll` 的 profile 从编译期常量搬到运行期文件，改引擎适配不再需要重编译、重新分发 DLL
+  - 新增 `test/TextHookDll/TextHookDll.profiles.ini` 模板（随 DLL 一起分发到 `test_output\`），DLL 从**自身所在目录**自动加载；也可用 `profilefile=<路径>` 指定别处、用 `nofile=1` 完全禁用
+  - 段落内支持 `codepage` / `minlen` / `dedup` / `desc` 与多行 `hook=<模块>,<函数>[,<方式>]`；文件里的 profile 可**同名覆盖**内置的 4 个，因此写一个 `[generic-gdi]` 就能改掉「不传 `engine=` 时」的兜底行为
+  - 解析策略为**全有或全无**：任何一行出错就整份文件不生效、退回内置 profile，并在启动横幅里说明原因。半个 profile 生效比完全没生效更难排查
+  - 未实现的挂钩方式（`inline` / `vtable`，属 S2 / S5）在文件里**明确报错**而不是静默忽略——静默接受会让使用者以为挂钩装上了；`engine=` 写错时告警里直接列出全部可用 profile 名
+  - 启动横幅新增一行报告 profile 文件路径与加载结果（读了哪个文件、加载了几个、叫什么），这是使用者最常问的问题
+  - **能力边界已写入文件头与 ini 注释**：文件只能从框架**已知的 6 个函数**里挑选组合挂钩目标；「哪个参数是文本」是编译期写死在 `ReplacementFor()` 里的，所以「写个文件就能适配任意引擎」暂时做不到，新增未知函数属于 S2 / S4
+  - `HookTarget` 的 `module` / `func` 由 `const char*` 改为内联字符数组，使编译期常量表与运行期文件加载共用同一套结构，文件加载的 profile 无需堆分配，也就不存在 `g_profile` 指向已释放内存的风险
+- **`TestTextHook` 进程内端到端验证**：新增 `test/TextHookDll/TestTextHook.c`。设计文档 §10 原有的验证链路需要三个进程手工配合（起客户端 → 注入器注入 → 目标程序输出文本），无法自动化；本程序把整条链路收进一个进程：自己 `LoadLibrary`、自己调 `InstallConfig` 装钩子、自己用 GDI 输出文本、自己读 `texthook_log.txt` 判断结果
+  - 4 个场景：内置 profile；文件 profile（**只挂 `TextOutA`，因此 `TextOutW` 不该被抓到**——这是 S3 是否真正生效的关键断言）；故意写错的 profile 文件（应整份退回内置且仍能抓到文本）；随仓库分发的模板 ini
+  - 断言覆盖：无修饰导出名可取（x86 `.def` 的回归防线）、启动横幅内容、Shift-JIS → UTF-8 转换正确、profile 对挂钩集合的实际约束、**卸载后主 EXE 的 IAT 已完全还原**（逐槽检查有没有地址落在 DLL 映像范围内）
+  - 期望值一律用 `\uXXXX` 转义写在宽字符串里，不含任何非 ASCII 字面量，因此「抓到的文本对不对」与源码文件编码无关
+  - 支持只跑指定场景（第 3 个参数），用于在全新进程里把「跨场景污染」与「该场景自身的问题」区分开
+  - `build.bat` 现在在编译完成后**自动跑两个架构的测试**，任一位数失败即 `VERIFY_FAIL` 并以非零码退出——「x86 和 x64 都要测试」从人工约定变成一条命令
+  - **已验证**：x64 与 x86 均全部通过
 
 ### 修复
+- **`Unhook` 从未真正卸载主 EXE 的 IAT，DLL 被卸载后游戏会跳进已释放内存**：`HookAllModules` 先显式挂钩主 EXE，随后又遍历模块快照——而快照**本身就包含主 EXE**，于是同一个 IAT 槽被挂了两次、在 `g_patched` 里记了两条。第二条把 `original` 记成了**我们自己的替换函数**，而 `UnhookAll` 顺序还原：第一条写回真实地址、第二条又把它写回替换函数，**最终槽仍指向 DLL 内部**
+  - 真实后果：游戏 EXE 的 IAT 一直指向 `TextHookDll` 里的 `Hook_TextOutA`，DLL 一旦被卸载（或手动映射后被 `VirtualFree`）就是跳进已释放内存
+  - 修复分两层，且**各自单独都足够**（已用三个变体构建交叉验证）：① 预防——`PatchModuleIat` 增加幂等检查（槽已指向替换函数则直接返回），并让 `HookAllModules` 在快照循环里跳过主 EXE；② 兜底——`UnhookAll` 改为**倒序**还原，万一同一个槽仍被记了多条，最后写回的也是最早记下的真实地址
+  - **已验证**：`TestTextHook` 逐槽检查主 EXE 的 6 个 IAT 槽是否还落在 DLL 映像范围内。修复前的构建精确复现了症状（6 个槽全部泄漏、5 项断言失败、退出码 2），修复后 x64 / x86 均为 0 泄漏
+- **`StopHooks` 之后重新安装会得到一个哑巴 DLL**：`StopHooks` 把 `g_stop` 置 1 让读写线程退出，但 `StartHooks` **从未把它清回 0**。于是「`Unhook` 之后再 `InstallConfig`」建出来的两个线程会立刻退出——DLL 看起来装好了、`InstallConfig` 也返回成功，实际一个字节都发不出去。现在 `StartHooks` 在创建线程前复位 `g_stop` 与 `g_pipeBroken`（并顺带复位 `g_patchedCount`）
+- **`TestTextHook` 里的 `Unhook 返回成功` 是句废话**：`Unhook` 恒返回 1，该断言证明不了任何事——上面那个 IAT 泄漏 bug 正是在它「通过」的情况下发生的。已改为逐槽检查主 EXE 的 IAT 是否真的还原
 - **编译中文注释的 C 源码时缺少 `/utf-8`，在中文 Windows 上构建直接失败**：`TextHookDll.c`、`TestTextTarget.c`、`TextHookClient.c`、`TestHookDll.c` 都含 UTF-8 中文注释，而 MSVC 默认按**系统代码页**（中文 Windows 为 936/GBK）解析源码。注释末尾的字节若构成 GBK 前导字节，会**吞掉行尾换行**，把下一行代码并进注释——表现为 `warning C4819` 加一堆莫名其妙的「未声明的标识符」，例如 `TestTextTarget.c` 报 11 个错误、`TextHookDll.c` 报数十个。已给全部 `cl` 命令行补 `/utf-8`（`test/build_test.bat`、`test/TestReflectiveDll/build.bat` 也一并补上，避免后续加中文注释时重蹈覆辙），并同步修正各源文件头部的手工编译说明
 - **`TestTextTarget.c` 未链接 `gdi32.lib` / `user32.lib`，链接必然失败**：该文件直接调用 `TextOutA/W`、`ExtTextOutA/W`、`DrawTextA/W`、`GetDC` 等 GDI/user32 API，却没有 `#pragma comment(lib, ...)`，而 `build.bat` 的链接行也没有指定这两个库，导致 13 个 `__imp_*` 符号无法解析（`error LNK2019`）。已在两条链接命令补上 `gdi32.lib user32.lib`
 - **`TextHookClient.c` 解析管道协议时漏了截断第三个字段，导致文本被打印两遍**：`PrintLine` 用 `*f1 = 0` / `*f2 = 0` 截断 pid 与 hook，却忘了 `*f3 = 0`，于是 `hook` 字段一路吞到行尾，把 hook 名和文本连成一片。实际表现为输出成 `[pid] TextOutA<TAB>こんにちは こんにちは`（hook 列里带着 TAB 和文本，文本重复），且因 hook 串超长导致 `%-14s` 不再补位。已补上截断
@@ -65,6 +86,7 @@
 - 展示页 CLI 示例修正：`-method` 补齐 `rfi`，移除重复出现的 `-eject` 行
 - **构建参数对齐**：`.github/workflows/build.yml` 的 publish 命令补上 `IncludeNativeLibrariesForSelfExtract`，与 `build.bat` 以及文件内「本地与 CI 参数保持一致」的说明对齐（此前 CI 产物缺这一项，两处实际不一致）
 - **移除仓库内重复截图**：`屏幕截图 2026-09-03 133127.png` 与 `screenshot.png` 内容完全相同（SHA256 均为 `d2a640eb…`），删除前者，只保留 `screenshot.png`
+- **统一 `.bat` 行尾为 CRLF**：`.gitattributes` 声明了 `*.bat text eol=crlf`，但工作区里 `test\ManualMap\build_shellcode.bat`、`test\TestReflectiveDll\build.bat`、`test\build_test.bat` 以及新加的 `test\TextHookDll\build.bat` 都是 LF。因为 git 按 CRLF 检出，这次转换**不产生任何 diff**，只是让工作区与声明自洽，并保证不经 git 检出（例如直接下载 zip）时拿到的也是 CRLF
 
 ### 新增
 - **SeDebugPrivilege 自动提权**：注入 / 卸载前自动尝试启用调试权限，以管理员运行时即可打开并注入 SYSTEM 等高权限 / 其他会话进程；普通权限令牌下仅提示、不阻断普通进程注入

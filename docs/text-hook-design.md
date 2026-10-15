@@ -92,6 +92,47 @@ typedef struct {
 > 真实引擎 profile（KiriKiri / BGI / RealLive / Artemis…）需要**对着实机样本逆向**才能填出
 > 正确的 `module!func` 与参数布局——这部分必须一台游戏一份地做，无法凭空推测。
 
+### 3.1 实现现状与上面这张图的差距
+
+上面是**目标形态**。当前 `TextHookDll.c` 里实际落地的 `HookTarget` / `EngineProfile` 是它的子集：
+
+| 字段 | 状态 | 说明 |
+| --- | --- | --- |
+| `module` / `func` / `kind` | ✅ 已实现 | `kind` 目前只有 `HOOK_IAT` |
+| `name` / `codepage` / `minLen` / `dedupMs` | ✅ 已实现 | 可外部化，见 §3.2 |
+| `textArg` / `lenArg` | ❌ 未实现 | 「哪个参数是文本」目前写死在 `ReplacementFor()` 的「函数名 → 提取器」映射里 |
+| `hintClass` / `hintExe` | ❌ 未实现 | `auto` 识别尚未落地，只能靠 `engine=` 显式指定 |
+
+**这张表是理解 S3 能力边界的关键**：因为 `textArg` / `lenArg` 没外部化，
+文件 profile 只能从框架**已知的 6 个函数**里挑，不能引入新函数。
+
+### 3.2 外部化后的 profile 文件（S3）
+
+DLL 从**自身所在目录**读取 `TextHookDll.profiles.ini`，也可用
+`-exportarg "...|profilefile=<路径>"` 指定别处，或用 `nofile=1` 完全禁用。
+
+```ini
+[my-game-jp]
+desc=某日文原版游戏
+codepage=932
+minlen=3
+dedup=400
+hook=gdi32.dll,TextOutA
+hook=gdi32.dll,ExtTextOutA
+hook=user32.dll,DrawTextA
+```
+
+规则：
+
+| 项 | 行为 |
+| --- | --- |
+| 同名覆盖 | 文件里的 `[generic-gdi]` 会覆盖内置的那一个，可用来调兜底行为 |
+| 全有或全无 | 任何一行出错则整份文件不生效、退回内置 profile，并在启动横幅说明原因 |
+| 未实现的方式 | `hook=...,inline` / `hook=...,vtable` **报错**而不是忽略（避免误以为挂钩装上了） |
+| profile 名 | 必须 ASCII。`engine=` 参数是 UTF-16、比对时按 `CP_ACP` 转窄，而文件是 UTF-8，非 ASCII 名必然对不上 |
+| 未知键 | 忽略，给前向兼容留空间 |
+| 可观测性 | 启动横幅单独一行报告「读了哪个文件、加载了几个、叫什么」；`engine=` 写错时告警列出全部可用名 |
+
 ---
 
 ## 4. Hook 策略分层
@@ -232,14 +273,16 @@ CreateProcess(SUSPENDED) → 逐个 LoadLibraryW 注入 DLL → ResumeThread →
 
 | 阶段 | 内容 | 状态 |
 | --- | --- | --- |
-| **S1** | 框架骨架 + IAT Hook + 编码转换 + 管道输出 + `generic-gdi` profile | ✅ 本次实现 |
+| **S1** | 框架骨架 + IAT Hook + 编码转换 + 管道输出 + `generic-gdi` profile | ✅ 已实现 |
 | **S2** | 最小长度反汇编器 + Inline Hook，覆盖 `GetProcAddress` 动态解析的引擎 | 待做 |
-| **S3** | 外部化 profile（INI/JSON 文件，改引擎适配不用重编译 DLL） | 待做 |
+| **S3** | 外部化 profile（INI 文件，改引擎适配不用重编译 DLL） | ✅ 已实现 |
 | **S4** | 具体引擎 profile：对实机样本逆向填 `module!func` 与参数布局 | 待做（需样本） |
 | **S5** | VTable / DirectX 系适配，或改用「读引擎文本缓冲区」路线 | 待做 |
 
-**S3 是性价比最高的下一步**：把 profile 从编译期挪到运行期，
-以后适配新引擎只需要写一个文本文件、不用重新编译和重新分发 DLL。
+S3 完成后，profile 已从编译期挪到运行期：适配新引擎只要写一个文本文件，
+不用重新编译、也不用重新分发 DLL。**但 S3 只外部化了「挑哪些函数、用什么编码、
+去重与长度阈值」，没有外部化「怎么从函数参数里取文本」**——后者仍是编译期的，
+见 §9「已知限制」里的能力边界说明。
 
 ---
 
@@ -248,6 +291,11 @@ CreateProcess(SUSPENDED) → 逐个 LoadLibraryW 注入 DLL → ResumeThread →
 - **启动后有一小段抓不到**：注入器的 `ResumeThread` 早于导出函数调用，
   挂钩装上之前游戏已跑了几十到一两百毫秒，这段文本会漏（详见第 7 节「执行顺序」）
 - **只覆盖 IAT 调用**：走 `GetProcAddress` 的引擎抓不到，需等 S2 的 Inline Hook
+- **profile 文件只能「挑函数」，不能「加函数」**：S3 之后文件可以决定挂哪几个函数、
+  用什么编码、长度与去重阈值，但**「怎么从参数里取文本」仍是编译期的**
+  （`ReplacementFor()` 里的「函数名 → 提取器」映射）。所以适配用了其它文本 API 的引擎
+  仍然要改代码（属 S2 / S4）。文件里写框架不认识的函数名**不会报错，但也不会有任何效果**——
+  这是 S3 最容易被人误解的地方，故在文件头、ini 注释与本文档三处都写明
 - **导入表按模块名精确匹配**：只认 `gdi32.dll` / `user32.dll` 这类直连导入。
   若目标通过 `api-ms-win-*` API Set 间接导入文本函数，当前匹配不到——
   这类二进制需要额外做一层模块名归一化（`api-ms-win-gdi-*` → `gdi32`）
@@ -258,6 +306,14 @@ CreateProcess(SUSPENDED) → 逐个 LoadLibraryW 注入 DLL → ResumeThread →
 - **不做文本合并**：GalGame 常把一句话分多次输出（逐字显示），一阶段按次上报，
   句子重组交给消费端
 - **管道单消费者**：管道只创建单实例，同时挂多个消费者需要改成多实例
+- **管道线程在无人连接时会漏掉一个线程和一个管道实例**（已发现，**暂未修**）：
+  `ConnectNamedPipe` 在阻塞句柄上会一直等客户端，而 `StopHooks` 的 1 秒有界等待超时后
+  只 `CloseHandle` 了**线程句柄**——关线程句柄不会终止线程，于是该线程与它持有的管道实例
+  一直留着。正常用法（注入一次、挂到游戏退出）只在进程收尾时发生一次，影响有限；
+  但反复 `Unhook` / 重装会累积，且残留实例仍占着同名管道、可能抢先接走客户端。
+  干净的修法是改用 `FILE_FLAG_OVERLAPPED` + 事件等待，让循环能及时看到 `g_stop`。
+  之所以先记不修：这条路径需要「有客户端连接」才能真正验证，而当前自动化测试里没有
+  客户端，`StopHooks` 的有界超时又会把实现缺陷掩盖成「只是慢一点」，改它的风险大于收益
 - **不做翻译**：本层只负责「把文本拿出来」，翻译与回填是消费端的事
 - **DirectX 系引擎无解**：一阶段完全不覆盖
 
@@ -265,21 +321,65 @@ CreateProcess(SUSPENDED) → 逐个 LoadLibraryW 注入 DLL → ResumeThread →
 
 ## 10. 验证方式
 
-配套提供了可复现的端到端验证链路（不依赖真实游戏）：
+分两层：**自动化进程内验证**（日常回归，一条命令）与**手工跨进程验证**（贴近真实注入链路）。
+
+### 10.1 自动化：`TestTextHook`（主）
 
 ```bat
-:: 1. 编译测试素材
+:: 编译两个架构，然后自动跑两个架构的验证
 test\TextHookDll\build.bat
+```
 
-:: 2. 起客户端监听管道
-TextHookClient.exe
+`build.bat` 编译完成后会自动执行 `TestTextHook-x64.exe` 与 `TestTextHook-x86.exe`，
+任一架构失败即打印 `VERIFY_FAIL` 并以非零码退出。所以「x86 和 x64 都要测试」是命令保证的，
+不是人工约定。
 
-:: 3. 注入并启动目标程序（目标程序会主动用 GDI 输出日文/中文文本）
+`TestTextHook` 把整条链路收进**一个进程**：自己 `LoadLibrary`、自己调 `InstallConfig`
+装钩子、自己用 GDI 输出文本、自己读 `texthook_log.txt` 判断结果。它跑的 4 个场景：
+
+| 场景 | 目的 |
+| --- | --- |
+| 内置 `generic-gdi` | 基线：6 个函数都能抓到，SJIS → UTF-8 正确 |
+| 文件 profile 只挂 `TextOutA` | **S3 是否真正生效的关键断言**——`TextOutW` 不该被抓到 |
+| 故意写错的 profile 文件 | 全有或全无：应整份退回内置，且仍能抓到文本 |
+| 随仓库分发的模板 ini | 保证分发出去的模板本身可用 |
+
+断言覆盖：无修饰导出名可取（x86 `.def` 的回归防线）、启动横幅内容、编码转换正确、
+profile 对挂钩集合的实际约束、**卸载后主 EXE 的 IAT 已完全还原**
+（逐槽检查有没有地址落在 DLL 映像范围内）。
+
+> 最后那条断言是有来历的：它抓出了「主 EXE 被重复挂钩 → 卸载时把 IAT 槽还原成
+> 我们自己的替换函数」这个缺陷——`Unhook` 恒返回 1，光看返回值完全看不出来。
+> 这也说明**验证要检查副作用，而不是检查返回值**。
+
+`TestTextTarget` / `TestTextHook` 都用**硬编码字节数组或 `\uXXXX` 转义**写期望文本，
+不含任何非 ASCII 字面量，因此「抓到的文本对不对」与源码文件编码无关。
+
+### 10.2 手工：跨进程真实注入链路（补充）
+
+自动化测试走的是 `LoadLibrary`，而真实链路走的是注入器，值得偶尔手工确认一次：
+
+```bat
+:: 1. 起客户端监听管道
+test_output\TextHookClient.exe
+
+:: 2. 注入并启动目标程序（目标程序会主动用 GDI 输出日文/中文文本）
 DllInjector-x64.exe -inject test_output\TextTarget_x64.exe test_output\TextHookDll-x64.dll ^
     -export InstallConfig -exportarg "engine=generic-gdi|cp=932|log=1"
 ```
 
 预期：客户端实时打印捕获到的文本，同时 `texthook_log.txt` 落盘一份。
 
-`TestTextTarget` 用**硬编码的 SJIS 字节数组**输出文本，避免源码文件编码影响测试结果——
-这样「抓到的文本是否正确」是可以确定性判断的。
+注意 `cp=` 是**进程级**的，一个进程只能有一种 `*A` 编码。`TextTarget` 默认输出 Shift-JIS；
+要跑 GBK 就 `TextTarget_x64.exe gbk` 并传 `cp=936`。两者不匹配时 `*A` 文本必然乱码，这是设计使然。
+
+### 10.3 验证 profile 文件是否真的被读到
+
+看 `texthook_log.txt` 开头的启动横幅，它有两行：
+
+```
+[TextHookDll] 已安装 profile=my-game-jp  cp=932  挂钩槽=8  管道=\\.\pipe\GalToolText  PID=1234
+[TextHookDll] profile 文件 D:\...\TextHookDll.profiles.ini 已加载 2 个：my-game-jp, my-game-cn
+```
+
+第二行直接回答「我改的那个文件到底有没有被读到、里面的 profile 认出来了没有」。

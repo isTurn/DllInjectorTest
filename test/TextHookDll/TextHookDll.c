@@ -17,12 +17,26 @@
 //        -export InstallConfig -exportarg "engine=generic-gdi|cp=932|pipe=GalToolText|log=1"
 //
 //  配置项（k=v 用 | 分隔）：
-//    engine=generic-gdi|generic-gdi-sjis|generic-gdi-gbk|generic-unicode  （默认 generic-gdi）
-//    cp=932|936|65001|1200   强制指定 *A 系列文本的代码页（覆盖 profile 默认值）
-//    pipe=<名称>             管道名，默认 GalToolText（实际路径 \\.\pipe\<名称>）
-//    log=1|0                 是否同时落盘 texthook_log.txt（默认 1，便于无客户端时验证）
-//    minlen=<n>              短于此长度的文本丢弃（默认 2）
-//    dedup=<ms>              去重窗口，同一文本在该毫秒数内只上报一次（默认 200）
+//    engine=<profile 名>      见下方「引擎适配表」；默认 generic-gdi
+//    profilefile=<路径>       指定 profile 文件（默认 DLL 同目录 TextHookDll.profiles.ini）
+//    nofile=1                 不读 profile 文件，只用内置的 4 个（排查用）
+//    cp=932|936|65001|1200    强制指定 *A 系列文本的代码页（覆盖 profile 默认值）
+//    pipe=<名称>              管道名，默认 GalToolText（实际路径 \\.\pipe\<名称>）
+//    log=1|0                  是否同时落盘 texthook_log.txt（默认 1，便于无客户端时验证）
+//    minlen=<n>               短于此长度的文本丢弃（默认 2）
+//    dedup=<ms>               去重窗口，同一文本在该毫秒数内只上报一次（默认 200）
+//
+//  引擎适配表（S3 起可外部化）：
+//    内置 4 个 profile（generic-gdi / generic-gdi-sjis / generic-gdi-gbk /
+//    generic-unicode）编译在 DLL 里，始终可用。DLL 同目录的
+//    TextHookDll.profiles.ini 可以新增 profile，也可以**同名覆盖**内置的那一个
+//    （例如写一个 [generic-gdi] 来调兜底行为）。文件格式见该 ini 内的注释。
+//
+//    ⚠ 能力边界：文件只能从框架**已知的 6 个函数**里挑选组合挂钩目标
+//      （gdi32!TextOutA/W、gdi32!ExtTextOutA/W、user32!DrawTextA/W）。
+//      文本提取逻辑（哪个参数是文本）是编译期写死在 ReplacementFor() 里的，
+//      所以「写个文件就能适配任意引擎」暂时做不到——新增未知函数属于 S2/S4。
+//      文件里写了框架不认识的函数名不会报错（IAT 里找不到而已），但也不会有任何效果。
 //
 //  编译（MSVC）：
 //    x64: cl /nologo /LD /O2 TextHookDll.c /link /OUT:TextHookDll-x64.dll
@@ -49,14 +63,22 @@
 
 #define HOOK_IAT 0
 
-typedef struct {
-    const char* module;   // 提供函数的 DLL 名，如 "gdi32.dll"
-    const char* func;     // 函数名
-    int         kind;     // 挂钩方式（当前仅 HOOK_IAT）
-} HookTarget;
+// 用内联字符数组而不是 const char*：profile 现在既能来自编译期常量，
+// 也能来自运行期读入的 INI 文件。内联数组让两条路径共用同一套结构，
+// 文件加载的 profile 不需要堆分配，也就不存在「g_profile 指向已释放内存」的风险。
+#define HT_MODULE_MAX 48
+#define HT_FUNC_MAX   48
 
 typedef struct {
-    const char*       name;
+    char module[HT_MODULE_MAX];   // 提供函数的 DLL 名，如 "gdi32.dll"
+    char func[HT_FUNC_MAX];       // 函数名
+    int  kind;                    // 挂钩方式（当前仅 HOOK_IAT）
+} HookTarget;
+
+#define PROFILE_NAME_MAX 48
+
+typedef struct {
+    char              name[PROFILE_NAME_MAX];
     UINT              codepage;     // 0 = 用系统 ANSI 代码页
     const HookTarget* targets;
     int               targetCount;
@@ -91,6 +113,39 @@ static const EngineProfile kProfiles[] = {
     { "generic-unicode",  1200, kGdiUnicodeTargets, 3, 2, 200 },
 };
 static const int kProfileCount = (int)(sizeof(kProfiles) / sizeof(kProfiles[0]));
+
+// ---------------------------------------------------------------------------
+// 运行期 profile（S3：外部化）
+//
+// 从 DLL 同目录的 TextHookDll.profiles.ini 读入，改引擎适配不用重编译。
+// 同名 profile 覆盖内置的那一个，所以 [generic-gdi] 可以用来调兜底行为。
+//
+// ★ 能力边界（必须如实告知，否则使用者会误以为「写个文件就能适配任何引擎」）：
+//   文件只能**从框架已知的 6 个函数里挑选和组合**挂钩目标。
+//   真正的文本提取逻辑（哪个参数是文本、哪个是长度）编译期写在
+//   ReplacementFor() 里，所以文件里写 gdi32.dll,TextOutA 可以，
+//   写一个框架不认识的函数则会挂钩失败——那属于 S2/S4 的工作。
+// ---------------------------------------------------------------------------
+
+#define MAX_FILE_PROFILES 32
+#define MAX_FILE_TARGETS  16
+#define MAX_DESC_LEN      128
+
+typedef struct {
+    EngineProfile prof;                    // 供 g_profile 指向；prof.targets 指向本结构的 targets
+    HookTarget    targets[MAX_FILE_TARGETS];
+    char          desc[MAX_DESC_LEN];      // 仅供人读，不参与逻辑
+} FileProfile;
+
+static FileProfile g_fileProfiles[MAX_FILE_PROFILES];
+static int         g_fileProfileCount = 0;
+static BOOL        g_profilesLoaded   = FALSE;   // 是否已经尝试过加载（无论成功与否，只试一次）
+static BOOL        g_profileExplicit  = FALSE;   // engine= 是否被显式指定过
+
+// profile 文件的加载结果描述 + 配置告警，由 StartHooks 在初始化完成后写入日志。
+// 注意：ApplyConfig 阶段队列和临界区都还没建好，绝不能在那里 Enqueue。
+static char g_profileFileMsg[768] = "";
+static char g_configWarn[512]     = "";
 
 // ---------------------------------------------------------------------------
 // 全局状态
@@ -464,6 +519,13 @@ static BOOL PatchModuleIat(HMODULE hMod, const char* dllName, const char* funcNa
                 (IMAGE_IMPORT_BY_NAME*)(base + orig->u1.AddressOfData);
             if (strcmp((const char*)ibn->Name, funcName) != 0) continue;
 
+            // 已经指向我们的替换函数说明这个槽挂过了，直接返回。
+            // 必须有这道幂等检查：主 EXE 会先被 HookAllModules 显式挂一次，
+            // 随后又出现在模块快照里被挂第二次。重复记录会让第二条把
+            // original 记成**我们自己的替换函数**，卸载时就会把槽还原成
+            // 替换函数——等于没卸，而 DLL 一旦被卸载就是跳进已释放内存。
+            if ((void*)iat->u1.Function == replacement) return TRUE;
+
             if (g_patchedCount >= MAX_PATCHED) return FALSE;
 
             // 只在首次记录原始地址：各模块 IAT 槽里存的是同一个函数地址
@@ -526,7 +588,8 @@ static void HookAllTargets(HMODULE hMod)
 // 引擎可能在 EXE 里，也可能在随游戏加载的某个 DLL 里，两者都要覆盖。
 static void HookAllModules(void)
 {
-    HookAllTargets(GetModuleHandleW(NULL));
+    HMODULE hMain = GetModuleHandleW(NULL);
+    HookAllTargets(hMain);
 
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
     if (snap == INVALID_HANDLE_VALUE) return;
@@ -536,6 +599,9 @@ static void HookAllModules(void)
     if (Module32FirstW(snap, &me))
     {
         do {
+            // 主 EXE 上面已经显式处理过了，而模块快照**也包含它**，必须跳过，
+            // 否则同一个 IAT 槽会被挂两次（PatchModuleIat 里的幂等检查是第二道防线）
+            if ((HMODULE)me.modBaseAddr == hMain) continue;
             if (IsDeniedModule(me.szModule)) continue;
             if ((HMODULE)me.modBaseAddr == g_hDll) continue;   // 绝不挂自己（会无限递归）
             HookAllTargets((HMODULE)me.modBaseAddr);
@@ -546,7 +612,9 @@ static void HookAllModules(void)
 
 static void UnhookAll(void)
 {
-    for (int i = 0; i < g_patchedCount; i++)
+    // 倒序还原：万一同一个槽被记了多条，先写回后记的那条（它可能是我们自己的
+    // 替换函数），最后写回最早记下的真实地址，最终状态才正确。
+    for (int i = g_patchedCount - 1; i >= 0; i--)
     {
         DWORD oldProtect = 0;
         if (!VirtualProtect(g_patched[i].slot, sizeof(void*), PAGE_READWRITE, &oldProtect))
@@ -562,14 +630,350 @@ static void UnhookAll(void)
 // 配置解析（兼容注入器的 -export InstallConfig 单字符串参数约定）
 // ---------------------------------------------------------------------------
 
+// 去掉首尾空白，并把行尾的 CR/LF 一起清掉（INI 可能是 CRLF 也可能是 LF）
+static void TrimInPlace(char* s)
+{
+    if (!s) return;
+
+    char* p = s;
+    while (*p == ' ' || *p == '\t') p++;
+    if (p != s) memmove(s, p, strlen(p) + 1);
+
+    size_t n = strlen(s);
+    while (n > 0 && (s[n - 1] == ' '  || s[n - 1] == '\t' ||
+                     s[n - 1] == '\r' || s[n - 1] == '\n'))
+        s[--n] = 0;
+}
+
+// 把 "k=v" 拆开：键写入 key，返回值的指针；没有 '=' 则返回 NULL。
+// 会就地修改 pair（把 '=' 写成 '\0'），所以两个 pass 必须各用一份拷贝。
+static const wchar_t* SplitPair(wchar_t* pair, wchar_t* key, size_t keyCch)
+{
+    wchar_t* eq = wcschr(pair, L'=');
+    if (!eq) { wcsncpy_s(key, keyCch, pair, _TRUNCATE); return NULL; }
+    *eq = 0;
+    wcsncpy_s(key, keyCch, pair, _TRUNCATE);
+    return eq + 1;
+}
+
+// 按窄字符串名查找 profile。文件里的优先，同名可覆盖内置。
+static const EngineProfile* FindProfileNarrow(const char* name)
+{
+    if (!name || !*name) return NULL;
+
+    for (int i = 0; i < g_fileProfileCount; i++)
+        if (_stricmp(name, g_fileProfiles[i].prof.name) == 0)
+            return &g_fileProfiles[i].prof;
+
+    for (int i = 0; i < kProfileCount; i++)
+        if (_stricmp(name, kProfiles[i].name) == 0)
+            return &kProfiles[i];
+
+    return NULL;
+}
+
 static const EngineProfile* FindProfile(const wchar_t* name)
 {
     char narrow[128];
+    if (!name || !*name) return NULL;
     if (WideCharToMultiByte(CP_ACP, 0, name, -1, narrow, 128, NULL, NULL) <= 0)
         return NULL;
-    for (int i = 0; i < kProfileCount; i++)
-        if (_stricmp(narrow, kProfiles[i].name) == 0) return &kProfiles[i];
-    return NULL;
+    return FindProfileNarrow(narrow);
+}
+
+// 列出所有可用 profile 名，供「engine= 写错」时给出可操作的提示
+static void BuildProfileList(char* out, size_t cch)
+{
+    out[0] = 0;
+    for (int i = 0; i < g_fileProfileCount; i++) {
+        if (out[0]) strcat_s(out, cch, ", ");
+        strcat_s(out, cch, g_fileProfiles[i].prof.name);
+    }
+    for (int i = 0; i < kProfileCount; i++) {
+        // 文件里已定义的就不再重复列
+        if (FindProfileNarrow(kProfiles[i].name) != &kProfiles[i]) continue;
+        if (out[0]) strcat_s(out, cch, ", ");
+        strcat_s(out, cch, kProfiles[i].name);
+    }
+}
+
+// 没被 engine= 显式指定过时，把默认 profile 重新解析一遍。
+// 这样文件里写了 [generic-gdi] 就能改掉「不传 engine= 时」的兜底行为。
+static void RefreshDefaultProfile(void)
+{
+    if (g_profileExplicit) return;
+    const EngineProfile* p = FindProfileNarrow("generic-gdi");
+    g_profile = p ? p : &kProfiles[0];
+}
+
+// 默认 profile 文件位置：DLL 同目录（和 texthook_log.txt 同一个地方）
+static void DefaultProfileFilePath(wchar_t* out, size_t cch)
+{
+    out[0] = 0;
+    if (!g_hDll) return;
+
+    wchar_t p[MAX_PATH];
+    if (!GetModuleFileNameW(g_hDll, p, MAX_PATH)) return;
+
+    wchar_t* slash = wcsrchr(p, L'\\');
+    if (!slash) return;
+    *(slash + 1) = 0;
+
+    swprintf_s(out, cch, L"%s%s", p, L"TextHookDll.profiles.ini");
+}
+
+// ---------------------------------------------------------------------------
+// INI 解析
+//
+// 格式：
+//   [profile 名]                 名字必须是 ASCII（见下）
+//   codepage=932                 *A 系列文本的代码页；0 = 系统 ANSI
+//   minlen=2                     短于此长度的文本丢弃
+//   dedup=200                    去重窗口（毫秒）
+//   hook=gdi32.dll,TextOutA      挂钩目标，可重复；第三段是方式，缺省 iat
+//   desc=任意说明文字            仅供人读
+//
+// 策略：全有或全无。任何一行出错就整份文件不生效、退回内置 profile。
+// 半个 profile 生效比完全没生效更难排查，配置文件的一次性读取没必要容错。
+// ---------------------------------------------------------------------------
+
+static void LoadProfilesFromFile(const wchar_t* path)
+{
+    g_profilesLoaded    = TRUE;
+    g_fileProfileCount  = 0;
+    g_profileFileMsg[0] = 0;
+
+    char narrowPath[MAX_PATH * 3];
+    narrowPath[0] = 0;
+    if (path && *path)
+        WideCharToMultiByte(CP_UTF8, 0, path, -1, narrowPath, sizeof(narrowPath), NULL, NULL);
+
+    if (!path || !*path) {
+        _snprintf_s(g_profileFileMsg, sizeof(g_profileFileMsg), _TRUNCATE,
+                    "profile 文件：未指定路径，使用内置 %d 个", kProfileCount);
+        RefreshDefaultProfile();
+        return;
+    }
+
+    FILE* f = NULL;
+    if (_wfopen_s(&f, path, L"rb") != 0 || !f) {
+        _snprintf_s(g_profileFileMsg, sizeof(g_profileFileMsg), _TRUNCATE,
+                    "profile 文件 %s 不存在或无法读取，使用内置 %d 个", narrowPath, kProfileCount);
+        RefreshDefaultProfile();
+        return;
+    }
+
+    // 吃掉 UTF-8 BOM；没有 BOM 就回到文件头
+    unsigned char bom[3] = { 0, 0, 0 };
+    if (fread(bom, 1, 3, f) != 3 ||
+        !(bom[0] == 0xEF && bom[1] == 0xBB && bom[2] == 0xBF))
+        fseek(f, 0, SEEK_SET);
+
+    char line[1024];
+    int  cur     = -1;          // 当前正在填的 profile 下标，-1 = 还没遇到 [section]
+    int  lineNo  = 0;
+    char err[320];
+    err[0] = 0;
+
+    while (!err[0] && fgets(line, sizeof(line), f))
+    {
+        lineNo++;
+
+        // 行过长判定：fgets 读满缓冲且末尾不是换行时，再偷看一个字符。
+        // 只看长度会把「恰好 N-1 字节 + 换行」误判成过长的行。
+        size_t ln = strlen(line);
+        if (ln == sizeof(line) - 1 && line[ln - 1] != '\n') {
+            int c = fgetc(f);
+            if (c != '\n' && c != EOF) {
+                while (c != '\n' && c != EOF) c = fgetc(f);
+                _snprintf_s(err, sizeof(err), _TRUNCATE, "第 %d 行过长", lineNo);
+                break;
+            }
+        }
+
+        TrimInPlace(line);
+        if (!line[0] || line[0] == ';' || line[0] == '#') continue;
+
+        // ---- [section] ----
+        if (line[0] == '[') {
+            char* close = strrchr(line, ']');
+            if (!close || close == line + 1 || close[1] != 0) {
+                _snprintf_s(err, sizeof(err), _TRUNCATE,
+                            "第 %d 行：[section] 格式不正确", lineNo);
+                break;
+            }
+            *close = 0;
+            char* nm = line + 1;
+            TrimInPlace(nm);
+
+            if (strlen(nm) >= PROFILE_NAME_MAX) {
+                _snprintf_s(err, sizeof(err), _TRUNCATE,
+                            "第 %d 行：profile 名过长（上限 %d 字符）", lineNo, PROFILE_NAME_MAX - 1);
+                break;
+            }
+
+            // profile 名必须 ASCII。engine= 参数是 UTF-16，比对时按 CP_ACP 转窄，
+            // 而文件是 UTF-8；非 ASCII 名字两边必然对不上，不如直接拒绝。
+            BOOL ascii = TRUE;
+            for (const unsigned char* q = (const unsigned char*)nm; *q; q++)
+                if (*q >= 0x80) { ascii = FALSE; break; }
+            if (!ascii) {
+                _snprintf_s(err, sizeof(err), _TRUNCATE,
+                            "第 %d 行：profile 名必须是 ASCII（非 ASCII 名字无法与 engine= 参数匹配）", lineNo);
+                break;
+            }
+
+            if (g_fileProfileCount >= MAX_FILE_PROFILES) {
+                _snprintf_s(err, sizeof(err), _TRUNCATE,
+                            "profile 数量超过上限 %d", MAX_FILE_PROFILES);
+                break;
+            }
+
+            // 重名报错而不是后者覆盖前者：配置文件里的复制粘贴错误应该立刻暴露
+            int dup = 0;
+            for (int i = 0; i < g_fileProfileCount; i++)
+                if (_stricmp(g_fileProfiles[i].prof.name, nm) == 0) { dup = 1; break; }
+            if (dup) {
+                _snprintf_s(err, sizeof(err), _TRUNCATE,
+                            "第 %d 行：profile [%s] 重复定义", lineNo, nm);
+                break;
+            }
+
+            cur = g_fileProfileCount++;
+            memset(&g_fileProfiles[cur], 0, sizeof(g_fileProfiles[cur]));
+            strcpy_s(g_fileProfiles[cur].prof.name, PROFILE_NAME_MAX, nm);
+            g_fileProfiles[cur].prof.minLen    = 2;      // 与内置默认一致
+            g_fileProfiles[cur].prof.dedupMs   = 200;
+            g_fileProfiles[cur].prof.codepage  = 0;
+            g_fileProfiles[cur].prof.targets   = g_fileProfiles[cur].targets;  // 指向自己的数组
+            continue;
+        }
+
+        // ---- key=value ----
+        char* eq = strchr(line, '=');
+        if (!eq) {
+            _snprintf_s(err, sizeof(err), _TRUNCATE,
+                        "第 %d 行：既不是 [section] 也不是 key=value", lineNo);
+            break;
+        }
+        *eq = 0;
+        char* key = line;
+        char* val = eq + 1;
+        TrimInPlace(key);
+        TrimInPlace(val);
+
+        if (cur < 0) {
+            _snprintf_s(err, sizeof(err), _TRUNCATE,
+                        "第 %d 行：key=value 出现在任何 [section] 之前", lineNo);
+            break;
+        }
+        FileProfile* fp = &g_fileProfiles[cur];
+
+        if (_stricmp(key, "codepage") == 0 || _stricmp(key, "cp") == 0)
+            fp->prof.codepage = (UINT)atoi(val);
+        else if (_stricmp(key, "minlen") == 0)
+            fp->prof.minLen = atoi(val);
+        else if (_stricmp(key, "dedup") == 0)
+            fp->prof.dedupMs = (DWORD)atoi(val);
+        else if (_stricmp(key, "desc") == 0)
+            strcpy_s(fp->desc, MAX_DESC_LEN, val);
+        else if (_stricmp(key, "hook") == 0)
+        {
+            if (fp->prof.targetCount >= MAX_FILE_TARGETS) {
+                _snprintf_s(err, sizeof(err), _TRUNCATE,
+                            "第 %d 行：hook 数量超过上限 %d", lineNo, MAX_FILE_TARGETS);
+                break;
+            }
+
+            // hook=<模块>,<函数>[,<方式>]
+            char v[256];
+            strcpy_s(v, sizeof(v), val);
+
+            char* c1 = strchr(v, ',');
+            if (!c1) {
+                _snprintf_s(err, sizeof(err), _TRUNCATE,
+                            "第 %d 行：hook 要写成 模块,函数[,方式]", lineNo);
+                break;
+            }
+            *c1 = 0;
+            char* mod  = v;
+            char* fn   = c1 + 1;
+            char* c2   = strchr(fn, ',');
+            char* kind = NULL;
+            if (c2) { *c2 = 0; kind = c2 + 1; }
+            TrimInPlace(mod);
+            TrimInPlace(fn);
+            if (kind) TrimInPlace(kind);
+
+            if (!mod[0] || !fn[0]) {
+                _snprintf_s(err, sizeof(err), _TRUNCATE,
+                            "第 %d 行：hook 的模块名或函数名为空", lineNo);
+                break;
+            }
+
+            int k = HOOK_IAT;
+            if (kind && kind[0]) {
+                if (_stricmp(kind, "iat") == 0) {
+                    k = HOOK_IAT;
+                } else {
+                    // inline / vtable 是 S2 / S5 的内容，还没实现。
+                    // 必须报错而不是忽略：静默接受会让使用者以为挂钩装上了。
+                    _snprintf_s(err, sizeof(err), _TRUNCATE,
+                                "第 %d 行：挂钩方式 \"%s\" 尚未实现（当前仅支持 iat）", lineNo, kind);
+                    break;
+                }
+            }
+
+            if (strlen(mod) >= HT_MODULE_MAX || strlen(fn) >= HT_FUNC_MAX) {
+                _snprintf_s(err, sizeof(err), _TRUNCATE,
+                            "第 %d 行：模块名或函数名过长", lineNo);
+                break;
+            }
+
+            HookTarget* t = &fp->targets[fp->prof.targetCount];
+            strcpy_s(t->module, HT_MODULE_MAX, mod);
+            strcpy_s(t->func,   HT_FUNC_MAX,   fn);
+            t->kind = k;
+            fp->prof.targetCount++;
+        }
+        // 其余键忽略：给前向兼容留空间（将来加 hint= 之类不会让老版本报错）
+    }
+
+    fclose(f);
+
+    if (err[0]) {
+        // 全有或全无：宁可退回内置，也不要半个 profile 生效
+        g_fileProfileCount = 0;
+        _snprintf_s(g_profileFileMsg, sizeof(g_profileFileMsg), _TRUNCATE,
+                    "profile 文件 %s 加载失败（%s），已退回内置 %d 个",
+                    narrowPath, err, kProfileCount);
+    } else if (g_fileProfileCount == 0) {
+        _snprintf_s(g_profileFileMsg, sizeof(g_profileFileMsg), _TRUNCATE,
+                    "profile 文件 %s 已读取但没有定义任何 [profile]，使用内置 %d 个",
+                    narrowPath, kProfileCount);
+    } else {
+        char names[384];
+        names[0] = 0;
+        for (int i = 0; i < g_fileProfileCount; i++) {
+            if (names[0]) strcat_s(names, sizeof(names), ", ");
+            strcat_s(names, sizeof(names), g_fileProfiles[i].prof.name);
+        }
+        _snprintf_s(g_profileFileMsg, sizeof(g_profileFileMsg), _TRUNCATE,
+                    "profile 文件 %s 已加载 %d 个：%s",
+                    narrowPath, g_fileProfileCount, names);
+    }
+
+    RefreshDefaultProfile();
+}
+
+// 只在第一次用到 profile 时加载默认文件（DllMain 里不能做这些事，持有加载器锁）
+static void EnsureProfilesLoaded(void)
+{
+    if (g_profilesLoaded) return;
+
+    wchar_t path[MAX_PATH];
+    DefaultProfileFilePath(path, MAX_PATH);
+    LoadProfilesFromFile(path);
 }
 
 // 解析 "k=v|k=v"，返回解析出的键值对个数
@@ -577,6 +981,44 @@ static int ApplyConfig(const wchar_t* cfg)
 {
     if (!cfg || !*cfg) return 0;
 
+    // ---- 第一遍：profilefile= / nofile= 必须先于 engine= 生效 ----
+    // 否则 "engine=X|profilefile=Y" 和 "profilefile=Y|engine=X" 结果不一致。
+    {
+        wchar_t pass1[2048];
+        wcsncpy_s(pass1, 2048, cfg, _TRUNCATE);
+
+        wchar_t wantFile[MAX_PATH];
+        wantFile[0] = 0;
+        int noFile = 0;
+
+        wchar_t* ctx = NULL;
+        for (wchar_t* pair = wcstok_s(pass1, L"|", &ctx);
+             pair;
+             pair = wcstok_s(NULL, L"|", &ctx))
+        {
+            wchar_t key[128];
+            const wchar_t* val = SplitPair(pair, key, 128);
+            if (_wcsicmp(key, L"profilefile") == 0 && val && *val)
+                wcsncpy_s(wantFile, MAX_PATH, val, _TRUNCATE);
+            else if (_wcsicmp(key, L"nofile") == 0)
+                noFile = (val == NULL) ? 1 : (_wtoi(val) != 0);
+        }
+
+        if (noFile) {
+            // 明确要求不读文件，直接用内置（排查「是不是 profile 文件在作怪」时用）
+            g_profilesLoaded   = TRUE;
+            g_fileProfileCount = 0;
+            _snprintf_s(g_profileFileMsg, sizeof(g_profileFileMsg), _TRUNCATE,
+                        "profile 文件：已按 nofile=1 禁用，使用内置 %d 个", kProfileCount);
+            RefreshDefaultProfile();
+        } else if (wantFile[0]) {
+            LoadProfilesFromFile(wantFile);
+        } else {
+            EnsureProfilesLoaded();
+        }
+    }
+
+    // ---- 第二遍：常规键值对 ----
     // 用 _TRUNCATE 而非 wcscpy_s：本 DLL 会挂进正在运行的游戏进程，
     // 超长的 -exportarg 绝不能触发无效参数处理器把游戏带走。
     wchar_t copy[2048];
@@ -587,32 +1029,36 @@ static int ApplyConfig(const wchar_t* cfg)
     const EngineProfile* newProfile = NULL;
 
     wchar_t* ctx = NULL;
-    wchar_t* pair = wcstok_s(copy, L"|", &ctx);
-    while (pair && count < 32)
+    for (wchar_t* pair = wcstok_s(copy, L"|", &ctx);
+         pair && count < 32;
+         pair = wcstok_s(NULL, L"|", &ctx))
     {
-        wchar_t key[128], val[1024];
-        wchar_t* eq = wcschr(pair, L'=');
-        if (eq) {
-            *eq = 0;
-            wcsncpy_s(key, 128,  pair,   _TRUNCATE);
-            wcsncpy_s(val, 1024, eq + 1, _TRUNCATE);
-        } else {
-            wcsncpy_s(key, 128,  pair, _TRUNCATE);
-            wcsncpy_s(val, 1024, L"",  _TRUNCATE);
-        }
+        wchar_t key[128];
+        const wchar_t* val = SplitPair(pair, key, 128);
+        const wchar_t* v = val ? val : L"";
 
-        if (_wcsicmp(key, L"engine") == 0)      { newProfile = FindProfile(val); }
-        else if (_wcsicmp(key, L"cp") == 0)     { g_codepage = (UINT)_wtoi(val); }
-        else if (_wcsicmp(key, L"log") == 0)    { g_logToFile = (_wtoi(val) != 0); }
-        else if (_wcsicmp(key, L"minlen") == 0) { g_minLen = _wtoi(val); minLenSet = 1; }
-        else if (_wcsicmp(key, L"dedup") == 0)  { g_dedupMs = (DWORD)_wtoi(val); dedupSet = 1; }
+        if (_wcsicmp(key, L"engine") == 0) {
+            newProfile = FindProfile(v);
+            if (newProfile) {
+                g_profileExplicit = TRUE;
+            } else {
+                // 静默沿用默认值最难排查，这里给出可用清单
+                char list[384];
+                BuildProfileList(list, sizeof(list));
+                _snprintf_s(g_configWarn, sizeof(g_configWarn), _TRUNCATE,
+                            "engine= 指定的 profile 未找到，已沿用默认；可用：%s", list);
+            }
+        }
+        else if (_wcsicmp(key, L"cp") == 0)     { g_codepage = (UINT)_wtoi(v); }
+        else if (_wcsicmp(key, L"log") == 0)    { g_logToFile = (_wtoi(v) != 0); }
+        else if (_wcsicmp(key, L"minlen") == 0) { g_minLen = _wtoi(v); minLenSet = 1; }
+        else if (_wcsicmp(key, L"dedup") == 0)  { g_dedupMs = (DWORD)_wtoi(v); dedupSet = 1; }
         else if (_wcsicmp(key, L"pipe") == 0) {
-            if (WideCharToMultiByte(CP_ACP, 0, val, -1, g_pipeName, sizeof(g_pipeName), NULL, NULL) <= 0)
+            if (WideCharToMultiByte(CP_ACP, 0, v, -1, g_pipeName, sizeof(g_pipeName), NULL, NULL) <= 0)
                 strcpy_s(g_pipeName, sizeof(g_pipeName), "GalToolText");
         }
 
         count++;
-        pair = wcstok_s(NULL, L"|", &ctx);
     }
 
     // profile 的默认值在最后应用，避免「engine= 写在 minlen= 之后」时把显式配置覆盖掉
@@ -631,6 +1077,18 @@ static int ApplyConfig(const wchar_t* cfg)
 static BOOL StartHooks(void)
 {
     if (g_initialized) return TRUE;
+
+    // profile 决定挂哪些函数，必须先于 HookAllModules 就位。
+    // InstallConfig 路径下 ApplyConfig 已经加载过，这里是给无参的 Init 兜底。
+    EnsureProfilesLoaded();
+
+    // ★ 重新安装时必须复位这两个标志。
+    //   StopHooks 会把 g_stop 置 1，而它此前从没被清回过——
+    //   于是「Unhook 之后再 InstallConfig」建出来的读写线程会立刻退出，
+    //   DLL 看着装好了、实际一个字节都发不出来。
+    g_stop         = 0;
+    g_pipeBroken   = 0;
+    g_patchedCount = 0;
 
     InitializeCriticalSection(&g_textCs);
     InitializeCriticalSection(&g_pipeCs);
@@ -653,6 +1111,18 @@ static BOOL StartHooks(void)
                 g_codepage ? g_codepage : (g_profile ? g_profile->codepage : 0),
                 g_patchedCount, g_pipeName, GetCurrentProcessId());
     Enqueue(msg);
+
+    // profile 来源单独一行：使用者最常问的就是「我改的那个文件到底有没有被读到」
+    if (g_profileFileMsg[0]) {
+        char msg2[1024];
+        _snprintf_s(msg2, sizeof(msg2), _TRUNCATE, "[TextHookDll] %s\n", g_profileFileMsg);
+        Enqueue(msg2);
+    }
+    if (g_configWarn[0]) {
+        char msg3[1024];
+        _snprintf_s(msg3, sizeof(msg3), _TRUNCATE, "[TextHookDll] 警告：%s\n", g_configWarn);
+        Enqueue(msg3);
+    }
     return TRUE;
 }
 

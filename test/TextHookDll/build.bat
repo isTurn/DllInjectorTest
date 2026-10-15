@@ -1,11 +1,15 @@
 @echo off
 rem ============================================================================
-rem  Build the text-hook material (hook DLL + pipe client + test target).
+rem  Build the text-hook material, then verify it end-to-end.
 rem
 rem  Output: ..\..\test_output\
 rem    TextHookDll-x64.dll / TextHookDll-x86.dll   the hook DLL (both bitnesses)
+rem    TextHookDll.profiles.ini                    engine profile template
 rem    TextHookClient.exe                          named-pipe consumer (x64)
 rem    TextTarget_x64.exe / TextTarget_x86.exe     GDI text target for testing
+rem    TestTextHook-x64.exe / -x86.exe             in-process end-to-end verifier
+rem
+rem  BOTH bitnesses are always built AND verified. Keep them in sync.
 rem
 rem  Notes:
 rem    - Paths are derived from this script's own location, so the repository
@@ -18,12 +22,14 @@ rem      comments, but without this switch MSVC decodes them using the system
 rem      code page (936/GBK on a Chinese Windows). A mis-decoded comment can
 rem      swallow the following newline and produce bogus "undeclared
 rem      identifier" errors, or fail outright with warning C4819.
-rem    - TestTextTarget calls GDI/user32 but has no #pragma comment(lib), so
-rem      gdi32.lib / user32.lib must be named explicitly on the link line.
+rem    - TestTextTarget and TestTextHook call GDI/user32 but have no
+rem      #pragma comment(lib), so gdi32.lib / user32.lib must be named
+rem      explicitly on the link line.
 rem    - TextHookDll.def is passed to the linker so the exports keep their
 rem      undecorated names on x86 too. Without it, WINAPI (=__stdcall) would
 rem      export them as _InstallConfig@4 on x86 but as InstallConfig on x64,
 rem      so GetProcAddress(h, "InstallConfig") would return NULL on x86.
+rem      TestTextHook checks exactly that, for both bitnesses.
 rem ============================================================================
 
 setlocal
@@ -60,7 +66,11 @@ echo.
 
 if not exist "%OUT%" md "%OUT%"
 
+rem 随 DLL 一起分发 profile 模板：DLL 会从自己所在目录自动加载这个文件
+copy /y "%SRC%TextHookDll.profiles.ini" "%OUT%\TextHookDll.profiles.ini" >nul
+
 rem ---- x64 -----------------------------------------------------------------
+echo [1/2] building x64 ...
 call "%VC%\vcvars64.bat" >nul
 
 cl /nologo /LD /O2 /utf-8 "%SRC%TextHookDll.c" /link /DEF:"%SRC%TextHookDll.def" /OUT:"%OUT%\TextHookDll-x64.dll"
@@ -72,7 +82,11 @@ if errorlevel 1 goto :fail
 cl /nologo /O2 /utf-8 "%TARGET%\TestTextTarget.c" /link /OUT:"%OUT%\TextTarget_x64.exe" /SUBSYSTEM:CONSOLE gdi32.lib user32.lib
 if errorlevel 1 goto :fail
 
+cl /nologo /O2 /utf-8 "%SRC%TestTextHook.c" /link /OUT:"%OUT%\TestTextHook-x64.exe" /SUBSYSTEM:CONSOLE gdi32.lib user32.lib
+if errorlevel 1 goto :fail
+
 rem ---- x86 -----------------------------------------------------------------
+echo [2/2] building x86 ...
 call "%VC%\vcvars32.bat" >nul
 
 cl /nologo /LD /O2 /utf-8 "%SRC%TextHookDll.c" /link /DEF:"%SRC%TextHookDll.def" /OUT:"%OUT%\TextHookDll-x86.dll"
@@ -81,32 +95,62 @@ if errorlevel 1 goto :fail
 cl /nologo /O2 /utf-8 "%TARGET%\TestTextTarget.c" /link /OUT:"%OUT%\TextTarget_x86.exe" /SUBSYSTEM:CONSOLE gdi32.lib user32.lib
 if errorlevel 1 goto :fail
 
+cl /nologo /O2 /utf-8 "%SRC%TestTextHook.c" /link /OUT:"%OUT%\TestTextHook-x86.exe" /SUBSYSTEM:CONSOLE gdi32.lib user32.lib
+if errorlevel 1 goto :fail
+
 rem ---- clean intermediates left next to the sources ------------------------
 del /q "%SRC%*.obj" "%SRC%*.exp" "%SRC%*.lib" 2>nul
 del /q "%TARGET%\*.obj" "%TARGET%\*.exp" "%TARGET%\*.lib" 2>nul
 
+rem ---- verify: run the in-process end-to-end test for BOTH bitnesses -------
+rem  Exit codes: 0 = all checks passed, 2 = some check failed, 1 = usage/load error.
 echo.
 echo ============================================================
-echo   BUILD OK
+echo   running end-to-end verification
+echo ============================================================
 echo.
-echo   Verify end-to-end (run each in its own console):
+
+echo [x64] TestTextHook
+"%OUT%\TestTextHook-x64.exe" "%OUT%\TextHookDll-x64.dll" "%OUT%\TextHookDll.profiles.ini"
+if errorlevel 1 goto :testfail
+
+echo.
+echo [x86] TestTextHook
+"%OUT%\TestTextHook-x86.exe" "%OUT%\TextHookDll-x86.dll" "%OUT%\TextHookDll.profiles.ini"
+if errorlevel 1 goto :testfail
+
+echo.
+echo ============================================================
+echo   BUILD OK + VERIFY OK (x64 and x86)
+echo.
+echo   Manual run against a real game ^(optional, both processes):
 echo.
 echo     1^) test_output\TextHookClient.exe
 echo.
 echo     2^) DllInjector-x64.exe -inject test_output\TextTarget_x64.exe ^
 echo            test_output\TextHookDll-x64.dll -export InstallConfig ^
-echo            -exportarg "engine=generic-gdi|cp=932|log=1"
+echo            -exportarg "engine=generic-gdi^|cp=932^|log=1"
 echo.
 echo   NOTE: cp= is process-wide, and one process can only carry ONE *A
 echo         encoding. The test target therefore defaults to Shift-JIS;
 echo         for a GBK run start it as "TextTarget_x64.exe gbk" and pass
 echo         cp=936. Mismatching them makes the *A text garbled by design.
 echo.
-echo   Expected: the client prints captured text, and
-echo             test_output\texthook_log.txt gets a copy.
+echo   Engine profiles: edit test_output\TextHookDll.profiles.ini
+echo         (loaded from the DLL's own directory; no rebuild needed).
+echo         The startup banner in texthook_log.txt reports which file was
+echo         read and which profiles were loaded.
 echo ============================================================
 endlocal
 exit /b 0
+
+:testfail
+echo.
+echo ============================================================
+echo   VERIFY_FAIL - see the FAIL lines above
+echo ============================================================
+endlocal
+exit /b 1
 
 :fail
 echo BUILD_FAIL

@@ -270,17 +270,19 @@ WaitForSingleObject(15s) → GetExitCodeThread
 | --- | --- |
 | `TextHookDll.c` | profile 驱动的文本 Hook DLL：IAT 挂钩 `TextOutA/W`、`ExtTextOutA/W`、`DrawTextA/W`，SJIS/GBK → UTF-8 转换，命名管道推送 |
 | `TextHookDll.def` | 导出表：统一 x86/x64 的无修饰导出名（x86 下 `__stdcall` 会修饰成 `_InstallConfig@4`） |
+| `TextHookDll.profiles.ini` | **引擎适配表模板**（随 DLL 一起分发）。改引擎适配只需改这个文件，不用重编译 DLL |
 | `TextHookClient.c` | 管道消费者，实时打印捕获到的文本 |
-| `build.bat` | 编译上述内容 + 验证用目标程序（输出到 `test_output\`） |
+| `TestTextHook.c` | **进程内端到端验证器**：自己加载 DLL、装钩子、用 GDI 输出文本、核对日志，全自动 |
+| `build.bat` | 编译上述内容 + 验证用目标程序，**并自动跑两个架构的验证**（输出到 `test_output\`） |
 | `../TestTextTarget/TestTextTarget.c` | 验证目标：用 GDI 输出硬编码的日文/中文文本，便于确定性核对 |
 
 **零改动复用现有注入器**——引擎配置通过既有的 `-export` / `-exportarg` 机制下发：
 
 ```bat
-:: 1) 编译
+:: 1) 编译 + 自动验证（x64 与 x86 都会跑一遍，失败即非零退出）
 test\TextHookDll\build.bat
 
-:: 2) 起客户端监听管道（独立控制台）
+:: 2) 起客户端监听管道（独立控制台，可选）
 test_output\TextHookClient.exe
 
 :: 3) 注入并启动目标程序
@@ -292,19 +294,52 @@ DllInjector-x64.exe -inject test_output\TextTarget_x64.exe test_output\TextHookD
 > 要验证 GBK 请以 `test_output\TextTarget_x64.exe gbk` 启动并传 `cp=936`。两者不匹配时 `*A` 文本必然乱码，这是设计使然。
 > `*W` 系列走宽字符，不受 `cp=` 影响。
 
+### 适配新引擎：改 ini，不用重编译
+
+DLL 会从**自身所在目录**读取 `TextHookDll.profiles.ini`，也可以写一份自己的：
+
+```ini
+[my-game-jp]
+desc=某日文原版游戏
+codepage=932
+minlen=3
+dedup=400
+hook=gdi32.dll,TextOutA
+hook=gdi32.dll,ExtTextOutA
+hook=user32.dll,DrawTextA
+```
+
+```bat
+DllInjector-x64.exe -inject game.exe test_output\TextHookDll-x64.dll ^
+    -export InstallConfig -exportarg "profilefile=D:\my\game.ini|engine=my-game-jp|log=1"
+```
+
+文件里的 profile 可以**同名覆盖**内置的 4 个（写一个 `[generic-gdi]` 就能改掉兜底行为）；
+任何一行写错则整份文件不生效、退回内置，并在启动横幅里说明原因。
+
+> ⚠ **能力边界**：文件只能从框架**已知的 6 个函数**里挑选组合挂钩目标。
+> 「哪个参数是文本」是编译期写死的，所以「写个文件就能适配任意引擎」目前做不到——
+> 引擎若用了其它文本 API，仍需改代码（属路线图 S2 / S4）。
+> 文件里写了框架不认识的函数名不会报错，但也不会有任何效果。
+
+**确认 ini 有没有被读到**：看 `texthook_log.txt` 开头的第二行横幅，它会直接报出
+读了哪个文件、加载了几个 profile、分别叫什么。
+
 配置项（`k=v` 用 `|` 分隔）：
 
 | 键 | 说明 |
 | --- | --- |
-| `engine` | `generic-gdi`（默认）/ `generic-gdi-sjis` / `generic-gdi-gbk` / `generic-unicode` |
+| `engine` | 内置 `generic-gdi`（默认）/ `generic-gdi-sjis` / `generic-gdi-gbk` / `generic-unicode`，或 ini 文件里自定义的名字 |
+| `profilefile` | 指定 profile 文件路径（默认取 DLL 同目录的 `TextHookDll.profiles.ini`） |
+| `nofile` | `1` 时完全不读 profile 文件，只用内置的 4 个（排查「是不是 ini 在作怪」时用） |
 | `cp` | 强制 `*A` 系列文本的代码页（932 = Shift-JIS，936 = GBK），覆盖 profile 默认值 |
 | `pipe` | 管道名，默认 `GalToolText`（实际路径 `\\.\pipe\<名称>`） |
 | `log` | `1` 时同时落盘 `texthook_log.txt`（默认开，便于无客户端时验证） |
 | `minlen` / `dedup` | 最短文本长度（默认 2）/ 去重窗口毫秒（默认 200，游戏每帧重绘必须去重） |
 
-> **当前状态：一阶段原型。** 只覆盖走 IAT 的调用，且挂钩发生在游戏开跑之后
+> **当前状态：一阶段原型 + 引擎适配表已外部化。** 只覆盖走 IAT 的调用，且挂钩发生在游戏开跑之后
 > （注入器的 `ResumeThread` 早于导出函数调用，会漏掉启动后约百毫秒的文本）。
-> 引擎 profile 目前是通用 GDI 兜底；**针对具体引擎的 profile 必须对着实机样本逆向填写**，
+> profile 可以写成文件、不用重编译；但**具体引擎 profile 仍需对着实机样本逆向填写**，
 > 无法凭空推测。演进计划见设计文档第 8 节路线图。
 
 ## 从源码构建
@@ -356,7 +391,7 @@ test\build_test.bat                  :: 编译测试 DLL 与目标程序 -> test
 test\ManualMap\build_shellcode.bat   :: 汇编手动映射 shellcode 并重新生成字节数组
 test\TestReflectiveDll\build.bat     :: 编译反射 DLL 示例 + TestLoader 进程内验证器
 test\TestHookDll\build.bat           :: 编译示例 DLL（x64 + x86，产物就放在 test\TestHookDll\）
-test\TextHookDll\build.bat           :: 编译文本 Hook DLL + 管道客户端 + 验证目标 -> test_output\
+test\TextHookDll\build.bat           :: 编译文本 Hook DLL + 客户端 + 验证目标，并自动跑双架构验证 -> test_output\
 ```
 
 > `test\ManualMap\build_shellcode.bat` 会重新生成 `shellcode_x64.cs` / `shellcode_x86.cs` / `unmap_x64.cs` / `unmap_x86.cs`，
@@ -397,8 +432,10 @@ DllInjectorTest/
 │   ├── TextHookDll/             # GalGame 文本 Hook（一阶段原型，详见 docs/text-hook-design.md）
 │   │   ├── TextHookDll.c        #   profile 驱动的 IAT 文本 Hook：挂钩 GDI 文本 API + 管道推送
 │   │   ├── TextHookDll.def      #   导出表：统一 x86/x64 的无修饰导出名（避免 __stdcall 修饰差异）
+│   │   ├── TextHookDll.profiles.ini  # 引擎适配表模板（随 DLL 分发，改它不用重编译）
 │   │   ├── TextHookClient.c     #   管道消费者（控制台实时打印捕获到的文本）
-│   │   └── build.bat            #   编译 Hook DLL + 客户端 + 验证目标（输出到 test_output\）
+│   │   ├── TestTextHook.c       #   进程内端到端验证器（自动跑 4 个场景，x64 + x86 都跑）
+│   │   └── build.bat            #   编译 Hook DLL + 客户端 + 验证目标 + 验证器，并自动验证
 │   ├── TestTextTarget/          # 文本 Hook 的验证目标（GDI 输出硬编码日文/中文，便于确定性核对）
 │   │   └── TestTextTarget.c     #   可传 sjis（默认）/ gbk 选择 *A 系列编码，需与 cp= 配对
 │   ├── TestDll/                 # 自测用注入 DLL 源码（DllMain 写标记文件验证，支持前缀宏区分多 DLL）

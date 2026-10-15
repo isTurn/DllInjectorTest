@@ -1,0 +1,121 @@
+@echo off
+rem ============================================================================
+rem  Build the "call an export after injection" sample DLL (TestHookDll).
+rem
+rem  Output (next to this script - these binaries are shipped with the repo):
+rem    TestHookDll-x64.dll   64-bit
+rem    TestHookDll-x86.dll   32-bit
+rem
+rem  It then builds and runs TestLoad.c for BOTH bitnesses, so the export names
+rem  and the return codes are verified on the spot instead of being taken on
+rem  trust. A mismatch fails the script.
+rem
+rem  Notes:
+rem    - Paths are derived from this script's own location, so the repository
+rem      can live anywhere.
+rem    - Visual Studio is located with vswhere.exe (any edition).
+rem    - Messages are ASCII-only on purpose: cmd.exe reads .bat files using the
+rem      console code page, so non-ASCII text would be garbled.
+rem    - /utf-8 is REQUIRED on every cl line: the sources carry UTF-8 Chinese
+rem      comments, but without this switch MSVC decodes them using the system
+rem      code page (936/GBK on a Chinese Windows). A mis-decoded comment can
+rem      swallow the following newline and produce bogus "undeclared
+rem      identifier" errors, or fail outright with warning C4819.
+rem    - TestHookDll.def is passed to the linker so the exports keep their
+rem      undecorated names on x86 too. Without it, WINAPI (=__stdcall) would
+rem      export them as _InstallHook@4 on x86 but as InstallHook on x64, so
+rem      GetProcAddress(h, "InstallHook") would return NULL on x86.
+rem    - BOTH bitnesses are always built and verified. Keep them in sync.
+rem ============================================================================
+
+setlocal
+set "SRC=%~dp0"
+set "OUT=%~dp0..\..\test_output"
+
+rem ---- Locate Visual Studio (any edition) via vswhere ----------------------
+set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+if not exist "%VSWHERE%" set "VSWHERE=%ProgramFiles%\Microsoft Visual Studio\Installer\vswhere.exe"
+if not exist "%VSWHERE%" (
+    echo [ERROR] vswhere.exe not found - Visual Studio does not appear to be installed.
+    echo         Install "Visual Studio Build Tools" with the C++ workload:
+    echo         https://visualstudio.microsoft.com/downloads/
+    exit /b 1
+)
+
+set "VSPATH="
+for /f "usebackq delims=" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSPATH=%%i"
+if not defined VSPATH (
+    echo [ERROR] No Visual Studio installation with the C++ build tools was found.
+    echo         Install the "Desktop development with C++" workload.
+    exit /b 1
+)
+
+set "VC=%VSPATH%\VC\Auxiliary\Build"
+if not exist "%VC%\vcvars64.bat" (
+    echo [ERROR] vcvars64.bat not found under: %VC%
+    exit /b 1
+)
+echo [INFO] Visual Studio: %VSPATH%
+echo [INFO] source        : %SRC%
+echo [INFO] verifier out  : %OUT%
+echo.
+
+if not exist "%OUT%" md "%OUT%"
+
+rem Stale log would make the verification below unprovable.
+if exist "%SRC%hook_call_log.txt" del /q "%SRC%hook_call_log.txt"
+
+rem ---- x64 -----------------------------------------------------------------
+call "%VC%\vcvars64.bat" >nul
+
+cl /nologo /LD /O2 /utf-8 "%SRC%TestHookDll.c" /link /DEF:"%SRC%TestHookDll.def" /OUT:"%SRC%TestHookDll-x64.dll"
+if errorlevel 1 goto :fail
+
+cl /nologo /O2 /utf-8 "%SRC%TestLoad.c" /link /OUT:"%OUT%\TestLoad-x64.exe" /SUBSYSTEM:CONSOLE
+if errorlevel 1 goto :fail
+
+echo.
+echo ---- verify x64 -------------------------------------------------------
+"%OUT%\TestLoad-x64.exe" "%SRC%TestHookDll-x64.dll"
+if errorlevel 1 goto :fail
+
+rem ---- x86 -----------------------------------------------------------------
+call "%VC%\vcvars32.bat" >nul
+
+cl /nologo /LD /O2 /utf-8 "%SRC%TestHookDll.c" /link /DEF:"%SRC%TestHookDll.def" /OUT:"%SRC%TestHookDll-x86.dll"
+if errorlevel 1 goto :fail
+
+cl /nologo /O2 /utf-8 "%SRC%TestLoad.c" /link /OUT:"%OUT%\TestLoad-x86.exe" /SUBSYSTEM:CONSOLE
+if errorlevel 1 goto :fail
+
+echo.
+echo ---- verify x86 -------------------------------------------------------
+"%OUT%\TestLoad-x86.exe" "%SRC%TestHookDll-x86.dll"
+if errorlevel 1 goto :fail
+
+rem ---- clean intermediates left next to the source -------------------------
+del /q "%SRC%*.obj" "%SRC%*.exp" "%SRC%*.lib" "%SRC%*.ilk" "%SRC%*.pdb" 2>nul
+
+echo.
+echo ============================================================
+echo   BUILD OK - both bitnesses built and verified
+echo.
+echo   Inspect the exports by hand if you want:
+echo     dumpbin /exports TestHookDll-x64.dll
+echo     dumpbin /exports TestHookDll-x86.dll
+echo   Expected on both: InstallHook / Init / InstallConfig / InstallMulti
+echo   (an x86 build without the .def would show _InstallHook@4 etc.)
+echo.
+echo   The calls above also wrote %SRC%hook_call_log.txt
+echo   End-to-end injection (needs the injector built first):
+echo     DllInjector-x64.exe -inject 你的目标.exe TestHookDll-x64.dll ^
+echo         -export InstallConfig -exportarg "server=1.2.3.4^|port=8080"
+echo ============================================================
+endlocal
+exit /b 0
+
+:fail
+echo.
+echo BUILD_FAIL
+endlocal
+exit /b 1

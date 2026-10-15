@@ -4,6 +4,31 @@
 // exactly like the injector starts a remote thread. Success = rfi_call_log.txt.
 #include <windows.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+// Default to the sibling reflective DLL built for the same architecture as this
+// loader, derived from the loader's own location so the repository can live
+// anywhere. (This used to be an absolute developer path, which broke the test
+// silently once the repo moved.)
+static const char* DefaultDllPath(char* out, size_t outSize)
+{
+    char exe[MAX_PATH];
+    DWORD n = GetModuleFileNameA(NULL, exe, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH)
+    {
+        strcpy_s(out, outSize, ".");
+        return out;
+    }
+    char* slash = strrchr(exe, '\\');
+    if (slash) *(slash + 1) = '\0';
+#if defined(_WIN64)
+    sprintf_s(out, outSize, "%sTestReflectiveDll-x64.dll", exe);
+#else
+    sprintf_s(out, outSize, "%sTestReflectiveDll-x86.dll", exe);
+#endif
+    return out;
+}
 
 // Resolve a named export to its RVA (from a memory-laid-out image in buf)
 static DWORD FindExportRva(const unsigned char* buf, const char* want)
@@ -30,8 +55,8 @@ static DWORD FindExportRva(const unsigned char* buf, const char* want)
 
 int main(int argc, char** argv)
 {
-    const char* path = argc > 1 ? argv[1] :
-        "D:\\Download\\ToDLL\\test\\TestReflectiveDll\\TestReflectiveDll-x64.dll";
+    char defaultPath[MAX_PATH];
+    const char* path = argc > 1 ? argv[1] : DefaultDllPath(defaultPath, sizeof(defaultPath));
     FILE* f = fopen(path, "rb");
     if (!f) { printf("open fail: %s\n", path); return 1; }
     fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);

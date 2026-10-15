@@ -195,7 +195,7 @@ WaitForSingleObject(15s) → 线程退出码非 0 即成功（返回映射模块
 ```
 
 > 反射 DLL 的 `ReflectiveLoader` 全部工作在**目标进程内**：先通过 PEB 的模块链手工找到 kernel32（x86 从 `FS:[0x30]` 取 PEB，x64 从 `GS:[0x60]` 取），再解析其导出表拿到 `VirtualAlloc / LoadLibraryA / GetProcAddress` 等函数；随后为镜像分配新内存、逐节复制、按基址增量重定位、填充导入表，最后调用 `DllMain(DLL_PROCESS_ATTACH)`。整个过程不产生任何磁盘文件。
-> 仓库 `test/TestReflectiveDll/` 提供**自包含反射加载器**示例（`ReflectiveLoader_x64.asm` / `ReflectiveLoader_x86.asm` + C 源码），已编译 x64/x86 两个反射 DLL，可直接配合反射式注入使用。
+> 仓库 `test/TestReflectiveDll/` 提供**自包含反射加载器**示例（`ReflectiveLoader_x64.asm` / `ReflectiveLoader_x86.asm` + C 源码），已编译 x64/x86 两个反射 DLL，可直接配合反射式注入使用。同目录的 `TestLoader-x64.exe` / `TestLoader-x86.exe` 用于**进程内自验证**：把 DLL 按内存布局展开后直接调用其 `ReflectiveLoader`，不依赖注入器即可确认加载器本身可用（成功则输出 `C:\Windows\Temp\rfi_call_log.txt`）。
 
 ### 手动映射注入（Manual Map）
 
@@ -257,6 +257,56 @@ WaitForSingleObject(15s) → GetExitCodeThread
 >
 > 返回码即线程退出码，`0` 通常表示失败或无返回值。该功能会在注入流程完成后自动执行，每个成功注入的 DLL 都会尝试调用一次。
 
+## 文本 Hook（GalGame 引擎适配）
+
+注入器本身是**通用投送器**；面向 GalGame 的文本提取能力由配套的文本 Hook DLL 提供。
+
+> 完整设计（分层架构、引擎 profile 抽象、Hook 策略演进、编码处理、路线图）见
+> **[docs/text-hook-design.md](docs/text-hook-design.md)**。
+
+`test/TextHookDll/` 提供一阶段原型：
+
+| 文件 | 作用 |
+| --- | --- |
+| `TextHookDll.c` | profile 驱动的文本 Hook DLL：IAT 挂钩 `TextOutA/W`、`ExtTextOutA/W`、`DrawTextA/W`，SJIS/GBK → UTF-8 转换，命名管道推送 |
+| `TextHookDll.def` | 导出表：统一 x86/x64 的无修饰导出名（x86 下 `__stdcall` 会修饰成 `_InstallConfig@4`） |
+| `TextHookClient.c` | 管道消费者，实时打印捕获到的文本 |
+| `build.bat` | 编译上述内容 + 验证用目标程序（输出到 `test_output\`） |
+| `../TestTextTarget/TestTextTarget.c` | 验证目标：用 GDI 输出硬编码的日文/中文文本，便于确定性核对 |
+
+**零改动复用现有注入器**——引擎配置通过既有的 `-export` / `-exportarg` 机制下发：
+
+```bat
+:: 1) 编译
+test\TextHookDll\build.bat
+
+:: 2) 起客户端监听管道（独立控制台）
+test_output\TextHookClient.exe
+
+:: 3) 注入并启动目标程序
+DllInjector-x64.exe -inject test_output\TextTarget_x64.exe test_output\TextHookDll-x64.dll ^
+    -export InstallConfig -exportarg "engine=generic-gdi|cp=932|log=1"
+```
+
+> **编码必须配对**：`cp=` 是**进程级**设置，一个进程只能有一种 `*A` 编码。验证目标默认输出 Shift-JIS（配 `cp=932`）；
+> 要验证 GBK 请以 `test_output\TextTarget_x64.exe gbk` 启动并传 `cp=936`。两者不匹配时 `*A` 文本必然乱码，这是设计使然。
+> `*W` 系列走宽字符，不受 `cp=` 影响。
+
+配置项（`k=v` 用 `|` 分隔）：
+
+| 键 | 说明 |
+| --- | --- |
+| `engine` | `generic-gdi`（默认）/ `generic-gdi-sjis` / `generic-gdi-gbk` / `generic-unicode` |
+| `cp` | 强制 `*A` 系列文本的代码页（932 = Shift-JIS，936 = GBK），覆盖 profile 默认值 |
+| `pipe` | 管道名，默认 `GalToolText`（实际路径 `\\.\pipe\<名称>`） |
+| `log` | `1` 时同时落盘 `texthook_log.txt`（默认开，便于无客户端时验证） |
+| `minlen` / `dedup` | 最短文本长度（默认 2）/ 去重窗口毫秒（默认 200，游戏每帧重绘必须去重） |
+
+> **当前状态：一阶段原型。** 只覆盖走 IAT 的调用，且挂钩发生在游戏开跑之后
+> （注入器的 `ResumeThread` 早于导出函数调用，会漏掉启动后约百毫秒的文本）。
+> 引擎 profile 目前是通用 GDI 兜底；**针对具体引擎的 profile 必须对着实机样本逆向填写**，
+> 无法凭空推测。演进计划见设计文档第 8 节路线图。
+
 ## 从源码构建
 
 需要 [.NET 8 SDK](https://dotnet.microsoft.com/)。
@@ -271,8 +321,46 @@ build.bat
 | --- | --- |
 | `out\x64\DllInjector.exe` | 64 位 |
 | `out\x86\DllInjector.exe` | 32 位 |
+| `dist\DllInjector-x64.exe` | 64 位（与 Release 同名副本） |
+| `dist\DllInjector-x86.exe` | 32 位（与 Release 同名副本） |
 
-> 也可以直接使用仓库内置的 [GitHub Actions](.github/workflows/build.yml)：打 `v*` 标签即可自动构建并发布 Release。
+> 发布参数与 [GitHub Actions](.github/workflows/build.yml) 保持一致（Release + 自包含单文件 + 压缩），本地构建与 CI 产物相同。
+> 也可以直接用仓库内置的 CI：打 `v*` 标签即可自动构建并发布 Release。
+
+<details>
+<summary>遇到 <code>NuGet.targets(745,5): error : Value cannot be null. (Parameter 'path1')</code>？</summary>
+
+这是**环境变量缺失**，与项目无关。NuGet 6.x 的 `NuGetEnvironment` 用环境变量（而非 Win32 API）推导配置目录：
+
+| NuGet 需要的目录 | 依赖的环境变量 |
+| --- | --- |
+| `MachineWideSettingsBaseDirectory` | `ProgramFiles` |
+| `UserSettingsDirectory` | `APPDATA` |
+
+在精简 / 加固 / 沙箱化的 shell 里这些变量可能整体缺失，于是 `XPlatMachineWideSetting` 的**静态**构造函数在项目被读取之前就 `Path.Combine(null, ...)` 抛异常——因此**改项目文件、改 `NuGet.Config`、加 MSBuild 属性都绕不过去**（空工程同样失败）。
+
+`build.bat` 已在启动时防御性补回缺失的变量，所以正常用 `build.bat` 不会碰到。若是直接调用 `dotnet`，手动补上即可：
+
+```bat
+set "APPDATA=%USERPROFILE%\AppData\Roaming"
+set "ProgramFiles=%SystemDrive%\Program Files"
+```
+</details>
+
+### 构建测试素材（可选）
+
+`test/` 下的 C / ASM 素材需要 MSVC，脚本会通过 `vswhere.exe` 自动定位 Visual Studio（任意版本、任意安装路径均可）：
+
+```bat
+test\build_test.bat                  :: 编译测试 DLL 与目标程序 -> test_output\
+test\ManualMap\build_shellcode.bat   :: 汇编手动映射 shellcode 并重新生成字节数组
+test\TestReflectiveDll\build.bat     :: 编译反射 DLL 示例 + TestLoader 进程内验证器
+test\TestHookDll\build.bat           :: 编译示例 DLL（x64 + x86，产物就放在 test\TestHookDll\）
+test\TextHookDll\build.bat           :: 编译文本 Hook DLL + 管道客户端 + 验证目标 -> test_output\
+```
+
+> `test\ManualMap\build_shellcode.bat` 会重新生成 `shellcode_x64.cs` / `shellcode_x86.cs` / `unmap_x64.cs` / `unmap_x86.cs`，
+> 需要手动把其中的字节数组回填到 `DllInjector\Program.cs` 中同名的 `byte[]` 定义处。
 
 ## 目录结构
 
@@ -296,13 +384,29 @@ DllInjectorTest/
 │   │   ├── ReflectiveLoader_x86.asm   #   x86 反射加载器入口
 │   │   ├── Reflective.def / build.bat
 │   │   ├── TestReflectiveDll-x64.dll  #   加载成功后写 C:\Windows\Temp\rfi_call_log.txt 两行日志
-│   │   └── TestReflectiveDll-x86.dll
+│   │   ├── TestReflectiveDll-x86.dll
+│   │   ├── TestLoader.c         #   进程内验证反射加载器（按内存布局展开后直接调用 ReflectiveLoader）
+│   │   └── TestLoader-x64.exe / -x86.exe   #   由 build.bat 一并编译，默认加载同目录同架构的反射 DLL
 │   ├── ManualMap/               # 手动映射注入 shellcode（源码 + 编译中间物，字节已内嵌注入器）
 │   │   ├── ManualMap_x64.asm    #   x64 手动映射器（1202 字节，已实机验证 Init=42 / InstallHook=1）
-│   │   └── ManualMap_x86.asm    #   x86 手动映射器（956 字节，已实机验证 Init=42 / InstallHook=1）
+│   │   ├── ManualMap_x86.asm    #   x86 手动映射器（956 字节，已实机验证 Init=42 / InstallHook=1）
+│   │   ├── UnmapDll_x64.asm     #   x64 手动映射卸载器（520 字节）
+│   │   ├── UnmapDll_x86.asm     #   x86 手动映射卸载器（451 字节）
+│   │   ├── gen_shellcode.py     #   从 .obj 提取 .text 机器码并生成 C# byte[] 字面量
+│   │   └── build_shellcode.bat  #   一键汇编 + 提取（ml64 / ml + python）
+│   ├── TextHookDll/             # GalGame 文本 Hook（一阶段原型，详见 docs/text-hook-design.md）
+│   │   ├── TextHookDll.c        #   profile 驱动的 IAT 文本 Hook：挂钩 GDI 文本 API + 管道推送
+│   │   ├── TextHookDll.def      #   导出表：统一 x86/x64 的无修饰导出名（避免 __stdcall 修饰差异）
+│   │   ├── TextHookClient.c     #   管道消费者（控制台实时打印捕获到的文本）
+│   │   └── build.bat            #   编译 Hook DLL + 客户端 + 验证目标（输出到 test_output\）
+│   ├── TestTextTarget/          # 文本 Hook 的验证目标（GDI 输出硬编码日文/中文，便于确定性核对）
+│   │   └── TestTextTarget.c     #   可传 sjis（默认）/ gbk 选择 *A 系列编码，需与 cp= 配对
 │   ├── TestDll/                 # 自测用注入 DLL 源码（DllMain 写标记文件验证，支持前缀宏区分多 DLL）
 │   ├── TestTarget/              # 自测用目标程序源码（支持命令行参数回显）
-│   └── build_test.bat           # 编译测试素材的脚本（MSVC）
+│   └── build_test.bat           # 编译测试素材的脚本（MSVC，自动定位 Visual Studio）
+├── docs/
+│   ├── index.html               # GitHub Pages 展示页
+│   └── text-hook-design.md      # 多引擎文本 Hook 适配架构设计
 ├── screenshot.png              # 界面截图
 ├── build.bat                   # 一键构建脚本（x64 + x86）
 ├── CHANGELOG.md

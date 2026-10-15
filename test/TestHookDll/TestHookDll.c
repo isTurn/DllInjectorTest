@@ -1,8 +1,12 @@
 // TestHookDll.c — 测试注入器「注入后调用 DLL 导出函数」功能的示例 DLL
 //
 // 编译（MSVC）:
-//   x64: vcvarsall.bat x64 && cl /LD /O2 TestHookDll.c /Fe:TestHookDll-x64.dll
-//   x86: vcvarsall.bat x86 && cl /LD /O2 TestHookDll.c /Fe:TestHookDll-x86.dll
+//   x64: vcvarsall.bat x64 && cl /LD /O2 /utf-8 TestHookDll.c /Fe:TestHookDll-x64.dll
+//   x86: vcvarsall.bat x86 && cl /LD /O2 /utf-8 TestHookDll.c /Fe:TestHookDll-x86.dll
+//
+//   注意：/utf-8 是必需的。本文件含 UTF-8 中文注释，缺这个开关时 MSVC 会按系统代码页
+//         （中文 Windows 为 936/GBK）解析源码，注释末尾的字节可能吞掉换行，
+//         把下一行代码并进注释，报出一堆莫名其妙的「未声明的标识符」。
 //
 // 用法:
 //   DllInjector-x64.exe -inject 目标.exe TestHookDll-x64.dll -export InstallHook -exportarg "你的参数"

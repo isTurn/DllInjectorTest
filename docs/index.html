@@ -256,7 +256,7 @@
       <div class="feat"><div class="f-ico">👑</div><h3>SeDebugPrivilege 提权</h3><p>注入 / 卸载前自动启用调试权限，以管理员运行时即可注入 SYSTEM 等高权限 / 其他会话进程；普通权限仅提示不阻断。</p></div>
       <div class="feat"><div class="f-ico">💾</div><h3>记忆上次选择</h3><p>自动记住上次的 exe / dll（多 DLL 完整记忆）、注入方式与窗口位置，下次启动直接带出。</p></div>
       <div class="feat"><div class="f-ico">🌐</div><h3>支持中文路径</h3><p>DLL 路径以 UTF-16 写入远程进程，中文目录 / 文件名完全兼容。</p></div>
-      <div class="feat"><div class="f-ico">⚙️</div><h3>命令行模式</h3><p><code>-inject</code> / <code>-injectpid</code> / <code>-eject</code>，支持多 DLL、注入方式与 <code>-export</code> 导出函数调用，退出码明确区分成败。</p></div>
+      <div class="feat"><div class="f-ico">⚙️</div><h3>命令行模式</h3><p><code>-inject</code> / <code>-injectpid</code> / <code>-injectname</code> / <code>-eject</code> / <code>-checkdll</code>，支持多 DLL、启动参数、注入方式与 <code>-export</code> 导出函数调用，退出码明确区分成败。</p></div>
     </div>
   </div>
 </section>
@@ -353,7 +353,7 @@
     <div class="sec-head">
       <span class="kicker">Compare</span>
       <h2>注入方式对比</h2>
-      <p>四种注入方式在不同场景下的适用性与特性差异。</p>
+      <p>五种注入方式在不同场景下的适用性与特性差异。</p>
     </div>
     <div class="tbl-wrap">
       <table>

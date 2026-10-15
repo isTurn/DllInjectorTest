@@ -1,0 +1,20 @@
+; TextHookDll.def — 导出函数表
+;
+; 为什么需要这个文件：
+;   x86 下 WINAPI(=__stdcall) 的导出名会被修饰成 _InstallConfig@4，
+;   而 x64 只有一种调用约定、不修饰，导出名就是 InstallConfig。
+;   结果是同一个源文件编出来的 x86/x64 DLL 导出名不一致，
+;   任何用 GetProcAddress(h, "InstallConfig") 按名字取址的消费者在 x86 上会拿到 NULL。
+;
+;   注入器自身能兼容两种形式（PeHelper.GetExportRva 会匹配 "_名称@数字"），
+;   但为了一致性与可预期性，这里用 .def 统一导出**无修饰**的名字。
+;   这也是本仓库既有的做法，参见 test\TestReflectiveDll\Reflective.def。
+;
+; 注意：注入器调用导出函数时会传入一个 UTF-16 字符串指针（可为 NULL），
+;      调用约定为 __stdcall（WINAPI），调用方需按此约定使用。
+
+EXPORTS
+    InstallConfig
+    InstallHook
+    Init
+    Unhook

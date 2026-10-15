@@ -1,31 +1,127 @@
-# 参与贡献
+# 贡献指南（Contributing）
 
-欢迎为本项目贡献力量！无论是提交 Bug、提出新特性，还是提交代码，都非常感谢。
+感谢你愿意为 **DLL 注入器** 出力。本文件说明如何搭建环境、修改代码、以及提交改动。
 
-## 环境准备
+在动手前，请先阅读 [SECURITY.md](SECURITY.md) —— 本项目涉及进程注入，**只接受合法用途的贡献**（调试、插件 / MOD 开发、教学研究）。任何用于绕过授权、规避检测、攻击他人系统的改动都会被拒绝。
 
-- [.NET 8 SDK](https://dotnet.microsoft.com/)（构建注入器）
-- Visual Studio 2022 + MSVC 工具集（可选，仅编译 `test/` 下的 C 测试程序时需要）
+---
 
-## 本地构建
+## 环境要求
+
+| 用途 | 需要什么 |
+| --- | --- |
+| 编译注入器本体 | [.NET 8 SDK](https://dotnet.microsoft.com/download) |
+| 编译 `test/` 下的 C/ASM 测试素材 | Visual Studio 2022（或 Build Tools），需勾选「使用 C++ 的桌面开发」工作负载 |
+| 重新生成手动映射 shellcode | 上面的 VS + Python 3（`test/ManualMap/gen_shellcode.py`） |
+
+> 构建脚本通过 `vswhere.exe` 自动定位 Visual Studio，**任意版本**（Community / Professional / Enterprise）与任意安装路径都可用，无需手工改路径。
+
+## 构建
 
 ```bat
+:: 构建注入器（x64 + x86 自包含单文件）
 build.bat
+
+:: 构建测试素材（测试 DLL + 目标程序）
+test\build_test.bat
+
+:: 重新生成手动映射 shellcode 字节数组
+test\ManualMap\build_shellcode.bat
 ```
 
-## 提交流程
+`build.bat` 产物：
 
-1. Fork 本仓库并创建特性分支：`git checkout -b feature/my-feature`
-2. 修改代码后本地构建验证：`build.bat`
-3. 提交并推送，然后创建 Pull Request（参考 `.github/PULL_REQUEST_TEMPLATE.md`）
-4. 等待 Review
+| 路径 | 说明 |
+| --- | --- |
+| `out\x64\DllInjector.exe` | 64 位注入器 |
+| `out\x86\DllInjector.exe` | 32 位注入器 |
+| `dist\DllInjector-x64.exe` | 与 Release 同名的 64 位副本 |
+| `dist\DllInjector-x86.exe` | 与 Release 同名的 32 位副本 |
 
-## 代码风格
+发布参数与 [`.github/workflows/build.yml`](.github/workflows/build.yml) **保持一致**。改动其中一处时，请同步另一处，否则本地构建与 CI 产物会出现差异。
 
-- 遵循 `.editorconfig`（UTF-8、4 空格缩进）
-- C# 代码保持与现有 `Program.cs` 风格一致（区域注释、命名清晰）
-- 提交信息使用简洁的祈使句，如 `Add xxx` / `Fix yyy`
+## 目录职责
 
-## 测试建议
+```
+DllInjector/Program.cs       注入器全部源码（单文件，约 3000 行）
+  ├─ NativeMethods           Win32 / ntdll P/Invoke 声明与常量
+  ├─ PeHelper                PE 头解析：位数、导出表 RVA、注入前体检
+  ├─ MainForm                WinForms 界面（手写 DPI 缩放布局）
+  │   ├─ DllSortDialog       多 DLL 注入顺序拖拽排序
+  │   └─ BatchInjectDialog   多进程批量注入勾选
+  ├─ InjectorCore            注入核心（GUI 与 CLI 共用）
+  ├─ ConfigStore             配置持久化（记忆 exe/dll/注入方式/窗口位置）
+  ├─ Theme                   暗色主题色板
+  └─ Program                 入口：UAC 自提权 + CLI 模式分发
 
-`test/` 目录提供了示例 DLL 与目标程序源码（C 语言，MSVC 编译），可用来端到端验证注入功能。测试 DLL 会在目标进程内写入标记文件以证明 `DllMain` 被调用。
+test/                        测试素材（源码 + 部分已编译产物）
+  ├─ TestDll/                自测注入 DLL（写标记文件，宏区分多 DLL 变体）
+  ├─ TestTarget/             自测目标程序（回显命令行参数）
+  ├─ TestHookDll/            导出函数调用示例（InstallHook / Init / InstallConfig / InstallMulti）
+  ├─ TestReflectiveDll/      自包含反射加载器示例
+  └─ ManualMap/              手动映射 / 卸载 shellcode（.asm 源码 + 生成脚本）
+
+docs/index.html              GitHub Pages 展示页
+```
+
+## 代码约定
+
+本项目**刻意保持单文件、零第三方依赖**——请不要引入 NuGet 包或拆分文件，除非在 Issue 中先达成共识。
+
+1. **目标框架**：`net8.0-windows`，WinForms。`Nullable` 与 `ImplicitUsings` 按现有 `csproj` 设置，不要改动。
+2. **注释用中文**，与现有风格一致；关键分支要写清「为什么这么做」，而不只是「做了什么」。
+3. **布局必须走 `LayoutAll()`**：界面全部手写坐标，基准是 96 DPI 逻辑值，统一经 `Scale()` 换算。**不要**使用 `AutoScaleMode`，也不要在控件上写死像素。
+4. **日志统一走 `Action<string> log` 回调**，不要在 `InjectorCore` 里直接碰控件或 `Console`——CLI 与 GUI 共用同一套核心逻辑。
+5. **错误信息要可诊断**：涉及 Win32 调用失败时附上 `NativeMethods.LastErrorText()`。
+6. **退出码语义固定**：CLI `0` = 成功，`1` = 失败。不要引入其他退出码。
+7. **`.bat` 脚本只用 ASCII 输出**：cmd.exe 按控制台代码页读取批处理文件，写入非 ASCII 文本会乱码。
+
+## 新增一种注入方式
+
+五种注入方式的实现都在 `InjectorCore.LoadLibraryIntoProcess` 中按 `method` 分派。新增一种需要同步改动以下位置：
+
+1. `NativeMethods`：新增 `INJECT_XXX` 常量（**追加在末尾**，不要插队，否则会破坏 `ConfigStore` 里已记忆的方式编号）。
+2. `InjectorCore.LoadLibraryIntoProcess`：新增分派分支，并明确 `remoteBuf` / `hRemoteThread` 的所有权与释放责任。
+3. `InjectorCore.Run` 与 `InjectToProcess`：确认新方式是否支持「启动时注入」与「运行中进程」；若只支持其一，需像 `QueueUserAPC` 那样给出提示或自动降级。
+4. `InjectorCore` 的注入核验段：说明该方式注入后模块是否会出现在目标进程模块列表，并给出对应的核验方式。
+5. `MainForm.BuildUi`：`_cboMethod` 的 `Items` 追加同名项（**顺序必须与常量编号一致**）。
+6. `Program.ParseMethod`：新增 CLI 别名。
+7. 文档：`README.md`（功能特性 / 对比表 / 原理图 / CLI 用法）、`docs/index.html`、`CHANGELOG.md`。
+8. `ConfigStore.Method` 的取值上限校验（当前是 `m <= 4`）。
+
+## 提交前自检
+
+- [ ] `build.bat` 能成功产出 x64 + x86 两个版本
+- [ ] 若改动涉及注入逻辑，用 `test\build_test.bat` 的素材实测过，且 x64 / x86 **双架构都验证**
+- [ ] `README.md` / `docs/index.html` / `CHANGELOG.md` 中受影响的内容已同步更新
+- [ ] 没有提交构建产物与运行时文件（`out/`、`dist/`、`bin/`、`obj/`、`test_output/`、`*.obj`、`inject_log.txt`、`DllInjector.config` 等，见 `.gitignore`）
+- [ ] 没有为了「顺手」而重构无关代码（请让 PR 保持聚焦）
+
+## 提交信息
+
+参考 [Conventional Commits](https://www.conventionalcommits.org/zh-hans/)：
+
+```
+feat: 新增 xxx 注入方式
+fix: 修正 64 位进程卸载时模块句柄被截断
+docs: 补充手动映射卸载的说明
+build: 让 test/build_test.bat 自动定位 Visual Studio
+refactor: 抽取 PreflightDlls 供 CLI 复用
+```
+
+## 提交 PR
+
+1. 从 `main` 切出分支，命名如 `feat/manual-map-unload`、`fix/x64-eject`；
+2. 按 [PR 模板](.github/PULL_REQUEST_TEMPLATE.md) 填写说明，**务必写清测试方式**；
+3. 确认自检清单全部勾选。
+
+## 版本与变更记录
+
+- 版本号遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)；
+- 所有用户可见的改动都要写进 [`CHANGELOG.md`](CHANGELOG.md) 的 `[Unreleased]` 段，合并发布时再归入具体版本号；
+- 打 `v*` 标签会触发 CI 自动构建并发布 Release。
+
+## 遇到问题
+
+- 使用问题、编译报错 → 提 [Issue](.github/ISSUE_TEMPLATE/bug_report.md)
+- 安全相关问题 → **不要**开公开 Issue，走 [SECURITY.md](SECURITY.md) 里的私密通道

@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 安全漏洞上报（请勿开公开 Issue）
+    url: https://github.com/isTurn/DllInjectorTest/security/advisories/new
+    about: 涉及进程注入的安全问题请走私密通道，详见 SECURITY.md
+  - name: 使用说明与常见问题
+    url: https://github.com/isTurn/DllInjectorTest#readme
+    about: 注入方式对比、CLI 用法、注意事项都写在 README 里，提 Issue 前建议先看一眼
+  - name: 参与贡献
+    url: https://github.com/isTurn/DllInjectorTest/blob/main/CONTRIBUTING.md
+    about: 构建方式、代码约定、如何新增一种注入方式

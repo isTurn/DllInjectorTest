@@ -20,6 +20,11 @@ setlocal
 set "SRC=%~dp0"
 set "OUT=%~dp0..\test_output"
 
+rem cl writes .obj / .exp / .lib into the CURRENT directory (not next to the
+rem source). Without this cd, invoking the script from the repo root scatters
+rem MSVC intermediates into the repo root.
+cd /d "%SRC%"
+
 rem ---- Locate Visual Studio (any edition) via vswhere ----------------------
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 if not exist "%VSWHERE%" set "VSWHERE=%ProgramFiles%\Microsoft Visual Studio\Installer\vswhere.exe"

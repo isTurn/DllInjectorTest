@@ -57,10 +57,14 @@ DllInjector.mmmap
 test_output/
 
 # MSVC intermediate files for the test material.
-# NOTE: the *compiled* test binaries (test/TestHookDll/*.dll,
-# test/TestReflectiveDll/*.dll, test/TestReflectiveDll/TestLoader-*.exe) are
-# intentionally shipped with the repository, so they are deliberately NOT
-# ignored here.
+# NOTE: the *compiled* test DLLs (test/TestHookDll/*.dll,
+# test/TestReflectiveDll/TestReflectiveDll-*.dll) are intentionally shipped with
+# the repository, so they are deliberately NOT ignored here.
+#
+# The validator executables next to them are NOT shipped: TestLoader-*.exe is
+# rebuilt by test\TestReflectiveDll\build.bat on every run, and nothing consumes
+# the committed copy (CI builds it, local runs build it). Committing them would
+# only add a fresh binary diff to every build.
 test/**/*.obj
 test/**/*.exp
 test/**/*.lib
@@ -69,6 +73,21 @@ test/**/*.res
 test/**/*.idb
 test/**/*.pdb
 test/**/*.tlog
+test/TestReflectiveDll/TestLoader-*.exe
+
+# Same intermediates when a build is invoked from the repository root.
+# cl.exe writes .obj/.exp/.lib into the *current working directory*, not next to
+# the source file, so running "cl ... test\TextHookDll\TextHookDll.c" from the
+# repo root drops them here and the test/** rules above do not cover them.
+# (Every build script now does "cd /d "%SRC%"" for exactly this reason, which is
+# also what used to make the link step fail with LNK1181 when run from the root.)
+/*.obj
+/*.exp
+/*.lib
+/*.ilk
+/*.res
+/*.idb
+/*.tlog
 
 # ---- OS junk ----
 Thumbs.db

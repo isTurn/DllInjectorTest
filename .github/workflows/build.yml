@@ -1,4 +1,4 @@
-﻿name: build
+name: build
 
 on:
   push:
@@ -12,10 +12,17 @@ jobs:
   build:
     name: Build (${{ matrix.rid }})
     runs-on: windows-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        rid: [ win-x64, win-x86 ]
+        include:
+          # probe 是随仓库分发的探针 DLL，用于给发布出来的 exe 做冒烟测试。
+          # 两个架构必须各配一个同架构的探针，否则 -checkdll 会因位数不符而失败。
+          - rid: win-x64
+            probe: test/TestHookDll/TestHookDll-x64.dll
+          - rid: win-x86
+            probe: test/TestHookDll/TestHookDll-x86.dll
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -25,8 +32,30 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
+      # C# 侧的纯逻辑回归测试：PE 解析、DLL 分隔、-method 解析、进程名通配。
+      # 放在 publish 之前跑，失败时能最快拿到结论（不必等发布产物）。
+      # 这些函数「错了不会崩、但会静默给出错误结果」，正是最需要自动化兜底的地方。
+      - name: Run C# logic tests
+        shell: cmd
+        run: test\DllInjectorTests\build.bat
+
       - name: Publish self-contained single-file
         run: dotnet publish DllInjector/DllInjector.csproj -c Release -r ${{ matrix.rid }} --self-contained true -p:PublishSingleFile=true -p:EnableCompressionInSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o out/${{ matrix.rid }}
+
+      # 冒烟测试：确认发布出来的 exe 真的能跑、PE 体检结果正确。
+      # 只依据退出码判定（-checkdll 成功返回 0、失败返回 1），不解析输出文本——
+      # 输出含中文，在非中文 locale 的 runner 上编码不可靠。
+      # 注意 -checkdll 带参数，因此不会触发 GUI 模式的 UAC 提权重启。
+      - name: Smoke-test published binary
+        shell: pwsh
+        run: |
+          $exe = "out/${{ matrix.rid }}/DllInjector.exe"
+          if (-not (Test-Path $exe)) { throw "not found: $exe" }
+          Write-Host "running: $exe -checkdll ${{ matrix.probe }}"
+          & $exe -checkdll "${{ matrix.probe }}"
+          $rc = $LASTEXITCODE
+          Write-Host "exit code: $rc"
+          if ($rc -ne 0) { throw "-checkdll failed (exit $rc)" }
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -35,10 +64,69 @@ jobs:
           path: out/${{ matrix.rid }}/
           if-no-files-found: error
 
+  # 原生测试素材（C）的编译与功能验证。
+  # 之前 CI 完全不碰 C 代码：/utf-8 缺失、导出名被 __stdcall 修饰、硬编码绝对路径
+  # 这类问题都只能等本地构建时才发现。text-hook 的验证器会把
+  # 「装钩子 → 捕获文本 → 卸载后 IAT 是否还原」整条链路跑一遍（x64 + x86）。
+  native:
+    name: Native tests (x64 + x86)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build test material (injection targets)
+        shell: cmd
+        run: test\build_test.bat
+
+      - name: Build and verify text-hook material
+        shell: cmd
+        run: test\TextHookDll\build.bat
+
+      # TestHookDll 是「注入后调用导出函数」的样例 DLL，随仓库分发。
+      # 它的 build.bat 会顺手编译 TestLoad.c 并真的调一遍导出函数（x64 + x86），
+      # 所以导出名被 __stdcall 修饰这类问题会在这里当场暴露。
+      - name: Build and verify call-export sample DLL
+        shell: cmd
+        run: test\TestHookDll\build.bat
+
+      # 反射式注入素材。注意它会重写 test/TestHookDll/*.dll 之外的同名产物，
+      # 但输出目录就是它自己，不会影响上面两步。
+      - name: Build reflective-injection material
+        shell: cmd
+        run: test\TestReflectiveDll\build.bat
+
+      # shellcode 与 .asm 的同步检查：Program.cs 里的四个 byte[] 是手工从 .obj
+      # 抄过去的历史遗留，现在由 gen_shellcode.py --apply 直接回填。
+      # 这里重新汇编 + 回填，再用 git diff 断言「仓库里提交的数组确实等于
+      # 当前 .asm 汇编出来的字节」。如果有人改了 .asm 却忘了重新生成，
+      # 这一步会失败并把差异打出来。
+      - name: Verify shellcode arrays match the assembly sources
+        shell: cmd
+        run: |
+          test\ManualMap\build_shellcode.bat
+          git diff --exit-code -- DllInjector\Program.cs
+          if errorlevel 1 (
+            echo SHELLCODE_OUT_OF_SYNC - run test\ManualMap\build_shellcode.bat locally and commit the result.
+            exit /b 1
+          )
+
+      - name: Upload native artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-test-output
+          path: |
+            test_output/
+            test/TestHookDll/hook_call_log.txt
+            test/TextHookDll/texthook_log.txt
+          if-no-files-found: ignore
+
   release:
     name: Create GitHub Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: [ build, native ]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -60,9 +148,11 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
-          # 固定 body：更新时整体覆盖，避免 generate_release_notes 重复追加 "Full Changelog"
+          # 固定 body：更新时整体覆盖，避免 generate_release_notes 重复追加 "Full Changelog"。
+          # 版本号取标签名（${{ github.ref_name }}），不要写死——写死的话以后每次发版
+          # 正文都还印着旧版本号。
           body: |
-            ## DLL 注入器 v1.0.0
+            ## DLL 注入器 ${{ github.ref_name }}
 
             选择目标 exe 和 dll，以挂起方式启动目标程序，注入 DLL 后恢复运行。
 
@@ -72,4 +162,3 @@ jobs:
             自包含单文件，无需安装 .NET 环境即可直接运行。使用方法见仓库 README。
 
             注入方式：CreateRemoteThread / NtCreateThreadEx / QueueUserAPC / 反射式注入（Reflective）/ 手动映射注入（Manual Map）。
-

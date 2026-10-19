@@ -9,6 +9,24 @@
 # Docs
 *.md text eol=lf
 
+# Config / scripts that .editorconfig also pins to LF. Without an explicit
+# eol here they fall under text=auto, and a Windows clone with
+# core.autocrlf=true would check them out as CRLF -- "git diff" would then warn
+# "LF will be replaced by CRLF the next time Git touches it" and the working
+# tree would disagree with .editorconfig. Keep these two files in sync.
+.editorconfig   text eol=lf
+.gitignore      text eol=lf
+.gitattributes  text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.py   text eol=lf
+*.ini  text eol=lf
+*.html text eol=lf
+*.csproj text eol=lf
+*.asm  text eol=lf
+*.def  text eol=lf
+
 # Batch scripts (must keep CRLF on Windows)
 *.bat text eol=crlf
 *.ps1 text eol=crlf

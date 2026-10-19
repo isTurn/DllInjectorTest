@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    纯逻辑回归测试。刻意**不引入任何 NuGet 测试框架**：
+    本项目的硬约定是零第三方依赖，而这里要测的都是纯函数，
+    一个自带断言的控制台程序已经够用（也省掉 restore 的网络与包体积）。
+
+    编译方式：把 DllInjector/Program.cs **原样链接进来**，而不是引用
+    DllInjector.exe。原因有两个：
+      1) DllInjector 是 WinExe，直接引用拿不到 internal 类型；
+      2) 链接同一份源码意味着测试跑的**就是**发布出去的那份代码，
+         不会出现「测的是另一份拷贝」的假通过。
+    代价是 DllInjector/Program.cs 里也有一个 Main，所以必须显式指定
+    StartupObject。
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>DllInjectorTests</AssemblyName>
+    <RootNamespace>DllInjectorTests</RootNamespace>
+    <StartupObject>DllInjectorTests.TestMain</StartupObject>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <SatelliteResourceLanguages>zh-Hans</SatelliteResourceLanguages>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <Compile Include="..\..\DllInjector\Program.cs" Link="DllInjector\Program.cs" />
+  </ItemGroup>
+
+</Project>

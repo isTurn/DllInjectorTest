@@ -1,10 +1,25 @@
 # gen_shellcode.py -- extract .text$mn machine code from COFF obj -> C# byte[]
-# Usage: python gen_shellcode.py [ManualMap_x64] [ManualMap_x86] [UnmapDll_x64] [UnmapDll_x86]
-#   (defaults to all four; args are obj basenames without .obj)
-import struct, sys
+#
+# Usage:
+#   python gen_shellcode.py                 # regenerate all four .cs files
+#   python gen_shellcode.py ManualMap_x64   # selected obj basenames (no .obj)
+#   python gen_shellcode.py --apply         # also patch DllInjector\Program.cs in place
+#   python gen_shellcode.py --check         # compare only; exit 1 if Program.cs is stale
+#
+# Why --apply / --check exist:
+#   The four byte arrays in DllInjector\Program.cs are a *copy* of the assembled
+#   .text section. Before this, keeping them in sync meant a human copy-pasting
+#   the generated output -- an easy step to forget, and a stale array is
+#   completely silent at build time (the injector just runs old shellcode).
+#   --check is what CI runs: if someone edits an .asm and forgets to regenerate,
+#   the build fails instead of shipping mismatched shellcode.
+import os, re, struct, sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+PROGRAM_CS = os.path.normpath(os.path.join(HERE, '..', '..', 'DllInjector', 'Program.cs'))
 
 def extract_text(path):
-    with open(path, 'rb') as f:
+    with open(os.path.join(HERE, path), 'rb') as f:
         data = f.read()
     num_sections = struct.unpack_from('<H', data, 2)[0]
     opt_size = struct.unpack_from('<H', data, 16)[0]
@@ -27,6 +42,23 @@ def fmt(blob):
         lines.append('        ' + ', '.join('0x%02X' % b for b in chunk) + ',')
     return '\n'.join(lines)
 
+def array_literal(cname, blob):
+    return ('        public static readonly byte[] %s =\n        {\n%s\n        };'
+            % (cname, fmt(blob)))
+
+def find_array(text, cname):
+    """Return (start, end) character offsets of the whole array declaration."""
+    m = re.search(r'public static readonly byte\[\]\s+' + re.escape(cname) + r'\s*=\s*\{(.*?)\};',
+                  text, re.S)
+    if not m:
+        raise SystemExit('array %s not found in Program.cs' % cname)
+    return m.start(), m.end()
+
+def bytes_in_array(text, cname):
+    s, e = find_array(text, cname)
+    body = text[s:e]
+    return [int(v, 16) for v in re.findall(r'0x([0-9A-Fa-f]{2})', body)]
+
 jobs = [
     ('ManualMap_x64.obj', 'ManualMapX64', 'shellcode_x64.cs'),
     ('ManualMap_x86.obj', 'ManualMapX86', 'shellcode_x86.cs'),
@@ -34,16 +66,74 @@ jobs = [
     ('UnmapDll_x86.obj',  'UnmapDllX86',  'unmap_x86.cs'),
 ]
 
-names = sys.argv[1:] or [j[0][:-4] for j in jobs]
+args = sys.argv[1:]
+apply_mode = '--apply' in args
+check_mode = '--check' in args
+names = [a for a in args if not a.startswith('--')] or [j[0][:-4] for j in jobs]
+
+def read_cs(path):
+    """Read Program.cs preserving whether it started with a UTF-8 BOM.
+
+    The source file ships with a BOM (it contains Chinese comments and is
+    opened by tooling that honours the BOM). Rewriting it without the BOM
+    would show up as a spurious one-line diff on every regeneration.
+    """
+    with open(path, 'rb') as f:
+        raw = f.read()
+    has_bom = raw.startswith(b'\xef\xbb\xbf')
+    if has_bom:
+        raw = raw[3:]
+    return raw.decode('utf-8'), has_bom
+
+def write_cs(path, text, has_bom):
+    data = text.encode('utf-8')
+    if has_bom:
+        data = b'\xef\xbb\xbf' + data
+    with open(path, 'wb') as f:
+        f.write(data)
+
+# ---- --check: compare assembled .obj bytes against what Program.cs already has
+if check_mode:
+    if not os.path.exists(PROGRAM_CS):
+        raise SystemExit('Program.cs not found: ' + PROGRAM_CS)
+    cs, _ = read_cs(PROGRAM_CS)
+    stale = []
+    for obj, cname, _ in jobs:
+        if obj[:-4] not in names:
+            continue
+        want = list(extract_text(obj))
+        have = bytes_in_array(cs, cname)
+        if want != have:
+            stale.append('%s: obj=%d bytes, Program.cs=%d bytes%s'
+                         % (cname, len(want), len(have),
+                            '' if len(want) != len(have) else ' (same length, different content)'))
+    if stale:
+        print('SHELLCODE_STALE')
+        for line in stale:
+            print('  ' + line)
+        print('Fix: run build_shellcode.bat (it now patches Program.cs directly).')
+        raise SystemExit(1)
+    print('SHELLCODE_OK: Program.cs arrays match the assembled .obj files')
+    raise SystemExit(0)
+
 out = []
 for obj, cname, csfile in jobs:
     if obj[:-4] not in names:
         continue
     blob = extract_text(obj)
     out.append((cname, blob))
-    with open(csfile, 'w', encoding='utf-8') as f:
-        f.write('        public static readonly byte[] %s =\n        {\n%s\n        };\n' % (cname, fmt(blob)))
+    with open(os.path.join(HERE, csfile), 'w', encoding='utf-8') as f:
+        f.write(array_literal(cname, blob) + '\n')
     print('%s -> %s (%d bytes)' % (obj, csfile, len(blob)))
+
+# ---- --apply: patch the arrays straight into Program.cs
+if apply_mode:
+    cs, has_bom = read_cs(PROGRAM_CS)
+    for cname, blob in out:
+        s, e = find_array(cs, cname)
+        cs = cs[:s] + array_literal(cname, blob) + cs[e:]
+    write_cs(PROGRAM_CS, cs, has_bom)
+    print('APPLIED: patched %d array(s) into %s' % (len(out), PROGRAM_CS))
 
 # print a one-line size summary for the caller
 print('SUMMARY: ' + ', '.join('%s=%d' % (n, len(b)) for n, b in out))

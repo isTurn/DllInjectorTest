@@ -22,6 +22,13 @@ setlocal
 set "SRC=%~dp0"
 set "OUT=%SRC%"
 
+rem cl / ml write .obj next to the SOURCE file, not next to the script, but
+rem the linker resolves the /link /OUT: paths and the .obj argument relative to
+rem the CURRENT directory. Without this cd, invoking the script from anywhere
+rem else (the repo root, or CI) makes ml64 drop the .obj in that other
+rem directory while the link step looks for it here -> LNK1181.
+cd /d "%SRC%"
+
 rem ---- Locate Visual Studio (any edition) via vswhere ----------------------
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 if not exist "%VSWHERE%" set "VSWHERE=%ProgramFiles%\Microsoft Visual Studio\Installer\vswhere.exe"

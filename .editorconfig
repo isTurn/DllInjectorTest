@@ -1,12 +1,25 @@
 root = true
 
+# ============================================================================
+#  Line endings
+# ----------------------------------------------------------------------------
+#  end_of_line here MUST agree with .gitattributes. Git checks out *.cs / *.c /
+#  *.h / *.md with eol=lf, so an editor that is told "crlf" would rewrite every
+#  line on save and bury real changes in whitespace-only diffs. Only the batch
+#  scripts are CRLF, because cmd.exe is happier with them that way.
+# ============================================================================
+
 [*]
 charset = utf-8
-end_of_line = crlf
 insert_final_newline = true
 indent_style = space
 indent_size = 4
 trim_trailing_whitespace = true
+end_of_line = lf
+
+# Batch / PowerShell scripts must keep CRLF on Windows (see .gitattributes).
+[*.{bat,cmd,ps1}]
+end_of_line = crlf
 
 [*.{yml,yaml,json}]
 indent_size = 2

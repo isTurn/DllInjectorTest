@@ -77,11 +77,12 @@
 ### 命令行模式（自动化 / 脚本）
 
 ```
-DllInjector-x64.exe -inject <exe路径> <dll1> [dll2 ...] [-args <参数>] [-method crt|ntc|apc|rfi] [-export <函数>] [-exportarg <参数>]
-DllInjector-x64.exe -injectpid <pid1[,pid2...]> <dll1> [dll2 ...] [-method crt|ntc|rfi] [-export <函数>] [-exportarg <参数>]
-DllInjector-x64.exe -injectname <进程名> <dll1> [dll2 ...] [-method crt|ntc|rfi] [-export <函数>] [-exportarg <参数>]
+DllInjector-x64.exe -inject <exe路径> <dll1> [dll2 ...] [-args <参数>] [-method crt|ntc|apc|rfi|mm] [-export <函数>] [-exportarg <参数>]
+DllInjector-x64.exe -injectpid <pid1[,pid2...]> <dll1> [dll2 ...] [-method crt|ntc|rfi|mm] [-export <函数>] [-exportarg <参数>]
+DllInjector-x64.exe -injectname <进程名> <dll1> [dll2 ...] [-method crt|ntc|rfi|mm] [-export <函数>] [-exportarg <参数>]
 DllInjector-x64.exe -eject <pid> <dll文件名>
 DllInjector-x64.exe -checkdll <dll1> [dll2 ...]
+DllInjector-x64.exe -help | -version
 ```
 
 - `-args`：附加给目标程序的命令行参数（可含空格）
@@ -91,8 +92,13 @@ DllInjector-x64.exe -checkdll <dll1> [dll2 ...]
 - `-injectpid`：支持**多个 PID 用逗号分隔**，逐个批量注入并汇总结果
 - `-injectname`：按**进程名**批量注入，支持 `*` / `?` 通配（如 `cmd*`），位数不符自动跳过
 - `-checkdll`：**只做注入前 PE 体检**，不执行注入（返回 0 = 全部合格）
+- `-help` / `-version`：打印完整用法 / 版本号后以 `0` 退出，不注入、不写日志
 - 退出码：`0` = 成功，`1` = 失败
 - 详细日志写入同目录下 `inject_log.txt`
+
+> **`|` 有两种含义，别混用**：作为**多个 DLL 之间的分隔符**时（DLL 输入框 / `-inject` 的 DLL 参数），`;`、`|`、换行都可以；而 `-exportarg` 里的 `|` 只是**普通字符**，原样传给导出函数（`InstallConfig` 正是用它分隔多个键值对）。
+> 所以 `-exportarg "engine=generic-gdi|cp=932"` 里的 `|` 不会被当成 DLL 分隔符——它整个是一份参数值。多个 DLL 请写在 `-exportarg` **之前**，或用 `;` 分隔以免看错。
+> 想让 `-exportarg` 传**多个独立参数**（打包成字符串指针数组）时用 `||`，例如 `-exportarg "张三||2024-01-01||admin"`。
 
 > 想快速体验「导出函数调用」？直接用仓库 `test/TestHookDll/`（或 Releases 附件）里编译好的示例 DLL（导出 `InstallHook` / `Init` / `InstallConfig` / `InstallMulti`）：
 > ```
@@ -271,8 +277,8 @@ WaitForSingleObject(15s) → GetExitCodeThread
 | `TextHookDll.c` | profile 驱动的文本 Hook DLL：IAT 挂钩 `TextOutA/W`、`ExtTextOutA/W`、`DrawTextA/W`，SJIS/GBK → UTF-8 转换，命名管道推送 |
 | `TextHookDll.def` | 导出表：统一 x86/x64 的无修饰导出名（x86 下 `__stdcall` 会修饰成 `_InstallConfig@4`） |
 | `TextHookDll.profiles.ini` | **引擎适配表模板**（随 DLL 一起分发）。改引擎适配只需改这个文件，不用重编译 DLL |
-| `TextHookClient.c` | 管道消费者，实时打印捕获到的文本 |
-| `TestTextHook.c` | **进程内端到端验证器**：自己加载 DLL、装钩子、用 GDI 输出文本、核对日志，全自动 |
+| `TextHookClient.c` | 管道消费者，实时打印捕获到的文本；管道断开后自动重连（游戏重开、重新注入都不会让客户端自己退出） |
+| `TestTextHook.c` | **进程内端到端验证器**：自己加载 DLL、装钩子、用 GDI 输出文本、核对日志，全自动（自动跑 7 个场景，x64 + x86 都跑） |
 | `build.bat` | 编译上述内容 + 验证用目标程序，**并自动跑两个架构的验证**（输出到 `test_output\`） |
 | `../TestTextTarget/TestTextTarget.c` | 验证目标：用 GDI 输出硬编码的日文/中文文本，便于确定性核对 |
 
@@ -317,10 +323,38 @@ DllInjector-x64.exe -inject game.exe test_output\TextHookDll-x64.dll ^
 文件里的 profile 可以**同名覆盖**内置的 4 个（写一个 `[generic-gdi]` 就能改掉兜底行为）；
 任何一行写错则整份文件不生效、退回内置，并在启动横幅里说明原因。
 
-> ⚠ **能力边界**：文件只能从框架**已知的 6 个函数**里挑选组合挂钩目标。
-> 「哪个参数是文本」是编译期写死的，所以「写个文件就能适配任意引擎」目前做不到——
-> 引擎若用了其它文本 API，仍需改代码（属路线图 S2 / S4）。
-> 文件里写了框架不认识的函数名不会报错，但也不会有任何效果。
+**框架不认识的函数也能挂**——只要补上参数位置（序号 1 起）：
+
+```ini
+[my-engine]
+desc=引擎自己的文本函数
+codepage=932
+minlen=2
+dedup=200
+text=4        ; 第 4 个参数是文本指针
+len=5         ; 第 5 个参数是长度（不写 = 以 \0 结尾）
+argc=5        ; 参数总数，1..8。必填，转发调用要按它弹栈
+wide=0        ; 0 = char*（按 codepage 转）；1 = wchar_t*
+conv=stdcall  ; stdcall（默认）或 cdecl。写错会弹歪栈、进程直接崩
+hook=myengine.dll,RenderText
+```
+
+这 5 个键写在段内任意位置都行（整段读完才生效），会应用到该段的所有 `hook=`。
+校验是「全有或全无」：`argc` 越界、`text`/`len` 超出 `argc`、值不是数字，
+都会让整份文件不生效并退回内置。
+
+> ⚠ **能力边界**：`text=` / `len=` 让 profile 不再局限于那 6 个函数，
+> 但**「第几个参数是文本」仍需自己数准**（看反汇编或头文件）。
+> 数错的后果不只是抓不到——把整数当指针读会让游戏崩掉，所以务必先在调试器里确认。
+> 仍然做不到的：自动猜参数位置、把逐字片段拼成整句、DirectX 自绘（S5）、
+> 引擎连 `GetProcAddress` 都自己现取的情况（S2 Inline Hook）。
+
+**动态取址（`GetProcAddress`）已被覆盖**：引擎若用
+`p = GetProcAddress(GetModuleHandleA("gdi32.dll"), "TextOutA")` 自己取地址再调用，
+导入表里看不到这个函数、IAT Hook 抓不到。DLL 会把各模块 IAT 里的 `GetProcAddress`
+换成自己的替身：先问真实地址，若是我们挂钩的目标就返回替换函数。
+启动横幅会单独报告一行「已登记 N 个目标，GetProcAddress 替换了 M 个槽」——
+「钩子挂上了却没文本」时，看这一行就能判断是不是动态取址没覆盖到。
 
 **确认 ini 有没有被读到**：看 `texthook_log.txt` 开头的第二行横幅，它会直接报出
 读了哪个文件、加载了几个 profile、分别叫什么。
@@ -333,13 +367,13 @@ DllInjector-x64.exe -inject game.exe test_output\TextHookDll-x64.dll ^
 | `profilefile` | 指定 profile 文件路径（默认取 DLL 同目录的 `TextHookDll.profiles.ini`） |
 | `nofile` | `1` 时完全不读 profile 文件，只用内置的 4 个（排查「是不是 ini 在作怪」时用） |
 | `cp` | 强制 `*A` 系列文本的代码页（932 = Shift-JIS，936 = GBK），覆盖 profile 默认值 |
-| `pipe` | 管道名，默认 `GalToolText`（实际路径 `\\.\pipe\<名称>`） |
+| `pipe` | 管道名，默认 `GalToolText`（实际路径 `\\.\pipe\<名称>`）。服务端默认开 **4 个实例**，可同时挂多个消费者，同一行文本广播给所有已连接的客户端 |
 | `log` | `1` 时同时落盘 `texthook_log.txt`（默认开，便于无客户端时验证） |
 | `minlen` / `dedup` | 最短文本长度（默认 2）/ 去重窗口毫秒（默认 200，游戏每帧重绘必须去重） |
 
-> **当前状态：一阶段原型 + 引擎适配表已外部化。** 只覆盖走 IAT 的调用，且挂钩发生在游戏开跑之后
-> （注入器的 `ResumeThread` 早于导出函数调用，会漏掉启动后约百毫秒的文本）。
-> profile 可以写成文件、不用重编译；但**具体引擎 profile 仍需对着实机样本逆向填写**，
+> **当前状态：一阶段 IAT Hook + 引擎适配表外部化 + 动态取址补漏。**
+> 挂钩发生在游戏开跑之后（注入器的 `ResumeThread` 早于导出函数调用，会漏掉启动后约百毫秒的文本）。
+> profile 可以写成文件、不用重编译，也能挂框架不认识的函数；但**具体引擎 profile 仍需对着实机样本逆向填写**，
 > 无法凭空推测。演进计划见设计文档第 8 节路线图。
 
 ## 从源码构建
@@ -388,14 +422,18 @@ set "ProgramFiles=%SystemDrive%\Program Files"
 
 ```bat
 test\build_test.bat                  :: 编译测试 DLL 与目标程序 -> test_output\
-test\ManualMap\build_shellcode.bat   :: 汇编手动映射 shellcode 并重新生成字节数组
+test\ManualMap\build_shellcode.bat   :: 汇编手动映射 shellcode 并回填 Program.cs 的字节数组
+test\ManualMap\build_shellcode.bat --check  :: 只校验 Program.cs 与 .asm 是否同步（CI 用）
 test\TestReflectiveDll\build.bat     :: 编译反射 DLL 示例 + TestLoader 进程内验证器
 test\TestHookDll\build.bat           :: 编译示例 DLL（x64 + x86，产物就放在 test\TestHookDll\）
 test\TextHookDll\build.bat           :: 编译文本 Hook DLL + 客户端 + 验证目标，并自动跑双架构验证 -> test_output\
+test\DllInjectorTests\build.bat      :: C# 纯逻辑回归测试（不需要 MSVC，只要 .NET 8 SDK）
 ```
 
-> `test\ManualMap\build_shellcode.bat` 会重新生成 `shellcode_x64.cs` / `shellcode_x86.cs` / `unmap_x64.cs` / `unmap_x86.cs`，
-> 需要手动把其中的字节数组回填到 `DllInjector\Program.cs` 中同名的 `byte[]` 定义处。
+> `test\ManualMap\build_shellcode.bat` 会**自动回填** `DllInjector\Program.cs` 里的四个 `byte[]`
+> （由 `gen_shellcode.py --apply` 完成，不再是手工复制）。
+> `--check` 只比对不写入：仓库里的数组与 `.asm` 汇编结果不一致时以非零码退出，
+> CI 用它挡住「改了 `.asm` 却忘了重新生成」的情况。
 
 ## 目录结构
 
@@ -434,8 +472,12 @@ DllInjectorTest/
 │   │   ├── TextHookDll.def      #   导出表：统一 x86/x64 的无修饰导出名（避免 __stdcall 修饰差异）
 │   │   ├── TextHookDll.profiles.ini  # 引擎适配表模板（随 DLL 分发，改它不用重编译）
 │   │   ├── TextHookClient.c     #   管道消费者（控制台实时打印捕获到的文本）
-│   │   ├── TestTextHook.c       #   进程内端到端验证器（自动跑 4 个场景，x64 + x86 都跑）
+│   │   ├── TestTextHook.c       #   进程内端到端验证器（自动跑 7 个场景，x64 + x86 都跑）
 │   │   └── build.bat            #   编译 Hook DLL + 客户端 + 验证目标 + 验证器，并自动验证
+│   ├── DllInjectorTests/        # C# 纯逻辑回归测试（PE 解析 / DLL 分隔 / -method / 通配）
+│   │   ├── Program.cs           #   自带断言的控制台程序，不依赖任何 NuGet 测试框架
+│   │   ├── DllInjectorTests.csproj   # 把 DllInjector/Program.cs 原样链接进来编译
+│   │   └── build.bat            #   构建 + 运行，只需 .NET 8 SDK（不需要 MSVC）
 │   ├── TestTextTarget/          # 文本 Hook 的验证目标（GDI 输出硬编码日文/中文，便于确定性核对）
 │   │   └── TestTextTarget.c     #   可传 sjis（默认）/ gbk 选择 *A 系列编码，需与 cp= 配对
 │   ├── TestDll/                 # 自测用注入 DLL 源码（DllMain 写标记文件验证，支持前缀宏区分多 DLL）

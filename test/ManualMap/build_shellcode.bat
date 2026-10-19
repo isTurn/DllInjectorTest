@@ -2,7 +2,7 @@
 rem ============================================================================
 rem  Build the Manual Map / Unmap shellcode and regenerate the C# byte arrays.
 rem
-rem  Pipeline (see README "手动映射注入" for the design):
+rem  Pipeline (see the "manual map" section of README.md for the design):
 rem    1. ml64 / ml assembles ManualMap_x64.asm / ManualMap_x86.asm
 rem                            UnmapDll_x64.asm  / UnmapDll_x86.asm   -> .obj
 rem    2. gen_shellcode.py extracts the .text machine code from each .obj
@@ -11,11 +11,12 @@ rem         shellcode_x64.cs  ->  ManualMapX64   (in DllInjector\Program.cs)
 rem         shellcode_x86.cs  ->  ManualMapX86
 rem         unmap_x64.cs      ->  UnmapDllX64
 rem         unmap_x86.cs      ->  UnmapDllX86
-rem    3. You then paste the generated arrays into DllInjector\Program.cs,
-rem       replacing the existing byte[] initialisers of the same names.
+rem    3. The generated arrays are patched straight into DllInjector\Program.cs
+rem       (gen_shellcode.py --apply) -- no manual copy-paste step.
 rem
-rem  Usage: build_shellcode.bat            (rebuild all four)
+rem  Usage: build_shellcode.bat            (rebuild all four, patch Program.cs)
 rem         build_shellcode.bat ManualMap_x64 UnmapDll_x86   (selected only)
+rem         build_shellcode.bat --check    (verify only: no rebuild, no writes)
 rem
 rem  Notes:
 rem    - Paths are derived from this script's own location.
@@ -27,6 +28,18 @@ rem ============================================================================
 setlocal
 set "SRC=%~dp0"
 cd /d "%SRC%"
+
+rem ---- --check: pure comparison, needs neither VS nor Python --------------
+if /i "%~1"=="--check" (
+    where python >nul 2>nul || (
+        echo [ERROR] Python 3 not found - --check needs gen_shellcode.py.
+        exit /b 1
+    )
+    python gen_shellcode.py --check
+    if errorlevel 1 exit /b 1
+    endlocal
+    exit /b 0
+)
 
 rem ---- Locate Visual Studio (any edition) via vswhere ----------------------
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -88,8 +101,11 @@ echo.
 echo [INFO] Assembly OK. Extracting shellcode bytes...
 echo.
 
-rem ---- 2. extract ----------------------------------------------------------
-python gen_shellcode.py %*
+rem ---- 2. extract + patch Program.cs ---------------------------------------
+rem --apply rewrites the four byte[] initialisers in DllInjector\Program.cs
+rem directly. If an array cannot be located the script exits non-zero, so a
+rem renamed/moved array fails loudly instead of silently leaving stale bytes.
+python gen_shellcode.py --apply %*
 if errorlevel 1 goto :fail
 
 echo.
@@ -97,10 +113,7 @@ echo ============================================================
 echo   Generated .cs files: shellcode_x64.cs / shellcode_x86.cs
 echo                        unmap_x64.cs     / unmap_x86.cs
 echo.
-echo   NEXT STEP: copy the byte arrays above into
-echo              DllInjector\Program.cs, replacing the arrays with
-echo              the same names (ManualMapX64 / ManualMapX86 /
-echo              UnmapDllX64 / UnmapDllX86).
+echo   DllInjector\Program.cs has been patched automatically.
 echo   Keep the reported byte counts in sync with README/CHANGELOG.
 echo ============================================================
 endlocal

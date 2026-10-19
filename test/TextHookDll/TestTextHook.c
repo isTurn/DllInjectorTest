@@ -25,6 +25,7 @@
 // ============================================================================
 
 #include <windows.h>
+#include <tlhelp32.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -333,14 +334,356 @@ static void RunScenario(const Scenario* sc)
 }
 
 // ---------------------------------------------------------------------------
+// 场景 6：动态取址（GetProcAddress）
+//
+// 为什么必须有：IAT Hook 只改导入表。引擎若用
+//     p = GetProcAddress(GetModuleHandleA("gdi32.dll"), "TextOutA");
+// 自己取址再调用，导入表里根本没有这个函数，钩子就抓不到——而使用者看到的
+// 现象是「钩子报告挂上了 N 个槽，但一句话都没有」。
+//
+// 这里的判据非常直接：装钩子后 GetProcAddress 返回的**不应**是 gdi32 里的
+// 真实地址（应该被重定向到 DLL 内的替换函数）；卸载后必须还原成真实地址。
+// 再补一条行为验证：通过这个指针真的调一次，文本必须被捕获。
+// ---------------------------------------------------------------------------
+
+static void RunDynamicScenario(void)
+{
+    printf("\n  --- 场景 6：动态取址（GetProcAddress 被重定向）---\n");
+
+    DeleteFileW(g_logPath);
+
+    // 先记下真实的 gdi32!TextOutA 地址（此时钩子还没装，取到的一定是真地址）
+    HMODULE hGdi = GetModuleHandleA("gdi32.dll");
+    void* realTextOutA = (void*)GetProcAddress(hGdi, "TextOutA");
+    Check(realTextOutA != NULL, "能取到 gdi32!TextOutA 的真实地址（基线）");
+
+    static const wchar_t cfg[] = L"engine=generic-gdi|cp=932|dedup=0|log=1";
+    DWORD rc = g_InstallConfig((LPVOID)cfg);
+    Check(rc > 0, "InstallConfig 返回成功（动态取址场景）");
+    Sleep(700);
+
+    // 装好钩子后再取一次：必须被重定向到 DLL 内部
+    void* dynTextOutA = (void*)GetProcAddress(hGdi, "TextOutA");
+    BYTE* lo = NULL;
+    BYTE* hi = NULL;
+    DllRange(g_hDllUnderTest, &lo, &hi);
+
+    Check(dynTextOutA != NULL && dynTextOutA != realTextOutA,
+          "装钩子后 GetProcAddress 不再返回 gdi32 的真实地址");
+    Check(dynTextOutA != NULL && (BYTE*)dynTextOutA >= lo && (BYTE*)dynTextOutA < hi,
+          "GetProcAddress 返回的是 DLL 内的替换函数");
+
+    // 行为验证：通过这个动态取得的指针真的调一次，文本必须被抓到。
+    // 这条比地址比对更接近真实场景——引擎就是这么用的。
+    if (dynTextOutA) {
+        HDC hScreen = GetDC(NULL);
+        HDC hMem    = CreateCompatibleDC(hScreen);
+        HBITMAP hBmp = CreateCompatibleBitmap(hScreen, 800, 600);
+        HGDIOBJ hOld = SelectObject(hMem, hBmp);
+
+        typedef BOOL (WINAPI *pTextOutA)(HDC, int, int, LPCSTR, int);
+        ((pTextOutA)dynTextOutA)(hMem, 10, 10, kSjisHello, (int)strlen(kSjisHello));
+
+        SelectObject(hMem, hOld);
+        DeleteObject(hBmp);
+        DeleteDC(hMem);
+        ReleaseDC(NULL, hScreen);
+    }
+
+    Sleep(1200);
+    size_t sz = 0;
+    char* log = ReadWholeFile(g_logPath, &sz);
+    if (log) {
+        char utf8Hello[128];
+        ToUtf8(kExpectHello, utf8Hello, sizeof(utf8Hello));
+        Check(LogContains(log, utf8Hello),
+              "通过动态取得的地址调用，文本同样被捕获");
+        // 启动横幅里应该报告动态取址的覆盖情况
+        Check(LogContains(log, "动态取址"),
+              "启动横幅报告了动态取址的覆盖情况");
+        free(log);
+    } else {
+        Check(0, "重新读取 texthook_log.txt（动态取址场景）");
+    }
+
+    g_Unhook(NULL);
+    Sleep(400);
+
+    // 卸载后必须还原：GetProcAddress 又要返回真实地址
+    void* afterTextOutA = (void*)GetProcAddress(hGdi, "TextOutA");
+    Check(afterTextOutA == realTextOutA,
+          "Unhook 后 GetProcAddress 恢复返回真实地址");
+}
+
+// ---------------------------------------------------------------------------
+// 场景 7：通用转发器（text= / len= / argc=）
+//
+// 为什么必须有：S3 完整版把「第几个参数是文本」也外部化了，这是**新代码里
+// 最危险的一段**——它按 argc 与 conv 生成 128 个 thunk，用错一个就是弹歪栈。
+// 而它的失败方式恰好是「崩溃」而不是「抓不到文本」，所以必须真的调一次。
+//
+// 设计上的取巧：拿框架**本来就认识**的 TextOutA 来测，但 profile 里故意不
+// 写内置提取器能识别的形式——加上 text= / len= / argc= 之后，挂钩路径走的
+// 就是通用转发器（`t->textArg > 0` 分支），与「框架不认识的函数」完全同一条
+// 代码路径。好处是不用编一个测试 DLL 就能验证真实参数布局。
+//
+// TextOutA 的真实签名（5 个参数，文本在第 4 个，长度在第 5 个）：
+//     BOOL WINAPI TextOutA(HDC hdc, int x, int y, LPCSTR s, int cch);
+// ---------------------------------------------------------------------------
+
+static void RunGenericScenario(const wchar_t* iniGeneric)
+{
+    printf("\n  --- 场景 7：通用转发器（profile 用 text=/len=/argc= 声明参数位置）---\n");
+
+    DeleteFileW(g_logPath);
+
+    wchar_t cfg[1024];
+    swprintf_s(cfg, 1024,
+               L"profilefile=%ls|engine=test-generic|dedup=0|log=1", iniGeneric);
+
+    DWORD rc = g_InstallConfig((LPVOID)cfg);
+    Check(rc > 0, "InstallConfig 返回成功（通用转发器场景）");
+    Sleep(700);
+
+    size_t sz = 0;
+    char* log = ReadWholeFile(g_logPath, &sz);
+    if (log) {
+        Check(LogContains(log, "已安装 profile=test-generic"),
+              "启动横幅确认用了文件里的 test-generic");
+        // 这一行是通用转发器是否真的接管的直接证据：
+        // 挂上了就该报告「N 个模块 / N 个槽」，而不是「未挂钩」。
+        Check(LogContains(log, "gdi32.dll!TextOutA → "),
+              "启动横幅逐个报告了目标 TextOutA");
+        Check(LogAbsent(log, "未挂钩"),
+              "TextOutA 没有被判成「未挂钩」（说明通用转发器接住了它）");
+        free(log);
+    } else {
+        Check(0, "读取 texthook_log.txt（通用转发器场景）");
+    }
+
+    // 真的调一次 TextOutA。如果 argc / conv 写错，这里会直接崩掉进程——
+    // 也就是说「能走到下面那条断言」本身就是弹栈正确的证明。
+    HDC     hScreen = GetDC(NULL);
+    HDC     hMem    = CreateCompatibleDC(hScreen);
+    HBITMAP hBmp    = CreateCompatibleBitmap(hScreen, 800, 600);
+    HGDIOBJ hOld    = SelectObject(hMem, hBmp);
+    TextOutA(hMem, 10, 10, kSjisHello, (int)strlen(kSjisHello));
+    SelectObject(hMem, hOld);
+    DeleteObject(hBmp);
+    DeleteDC(hMem);
+    ReleaseDC(NULL, hScreen);
+
+    Sleep(1200);
+    log = ReadWholeFile(g_logPath, &sz);
+    if (log) {
+        char utf8Hello[128];
+        ToUtf8(kExpectHello, utf8Hello, sizeof(utf8Hello));
+        Check(LogContains(log, utf8Hello),
+              "通用转发器按 text=4 / len=5 正确取到文本并转成 UTF-8");
+
+        // 只挂 TextOutA，TextOutW 必须抓不到——否则说明 profile 的挂钩集合
+        // 没被尊重（比如通用槽位串了）。
+        char utf8Wide[128];
+        ToUtf8(kWideOnlyFromTextOutW, utf8Wide, sizeof(utf8Wide));
+        Check(LogAbsent(log, utf8Wide),
+              "通用转发器场景没有顺带抓到 TextOutW（该 profile 没挂它）");
+        free(log);
+    } else {
+        Check(0, "重新读取 texthook_log.txt（通用转发器场景）");
+    }
+
+    g_Unhook(NULL);
+    Sleep(400);
+    Check(CountIatSlotsInsideDll(g_hDllUnderTest) == 0,
+          "Unhook 后 IAT 已还原（通用转发器槽位也要还原干净）");
+}
+
+// ---------------------------------------------------------------------------
+// 场景 5：命名管道
+//
+// 为什么必须有：前面 4 个场景全程没有客户端连管道，只靠 texthook_log.txt
+// 判断结果，于是「管道」这条主链路的生命周期完全没被验证过——而它恰好是
+// 最容易出问题的地方：
+//   管道线程平时阻塞在 ConnectNamedPipe 上（没有客户端时），而 g_stop 只是
+//   一个被**轮询**的标志位，叫不醒它。卸载时它不退出就会变成僵尸，一直占着
+//   \\.\pipe\<name> 那个实例（nMaxInstances=1），于是**下一次安装**的
+//   CreateNamedPipeA 必然失败——表现为「卸载再重装之后，管道再也传不出一个字节」。
+//
+// 检查三件事：
+//   a) 有客户端时文本能真的从管道出来（管道主链路可用）
+//   b) 卸载后管道名彻底空闲（僵尸线程没了）—— 这一条就是上面那个 bug 的回归防线
+//   c) 反复「无客户端安装 -> 卸载」后进程线程数不增长
+// ---------------------------------------------------------------------------
+
+static int CountProcessThreads(void)
+{
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return -1;
+
+    THREADENTRY32 te;
+    te.dwSize = sizeof(te);
+    int n = 0;
+    DWORD me = GetCurrentProcessId();
+    if (Thread32First(snap, &te)) {
+        do {
+            if (te.th32OwnerProcessID == me) n++;
+        } while (Thread32Next(snap, &te));
+    }
+    CloseHandle(snap);
+    return n;
+}
+
+// 作为客户端连上管道，带超时（实例还没建出来时 CreateFile 会失败，需要重试）
+static HANDLE PipeConnect(const wchar_t* pipeName, DWORD timeoutMs)
+{
+    wchar_t full[MAX_PATH];
+    swprintf_s(full, MAX_PATH, L"\\\\.\\pipe\\%s", pipeName);
+
+    DWORD deadline = GetTickCount() + timeoutMs;
+    for (;;) {
+        HANDLE h = CreateFileW(full, GENERIC_READ, 0, NULL, OPEN_EXISTING, 0, NULL);
+        if (h != INVALID_HANDLE_VALUE) return h;
+        if ((long)(GetTickCount() - deadline) >= 0) return INVALID_HANDLE_VALUE;
+        Sleep(50);
+    }
+}
+
+// 读一行（到 '\n' 为止），带超时。返回读到的字节数，-1 = 超时/管道断开。
+static int PipeReadLine(HANDLE h, char* out, size_t cch, DWORD timeoutMs)
+{
+    size_t used = 0;
+    DWORD deadline = GetTickCount() + timeoutMs;
+    out[0] = 0;
+
+    while (used + 1 < cch) {
+        DWORD avail = 0;
+        if (!PeekNamedPipe(h, NULL, 0, NULL, &avail, NULL)) return -1;
+        if (avail == 0) {
+            if ((long)(GetTickCount() - deadline) >= 0) return -1;
+            Sleep(20);
+            continue;
+        }
+        DWORD got = 0;
+        if (!ReadFile(h, out + used, (DWORD)(cch - 1 - used), &got, NULL) || got == 0)
+            return -1;
+        used += got;
+        out[used] = 0;
+        if (memchr(out, '\n', used)) return (int)used;
+    }
+    return (int)used;
+}
+
+// 管道名是否已经空闲：我们按同样的 nMaxInstances=1 自己建一个实例，
+// 建得起来才说明原来那个实例真的被释放了。这是判断「管道线程是否退出」
+// 最直接的观测方式——不需要去猜线程数，也不需要连上去试探。
+static int PipeNameIsFree(const wchar_t* pipeName)
+{
+    wchar_t full[MAX_PATH];
+    swprintf_s(full, MAX_PATH, L"\\\\.\\pipe\\%s", pipeName);
+
+    HANDLE h = CreateNamedPipeW(full, PIPE_ACCESS_OUTBOUND,
+                                PIPE_TYPE_BYTE | PIPE_WAIT, 1, 4096, 0, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    CloseHandle(h);
+    return 1;
+}
+
+static void RunPipeScenario(void)
+{
+    printf("\n  --- 场景 5：命名管道（文本真的从管道出来 + 卸载后不留僵尸线程）---\n");
+
+    // 带 PID 的唯一管道名：避免和真实游戏、或同时跑的另一个测试实例抢同名管道
+    wchar_t pipeName[64];
+    swprintf_s(pipeName, 64, L"GalToolTextTest_%lu", GetCurrentProcessId());
+
+    wchar_t cfg[512];
+    swprintf_s(cfg, 512, L"engine=generic-gdi|cp=932|dedup=0|log=0|pipe=%ls", pipeName);
+
+    // ---- a) 有客户端时能真的收到文本 --------------------------------------
+    DWORD rc = g_InstallConfig((LPVOID)cfg);
+    Check(rc > 0, "InstallConfig 返回成功（管道场景）");
+
+    HANDLE hCli = PipeConnect(pipeName, 3000);
+    Check(hCli != INVALID_HANDLE_VALUE, "能作为客户端连上命名管道");
+    if (hCli == INVALID_HANDLE_VALUE) { g_Unhook(NULL); return; }
+
+    // 第二个消费者：多实例的意义就在这里。原先 nMaxInstances=1 时这次连接会
+    // 直接被拒绝（CreateFile 拿不到实例），使用者只会看到「客户端连不上」。
+    HANDLE hCli2 = PipeConnect(pipeName, 3000);
+    Check(hCli2 != INVALID_HANDLE_VALUE, "第二个消费者也能连上（管道是多实例的）");
+
+    Sleep(300);          // 等管道线程把 g_hPipe 装上再发文本
+    EmitAllText();
+
+    char line[4096];
+    int n = PipeReadLine(hCli, line, sizeof(line), 5000);
+    Check(n > 0, "从管道收到文本行");
+
+    char utf8Hello[128];
+    ToUtf8(kExpectHello, utf8Hello, sizeof(utf8Hello));
+    Check(n > 0 && strstr(line, utf8Hello) != NULL,
+          "管道收到的内容正确（SJIS -> UTF-8）");
+    if (n > 0 && strstr(line, utf8Hello) == NULL)
+        printf("      实际收到：%s\n", line);
+
+    // 广播语义：第二个消费者必须收到**同一行**，而不是只有第一个能拿到
+    if (hCli2 != INVALID_HANDLE_VALUE) {
+        char line2[4096];
+        int n2 = PipeReadLine(hCli2, line2, sizeof(line2), 5000);
+        Check(n2 > 0 && strstr(line2, utf8Hello) != NULL,
+              "第二个消费者也收到了同一行（广播而不是独占）");
+        if (n2 > 0 && strstr(line2, utf8Hello) == NULL)
+            printf("      第二个消费者收到：%s\n", line2);
+        CloseHandle(hCli2);
+    }
+
+    CloseHandle(hCli);
+    Sleep(300);          // 让管道线程发现客户端断开、重建实例
+
+    // ---- b) 卸载后管道名必须彻底空闲 --------------------------------------
+    //      修复前：管道线程还阻塞在 ConnectNamedPipe 里，实例没释放 -> 这里 FAIL
+    g_Unhook(NULL);
+    Sleep(600);
+    Check(PipeNameIsFree(pipeName),
+          "Unhook 后管道实例已释放（没有卡在 ConnectNamedPipe 的僵尸线程）");
+
+    // ---- c) 反复「无客户端安装 -> 卸载」不应残留线程 -----------------------
+    //      这是最贴近真实的路径：注入后没起客户端，然后重新注入。
+    //      基线在**这里**取，不能取在进程启动时：GDI 首次使用（GetDC）会让系统
+    //      懒加载一个线程，把进程线程数永久抬高 1 —— 拿它当基线会误报。
+    //      这里测的是「安装/卸载本身带来的增量」，与环境无关。
+    const int cycles = 3;
+    int tBase = CountProcessThreads();
+    for (int i = 0; i < cycles; i++) {
+        g_InstallConfig((LPVOID)cfg);   // 故意不连客户端
+        Sleep(500);                     // 给它足够时间阻塞在 ConnectNamedPipe 上
+        g_Unhook(NULL);
+        Sleep(400);
+    }
+    int tAfter = CountProcessThreads();
+
+    Check(PipeNameIsFree(pipeName),
+          "多轮「无客户端安装->卸载」之后管道名仍然空闲");
+    printf("      线程数：%d -> %d（期间做了 %d 轮「无客户端安装->卸载」）\n",
+           tBase, tAfter, cycles);
+    Check(tAfter == tBase, "反复安装/卸载没有残留工作线程（线程数回到本轮基线）");
+}
+
+// ---------------------------------------------------------------------------
 
 int main(int argc, char** argv)
 {
+    // 关掉 stdout 缓冲。这个测试会在进程内真的挂钩、真的调 API，
+    // 一旦某个场景把进程打崩（访问违例），块缓冲会把崩溃前所有 [PASS]/[FAIL]
+    // 一起吞掉，只留下一个空文件和「什么都没打印」的假象——排查时最要命的
+    // 就是分不清「没跑到」和「跑完了但输出丢了」。
+    setvbuf(stdout, NULL, _IONBF, 0);
+
     printf("TestTextHook — TextHookDll 进程内端到端验证\n");
     printf("================================================\n");
 
     if (argc < 2) {
-        printf("用法: TestTextHook.exe <TextHookDll 路径> [sample ini 路径] [只跑的场景号 1-4]\n");
+        printf("用法: TestTextHook.exe <TextHookDll 路径> [sample ini 路径] [只跑的场景号 1-7]\n");
         return 1;
     }
 
@@ -364,10 +707,11 @@ int main(int argc, char** argv)
     wchar_t dir[MAX_PATH];
     DirOf(dllPath, dir, MAX_PATH);
 
-    wchar_t logPath[MAX_PATH], iniGood[MAX_PATH], iniBad[MAX_PATH];
+    wchar_t logPath[MAX_PATH], iniGood[MAX_PATH], iniBad[MAX_PATH], iniGeneric[MAX_PATH];
     swprintf_s(logPath, MAX_PATH, L"%stexthook_log.txt", dir);
     swprintf_s(iniGood, MAX_PATH, L"%s_test_profiles_good.ini", dir);
     swprintf_s(iniBad,  MAX_PATH, L"%s_test_profiles_bad.ini", dir);
+    swprintf_s(iniGeneric, MAX_PATH, L"%s_test_profiles_generic.ini", dir);
     g_logPath = logPath;
 
     printf("DLL      : %ls\n", dllPath);
@@ -415,8 +759,27 @@ int main(int argc, char** argv)
         "codepage=932\n"
         "hook=gdi32.dll,TextOutA,inline\n";
 
+    // 场景 7 用：把 TextOutA 当成一个「框架不认识的函数」重新声明一遍。
+    // 函数本身是框架认识的，但这里**故意不靠内置提取器**——走 text= / len= /
+    // argc= 的通用转发器。如果这条能抓到文本，说明通用转发器真的在工作，
+    // 而且 argc=5 的 stdcall 弹栈是对的（弹错就直接崩，根本走不到断言）。
+    static const char kIniGenericText[] =
+        "[test-generic]\r\n"
+        "desc=TextOutA declared generically\r\n"
+        "codepage=932\r\n"
+        "minlen=2\r\n"
+        "dedup=0\r\n"
+        "text=4\r\n"
+        "len=5\r\n"
+        "argc=5\r\n"
+        "wide=0\r\n"
+        "conv=stdcall\r\n"
+        "hook=gdi32.dll,TextOutA\r\n";
+
     Check(WriteAsciiFile(iniGood, kIniGoodText), "写入测试用 profile 文件（CRLF）");
     Check(WriteAsciiFile(iniBad,  kIniBadText),  "写入故意写错的 profile 文件（LF）");
+    Check(WriteAsciiFile(iniGeneric, kIniGenericText),
+          "写入通用转发器用的 profile 文件（text= / len= / argc=）");
 
     // ---- 3. 场景 1：内置 profile ---------------------------------------------
     static const Scenario sc1 = {
@@ -472,9 +835,21 @@ int main(int argc, char** argv)
         printf("\n  --- 场景 4 跳过（未提供 sample ini 路径）---\n");
     }
 
-    // ---- 7. 收尾 ------------------------------------------------------------
+    // ---- 7. 场景 7：通用转发器 ----------------------------------------------
+    //      放在场景 5 之前：场景 5 会额外做多轮安装/卸载，前面的场景要保持各自干净。
+    if (!only || only == 7) RunGenericScenario(iniGeneric);
+
+    // ---- 8. 场景 5：命名管道 ------------------------------------------------
+    //      必须在最后跑：它会额外做多轮安装/卸载，前面的场景要保持各自干净。
+    if (!only || only == 5) RunPipeScenario();
+
+    // ---- 9. 场景 6：动态取址 ------------------------------------------------
+    if (!only || only == 6) RunDynamicScenario();
+
+    // ---- 10. 收尾 -----------------------------------------------------------
     DeleteFileW(iniGood);
     DeleteFileW(iniBad);
+    DeleteFileW(iniGeneric);
 
     printf("\n================================================\n");
     if (g_failures == 0) {

@@ -32,6 +32,11 @@ setlocal
 set "SRC=%~dp0"
 set "OUT=%~dp0..\..\test_output"
 
+rem cl writes .obj / .exp / .lib into the CURRENT directory (not next to the
+rem source). Without this cd, invoking the script from the repo root scatters
+rem MSVC intermediates into the repo root.
+cd /d "%SRC%"
+
 rem ---- Locate Visual Studio (any edition) via vswhere ----------------------
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 if not exist "%VSWHERE%" set "VSWHERE=%ProgramFiles%\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -108,8 +113,12 @@ echo   (an x86 build without the .def would show _InstallHook@4 etc.)
 echo.
 echo   The calls above also wrote %SRC%hook_call_log.txt
 echo   End-to-end injection (needs the injector built first):
-echo     DllInjector-x64.exe -inject 你的目标.exe TestHookDll-x64.dll ^
-echo         -export InstallConfig -exportarg "server=1.2.3.4^|port=8080"
+rem Do NOT join these two lines with a trailing caret: cmd would splice the
+rem literal word "echo" into the output. Two separate echo lines instead.
+echo     DllInjector-x64.exe -inject your_target.exe TestHookDll-x64.dll
+rem Inside double quotes cmd does NOT consume a caret, so "a^|b" would print the
+rem caret literally. A plain | inside quotes is safe and prints as intended.
+echo         -export InstallConfig -exportarg "server=1.2.3.4|port=8080"
 echo ============================================================
 endlocal
 exit /b 0

@@ -209,6 +209,7 @@
       <a href="#preview">界面</a>
       <a href="#usage">使用</a>
       <a href="#principle">原理</a>
+      <a href="#texthook">文本Hook</a>
       <a class="hide-m" href="https://github.com/isTurn/DllInjectorTest" target="_blank" rel="noopener">GitHub</a>
     </div>
   </div>
@@ -256,7 +257,7 @@
       <div class="feat"><div class="f-ico">👑</div><h3>SeDebugPrivilege 提权</h3><p>注入 / 卸载前自动启用调试权限，以管理员运行时即可注入 SYSTEM 等高权限 / 其他会话进程；普通权限仅提示不阻断。</p></div>
       <div class="feat"><div class="f-ico">💾</div><h3>记忆上次选择</h3><p>自动记住上次的 exe / dll（多 DLL 完整记忆）、注入方式与窗口位置，下次启动直接带出。</p></div>
       <div class="feat"><div class="f-ico">🌐</div><h3>支持中文路径</h3><p>DLL 路径以 UTF-16 写入远程进程，中文目录 / 文件名完全兼容。</p></div>
-      <div class="feat"><div class="f-ico">⚙️</div><h3>命令行模式</h3><p><code>-inject</code> / <code>-injectpid</code> / <code>-injectname</code> / <code>-eject</code> / <code>-checkdll</code>，支持多 DLL、启动参数、注入方式与 <code>-export</code> 导出函数调用，退出码明确区分成败。</p></div>
+      <div class="feat"><div class="f-ico">⚙️</div><h3>命令行模式</h3><p><code>-inject</code> / <code>-injectpid</code> / <code>-injectname</code> / <code>-eject</code> / <code>-checkdll</code> / <code>-help</code> / <code>-version</code>，支持多 DLL、启动参数、注入方式与 <code>-export</code> 导出函数调用，退出码明确区分成败。</p></div>
     </div>
   </div>
 </section>
@@ -321,7 +322,8 @@
 <span class="k">DllInjector-x64.exe</span> -injectpid <span class="s">&lt;pid1[,pid2...]&gt;</span> <span class="s">&lt;dll1&gt;</span> [dll2 ...] [-method crt|ntc|rfi|mm] [-export <span class="s">&lt;函数&gt;</span>] [-exportarg <span class="s">&lt;参数&gt;</span>]
 <span class="k">DllInjector-x64.exe</span> -injectname <span class="s">&lt;进程名&gt;</span> <span class="s">&lt;dll1&gt;</span> [dll2 ...] [-method crt|ntc|rfi|mm] [-export <span class="s">&lt;函数&gt;</span>] [-exportarg <span class="s">&lt;参数&gt;</span>]
 <span class="k">DllInjector-x64.exe</span> -eject <span class="s">&lt;pid&gt;</span> <span class="s">&lt;dll文件名&gt;</span>
-<span class="k">DllInjector-x64.exe</span> -checkdll <span class="s">&lt;dll1&gt;</span> [dll2 ...]</pre>
+<span class="k">DllInjector-x64.exe</span> -checkdll <span class="s">&lt;dll1&gt;</span> [dll2 ...]
+<span class="k">DllInjector-x64.exe</span> -help <span class="s">|</span> -version</pre>
   </div>
 </section>
 
@@ -397,6 +399,41 @@
   </div>
 </section>
 
+<section id="texthook">
+  <div class="wrap">
+    <div class="sec-head">
+      <span class="kicker">Text Hook</span>
+      <h2>文本 Hook（GalGame 引擎适配）</h2>
+      <p>注入器本身是通用投送器；面向 GalGame 的文本提取由配套的 <code>TextHookDll</code> 提供——挂钩 GDI / user32 的文本输出 API，把捕获到的文本统一转成 UTF-8 推送给外部消费者（翻译工具等）。</p>
+    </div>
+    <div class="feat-grid">
+      <div class="feat"><div class="f-ico">🪝</div><h3>IAT Hook 六个文本 API</h3><p>挂钩 <code>TextOutA/W</code>、<code>ExtTextOutA/W</code>、<code>DrawTextA/W</code>，覆盖主 EXE 与随游戏加载的全部非系统模块。按<strong>地址</strong>匹配 IAT 槽，API Set 转发与名字修饰自动兼容。</p></div>
+      <div class="feat"><div class="f-ico">🔤</div><h3>编码统一转 UTF-8</h3><p>Shift-JIS / GBK / UTF-16 按 profile 指定的代码页解码，统一转成 UTF-8 后上报。</p></div>
+      <div class="feat"><div class="f-ico">📝</div><h3>改 ini 即可适配新引擎</h3><p>引擎适配表外部化为 <code>TextHookDll.profiles.ini</code>，DLL 从自身目录自动加载——改挂钩集合、代码页、长度与去重阈值都<strong>不用重编译</strong>。框架不认识的函数也能挂：写 <code>text=</code> / <code>len=</code> / <code>argc=</code> 声明参数位置即可。</p></div>
+      <div class="feat"><div class="f-ico">🎯</div><h3>动态取址也覆盖</h3><p>引擎若用 <code>GetProcAddress</code> 自己取地址再调用，导入表里看不到该函数。DLL 会把各模块 IAT 里的 <code>GetProcAddress</code> 换成替身，把查询重定向到替换函数。</p></div>
+      <div class="feat"><div class="f-ico">📡</div><h3>命名管道推送</h3><p>去重后经独立写线程推送到命名管道，客户端不读也不会卡住游戏线程；断线自动重建实例。服务端默认开 <strong>4 个实例</strong>，同一行文本广播给所有消费者。</p></div>
+      <div class="feat"><div class="f-ico">🧪</div><h3>进程内端到端验证</h3><p><code>TestTextHook</code> 把「装钩子 → 输出文本 → 收管道 → 卸钩子」收进一个进程，x64 / x86 各跑 7 个场景，一条命令给出结论。</p></div>
+      <div class="feat"><div class="f-ico">🔌</div><h3>注入器零改动</h3><p>复用既有的 <code>-export</code> / <code>-exportarg</code> 机制下发引擎配置，不需要为文本 Hook 单独改注入器。</p></div>
+      <div class="feat"><div class="f-ico">✅</div><h3>纯逻辑回归测试</h3><p><code>test\DllInjectorTests</code> 覆盖 PE 解析、DLL 分隔、<code>-method</code> 解析与进程名通配——这些地方错了不会崩，只会静默给出错误结果。</p></div>
+    </div>
+    <pre><span class="c"># 注入并装钩子（引擎配置通过 -exportarg 下发）</span>
+DllInjector-x64.exe -inject game.exe TextHookDll-x64.dll <span class="s">\</span>
+    -export InstallConfig -exportarg <span class="s">"engine=generic-gdi|cp=932|pipe=GalToolText|log=1"</span>
+
+<span class="c"># 构建 + 双架构端到端验证</span>
+test\TextHookDll\build.bat
+
+<span class="c"># C# 纯逻辑回归测试（只需 .NET 8 SDK）</span>
+test\DllInjectorTests\build.bat</pre>
+    <div class="notice">
+      <div class="note"><b>参数位置仍需自己数准</b> — <code>text=</code> / <code>len=</code> 让 profile 不再局限于那 6 个函数，但「第几个参数是文本」得看反汇编或头文件。数错的后果不只是抓不到，把整数当指针读会让游戏崩掉。</div>
+      <div class="note"><b>仍有覆盖不到的动态取址</b> — 挂钩 <code>GetProcAddress</code> 只覆盖「通过导入表调用它」的情形；引擎若连取址都自己现取，仍需 Inline Hook（S2）。DirectX 自绘引擎完全不覆盖。</div>
+      <div class="note"><b>启动后有一小段抓不到</b> — 注入器的 <code>ResumeThread</code> 早于导出函数调用，挂钩装上之前游戏已跑了几十到一两百毫秒。</div>
+      <div class="note"><b>不做句子重组</b> — 逐字显示会逐次上报，句子合并交给消费端处理。</div>
+    </div>
+  </div>
+</section>
+
 <section id="build" style="background:var(--bg-soft);border-top:1px solid var(--border-soft);border-bottom:1px solid var(--border-soft);">
   <div class="wrap">
     <div class="sec-head">
@@ -407,8 +444,14 @@
     <pre><span class="c"># 一键构建（x64 + x86）</span>
 build.bat
 
+<span class="c"># C# 纯逻辑回归测试（只需 .NET 8 SDK）</span>
+test\DllInjectorTests\build.bat
+
+<span class="c"># 原生测试材料的构建 + 双架构端到端验证（需 VS C++ 生成工具）</span>
+test\TextHookDll\build.bat
+
 <span class="c"># 或使用 CI：打 v* 标签自动构建并发布 Release</span>
-git tag v1.0.0 <span class="s">&amp;&amp;</span> git push origin v1.0.0</pre>
+git tag v1.2.3 <span class="s">&amp;&amp;</span> git push origin v1.2.3</pre>
   </div>
 </section>
 

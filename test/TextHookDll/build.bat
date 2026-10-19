@@ -37,6 +37,12 @@ set "SRC=%~dp0"
 set "OUT=%~dp0..\..\test_output"
 set "TARGET=%~dp0..\TestTextTarget"
 
+rem cl writes .obj / .exp / .lib into the CURRENT directory (not next to the
+rem source), and the linker resolves some paths relative to it too. Without
+rem this cd, invoking the script from the repo root scatters MSVC
+rem intermediates into the repo root and can make the link step fail.
+cd /d "%SRC%"
+
 rem ---- Locate Visual Studio (any edition) via vswhere ----------------------
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 if not exist "%VSWHERE%" set "VSWHERE=%ProgramFiles%\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -66,7 +72,8 @@ echo.
 
 if not exist "%OUT%" md "%OUT%"
 
-rem 随 DLL 一起分发 profile 模板：DLL 会从自己所在目录自动加载这个文件
+rem Ship the profile template next to the DLL: the DLL auto-loads it from
+rem its own directory.
 copy /y "%SRC%TextHookDll.profiles.ini" "%OUT%\TextHookDll.profiles.ini" >nul
 
 rem ---- x64 -----------------------------------------------------------------
@@ -123,13 +130,17 @@ echo.
 echo ============================================================
 echo   BUILD OK + VERIFY OK (x64 and x86)
 echo.
-echo   Manual run against a real game ^(optional, both processes):
+rem  NOTE: no "^" line continuations in the echo block below. A caret at the
+rem  end of an echo line escapes the newline, so the *next* line's literal
+rem  text -- including the word "echo" -- gets appended to the output. The
+rem  long command is therefore split into separate echo lines instead.
+echo   Manual run against a real game (optional, both processes):
 echo.
-echo     1^) test_output\TextHookClient.exe
+echo     1) test_output\TextHookClient.exe
 echo.
-echo     2^) DllInjector-x64.exe -inject test_output\TextTarget_x64.exe ^
-echo            test_output\TextHookDll-x64.dll -export InstallConfig ^
-echo            -exportarg "engine=generic-gdi^|cp=932^|log=1"
+echo     2) DllInjector-x64.exe -inject test_output\TextTarget_x64.exe
+echo            test_output\TextHookDll-x64.dll -export InstallConfig
+echo            -exportarg "engine=generic-gdi|cp=932|log=1"
 echo.
 echo   NOTE: cp= is process-wide, and one process can only carry ONE *A
 echo         encoding. The test target therefore defaults to Shift-JIS;

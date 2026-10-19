@@ -18,6 +18,32 @@
 #include <stdio.h>
 #include <string.h>
 
+// 连接管道：先直接试，失败则用 WaitNamedPipe 等一小会儿再试，最多等 totalMs。
+// 为什么要 WaitNamedPipe 而不是纯粹 Sleep 轮询：CreateFile 打不开时如果是
+// ERROR_PIPE_BUSY（实例都被占满），WaitNamedPipe 会让内核在有空闲实例时
+// 立刻唤醒，比固定 100ms 轮询更快也省 CPU；其它错误码（管道根本还没创建）
+// 才退回 Sleep。四实例广播下「全被占满」是真会发生的——比如开了四个客户端。
+static HANDLE ConnectPipe(const char* full, int totalMs)
+{
+    int waited = 0;
+    while (waited < totalMs)
+    {
+        HANDLE h = CreateFileA(full, GENERIC_READ, 0, NULL, OPEN_EXISTING, 0, NULL);
+        if (h != INVALID_HANDLE_VALUE) return h;
+
+        DWORD err = GetLastError();
+        if (err == ERROR_PIPE_BUSY) {
+            // 等 200ms 让出实例；超时返回 FALSE 也没关系，外层继续轮询
+            WaitNamedPipeA(full, 200);
+            waited += 200;
+        } else {
+            Sleep(100);
+            waited += 100;
+        }
+    }
+    return INVALID_HANDLE_VALUE;
+}
+
 // 打印一行：把 "GalToolText\t<pid>\t<hook>\t<text>" 格式化成便于阅读的形式
 static void PrintLine(char* line)
 {
@@ -53,15 +79,8 @@ int main(int argc, char* argv[])
     printf("Waiting for pipe %s ...\n", full);
     printf("(管道由 DLL 在注入后创建；若一直连不上，确认 DLL 已注入且 pipe= 名称一致)\n\n");
 
-    // 管道可能尚未创建（游戏还没注入），轮询等待最多 60 秒
-    HANDLE h = INVALID_HANDLE_VALUE;
-    for (int i = 0; i < 600; i++)
-    {
-        h = CreateFileA(full, GENERIC_READ, 0, NULL, OPEN_EXISTING, 0, NULL);
-        if (h != INVALID_HANDLE_VALUE) break;
-        Sleep(100);
-    }
-
+    // 首连：管道可能尚未创建（游戏还没注入），轮询等待最多 60 秒
+    HANDLE h = ConnectPipe(full, 60000);
     if (h == INVALID_HANDLE_VALUE)
     {
         printf("连接失败（错误码 %lu）。\n", GetLastError());
@@ -79,8 +98,26 @@ int main(int argc, char* argv[])
     {
         if (!ReadFile(h, buf, sizeof(buf), &got, NULL) || got == 0)
         {
-            printf("\n[管道已断开]\n");
-            break;
+            // 断开就重连，而不是退出。真实使用里断线是常态：
+            //   - 游戏重新注入一次（StopHooks 会关掉所有实例）
+            //   - 游戏崩溃后重开
+            //   - 四个实例全被别的客户端占着，自己这一路被挤掉
+            // 老版本直接 break 退出，使用者看到的就是「客户端自己关了」，
+            // 而游戏其实还在跑、文本还在产生。
+            CloseHandle(h);
+            printf("\n[管道已断开，正在重连...]\n");
+            fflush(stdout);
+            h = ConnectPipe(full, 60000);
+            if (h == INVALID_HANDLE_VALUE)
+            {
+                printf("[重连超时，退出] 错误码 %lu\n", GetLastError());
+                return 1;
+            }
+            // 断开时可能正好读到半行，丢掉它——半行拼上下一次的开头会变成乱码
+            li = 0;
+            printf("[已重新连接]\n\n");
+            fflush(stdout);
+            continue;
         }
         for (DWORD i = 0; i < got; i++)
         {

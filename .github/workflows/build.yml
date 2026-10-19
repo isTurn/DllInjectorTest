@@ -147,6 +147,12 @@ jobs:
     permissions:
       contents: write
     steps:
+      # release job 跑在 ubuntu-latest 上，workspace 默认是空的：
+      # 下面的 Prepare dist 要拷 test/ 下已提交的样例 DLL，Prepare release notes
+      # 要读 CHANGELOG.md，都依赖工作区里有仓库内容，所以必须先 checkout。
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:

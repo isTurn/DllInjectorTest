@@ -158,23 +158,88 @@ jobs:
           mkdir -p dist
           cp artifacts/win-x64/DllInjector.exe dist/DllInjector-x64.exe
           cp artifacts/win-x86/DllInjector.exe dist/DllInjector-x86.exe
+          # 样例 DLL 直接取仓库里提交过的版本。native job 虽然也构建了它们，
+          # 但那只是构建副产物；发布应当用可复现构建、进过代码审查的那一份。
+          cp test/TestHookDll/TestHookDll-x64.dll             dist/
+          cp test/TestHookDll/TestHookDll-x86.dll             dist/
+          cp test/TestReflectiveDll/TestReflectiveDll-x64.dll dist/
+          cp test/TestReflectiveDll/TestReflectiveDll-x86.dll dist/
+          # TextHookDll 是本地构建产物（不入库），只能从 native job 的 artifact 取。
+          cp artifacts/native-test-output/TextHookDll-x64.dll      dist/
+          cp artifacts/native-test-output/TextHookDll-x86.dll      dist/
+          cp artifacts/native-test-output/TextHookClient.exe       dist/
+          cp test/TextHookDll/TextHookDll.profiles.ini             dist/
           ls -la dist
+
+      - name: Prepare release notes
+        shell: bash
+        run: |
+          set -e
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "version: $VERSION"
+
+          {
+            echo "## DLL 注入器 ${GITHUB_REF_NAME}"
+            echo
+            echo "Windows DLL 注入器，图形界面 + 命令行双模式，自包含单文件，**无需安装 .NET 运行时**。"
+            echo
+            echo "### 下载哪个"
+            echo
+            echo "| 文件 | 用途 |"
+            echo "| --- | --- |"
+            echo "| \`DllInjector-x64.exe\` | 64 位版本，用于注入 64 位目标程序 |"
+            echo "| \`DllInjector-x86.exe\` | 32 位版本，用于注入 32 位目标程序 |"
+            echo
+            echo "要注入的程序是多少位，就用多少位的注入器；位数不符会被拦截并提示。"
+            echo "其余附件是测试样例 DLL 与文本 Hook 的引擎适配表模板，普通注入不需要它们。"
+            echo
+            echo "### 本版变更"
+            echo
+          } > dist/RELEASE_BODY.md
+
+          # 从 CHANGELOG 抽取本版段落，正文与仓库记录保持同一份来源。
+          # 用 awk 而不是 python：release job 跑在 ubuntu-latest 上两者都有，
+          # 但这段只做「按标题切段」，awk 足以胜任，且不依赖解释器版本。
+          # 找不到段落时直接失败——宁可中断发版，也不要发出一份没有说明的 Release。
+          awk -v want="[${VERSION}]" '
+            /^## \[/ {
+              if (inside) exit
+              n = split($0, a, " ")
+              if (n >= 2 && a[2] == want) { inside = 1; next }
+            }
+            inside
+          ' CHANGELOG.md > dist/section.md
+
+          if [ ! -s dist/section.md ]; then
+            echo "no '## [${VERSION}]' section in CHANGELOG.md"
+            exit 1
+          fi
+          cat dist/section.md >> dist/RELEASE_BODY.md
+
+          {
+            echo
+            echo "### 已知限制"
+            echo
+            echo "- **启动后有一小段抓不到**：挂钩发生在目标程序开始运行之后，启动后约百毫秒内的文本会漏掉。"
+            echo "- **DirectX / OpenGL 自绘引擎不覆盖**：文本不进 GDI，IAT Hook 无从下手。"
+            echo "- **不做句子重组**：逐字/逐次输出交给消费端自行合并。"
+            echo
+            echo "完整历史见 [CHANGELOG](https://github.com/isTurn/DllInjectorTest/blob/main/CHANGELOG.md)，"
+            echo "使用说明与构建方式见 [README](https://github.com/isTurn/DllInjectorTest#readme)。"
+            echo
+            echo "> 本工具仅供学习研究与软件互操作性测试，请勿用于侵犯他人权益的场景。"
+          } >> dist/RELEASE_BODY.md
+
+          echo "---- release body ----"
+          cat dist/RELEASE_BODY.md
 
       - name: Create/Update Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
-          # 固定 body：更新时整体覆盖，避免 generate_release_notes 重复追加 "Full Changelog"。
-          # 版本号取标签名（${{ github.ref_name }}），不要写死——写死的话以后每次发版
-          # 正文都还印着旧版本号。
-          body: |
-            ## DLL 注入器 ${{ github.ref_name }}
-
-            选择目标 exe 和 dll，以挂起方式启动目标程序，注入 DLL 后恢复运行。
-
-            - DllInjector-x64.exe — 64 位版本（用于 64 位目标程序）
-            - DllInjector-x86.exe — 32 位版本（用于 32 位目标程序）
-
-            自包含单文件，无需安装 .NET 环境即可直接运行。使用方法见仓库 README。
-
-            注入方式：CreateRemoteThread / NtCreateThreadEx / QueueUserAPC / 反射式注入（Reflective）/ 手动映射注入（Manual Map）。
+          files: |
+            dist/*.exe
+            dist/*.dll
+            dist/*.ini
+          # 固定结构 + 从 CHANGELOG 抽取的本版段落，避免两处各写一份、日久脱节。
+          # softprops 的 generate_release_notes 会重复追加 "Full Changelog"，故不用。
+          body_path: dist/RELEASE_BODY.md

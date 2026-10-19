@@ -49,6 +49,10 @@
 | `DllInjector-x64.exe` | 64 位目标程序 |
 | `DllInjector-x86.exe` | 32 位目标程序 |
 
+Release 里还会附带测试样例 DLL（`TestHookDll-*` / `TestReflectiveDll-*`）、文本 Hook 的
+`TextHookDll-*` / `TextHookClient.exe` 与引擎适配表模板 `TextHookDll.profiles.ini`。
+它们只用于试用对应功能，普通注入不需要。
+
 > 提示：文件选择对话框默认定位在**注入器 EXE 所在文件夹**。建议把目标 exe 和 dll 与注入器放在同一目录，选择起来更方便。
 
 ### 图形界面使用

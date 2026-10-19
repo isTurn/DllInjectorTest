@@ -7,6 +7,8 @@
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-10-19
+
 ### 新增
 - **文本 Hook 的 profile 现在能挂「框架不认识」的函数**：`HookTarget` 新增 `textArg` / `lenArg` / `argc` / `wide` / `conv`，ini 里用 `text=` / `len=` / `argc=` / `wide=` / `conv=` 声明「第几个参数是文本、第几个是长度、参数总数、窄/宽字符、调用约定」。此前「哪个参数是文本」写死在 `ReplacementFor()` 的「函数名 → 提取器」映射里，文件 profile 只能从框架已知的 6 个 GDI 函数里挑；现在任何导出函数都能挂
   - 实现方式是按「参数个数 × 调用约定」生成 8 × 2 = 16 种函数指针类型与 128 个转发 thunk（`GenDispatch` 按 `argc` 与 `conv` 选对应原型转发），仍然零第三方依赖
@@ -153,8 +155,6 @@
 - **`NtCreateThreadEx` 失败时可能残留无效句柄**被调用方 `CloseHandle`，失败时显式置零
 - 日志行数截断时每行残留回车符（`\r`），现在先归一 `\r\n` 再截断，日志更干净
 - 增强：`-injectname` 进程名匹配支持 `.exe` 后缀（输入 `notepad` 或 `notepad.exe` 均可匹配）
-- 64 位进程卸载失败：远程线程退出码仅 32 位导致模块句柄截断，改为注入器侧枚举目标进程模块取得完整 64 位基址
-- 「刷新」按钮点击时的空引用异常（对象未设置为对象实例）
 
 ### 变更
 - **测试素材的构建脚本不再写仓库里已提交的文件**：`test\TestHookDll\build.bat` 与 `test\TestReflectiveDll\build.bat` 原先把 4 个随仓库分发的样例 DLL 直接输出到源码目录（`/OUT:"%SRC%TestHookDll-x64.dll"`），于是每跑一次回归 `git status` 就多出 4 个 `M`——它们只差一个 PE 时间戳，没有任何源码变化，必须手工 `git checkout --` 才能复原，忘记复原就会误提交重新编译的二进制
@@ -168,7 +168,6 @@
 - **README 说清 `|` 的两种含义**：作为 DLL 分隔符时 `;` / `|` / 换行都行；而 `-exportarg` 里的 `|` 只是普通字符（`InstallConfig` 正用它分隔键值对）。此前两处都用 `|` 却没解释，容易误以为要转义
 - **CI 覆盖全部构建脚本**：`native` job 新增 `test\TestHookDll\build.bat`（会真的调一遍导出函数，`__stdcall` 修饰名问题当场暴露）、`test\TestReflectiveDll\build.bat`、`test\ManualMap\build_shellcode.bat --check`（`git diff --exit-code` 断言字节数组与 `.asm` 同步）；`build` job 新增 `test\DllInjectorTests\build.bat`，放在 publish 之前跑
 - **文档三处联动更新**：`README.md`、`docs/index.html`、`docs/text-hook-design.md` 同步新的能力边界（能挂未知函数、动态取址已覆盖、管道多实例）、测试场景数（5 → 6）、`-help`/`-version`、C# 测试入口
-
 - **文档事实性修正**：`docs/index.html` 展示页「四种注入方式」改为「五种」（同页对比表实际有 5 行），CLI 特性补齐 `-injectname` / `-checkdll`；`CHANGELOG.md` 按 Keep a Changelog 约定把 `[Unreleased]` 移至文件顶部、统一版本标题格式；README 构建章节补充 `dist\` 产物与测试素材构建脚本说明
 - **CI 发布启用单文件压缩**（`EnableCompressionInSingleFile`）：Release 体积从约 130MB 降至约 60MB，文件更小、下载更快
 - **CI Release 改用固定说明文本**：移除 `generate_release_notes`，杜绝每次更新 Release 时重复追加「Full Changelog」
@@ -177,7 +176,6 @@
 - **构建参数对齐**：`.github/workflows/build.yml` 的 publish 命令补上 `IncludeNativeLibrariesForSelfExtract`，与 `build.bat` 以及文件内「本地与 CI 参数保持一致」的说明对齐（此前 CI 产物缺这一项，两处实际不一致）
 - **移除仓库内重复截图**：`屏幕截图 2026-09-03 133127.png` 与 `screenshot.png` 内容完全相同（SHA256 均为 `d2a640eb…`），删除前者，只保留 `screenshot.png`
 - **统一 `.bat` 行尾为 CRLF**：`.gitattributes` 声明了 `*.bat text eol=crlf`，但工作区里 `test\ManualMap\build_shellcode.bat`、`test\TestReflectiveDll\build.bat`、`test\build_test.bat` 以及新加的 `test\TextHookDll\build.bat` 都是 LF。因为 git 按 CRLF 检出，这次转换**不产生任何 diff**，只是让工作区与声明自洽，并保证不经 git 检出（例如直接下载 zip）时拿到的也是 CRLF
-
 - 移除设置对话框与「设置」按钮：不再提供主题 / 注入超时 / 日志最大行数的手动调整
 - 主题固定为暗色；注入等待超时固定 15 秒；日志最大行数固定 1000 行
 - 修复设置对话框「日志最大行数」输入框在高 DPI 下数字显示不完整的问题（改用 TextBox 并移除手动 DPI 缩放；随设置功能移除一并消失）

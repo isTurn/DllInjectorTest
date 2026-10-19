@@ -13,7 +13,7 @@ body:
     attributes:
       label: 注入器版本
       description: x64 还是 x86？哪个 Release 版本？
-      placeholder: 例如 DllInjector-x64.exe v1.0.0
+      placeholder: 例如 DllInjector-x64.exe v1.1.0
     validations:
       required: true
   - type: input

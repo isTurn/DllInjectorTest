@@ -147,6 +147,68 @@ namespace DllInjectorTests
             Check(!inspBad.IsValidPe, "非 PE 文件体检判定为无效");
             Check(!string.IsNullOrEmpty(inspBad.Detail), "无效文件给出原因说明");
 
+            // ---- 7. 配置读写（ConfigStore）---------------------------------------
+            // 这几条覆盖的是「存了但读不回来」「写坏配置文件」这类静默故障：
+            // 用户不会看到任何报错，只会觉得「上次选的东西又没了」。
+            Console.WriteLine("\n  --- ConfigStore（记忆上次选择）---");
+            string cfgPath = DllInjector.ConfigStore.ConfigPath;
+            Check(!string.IsNullOrEmpty(cfgPath), "能确定配置文件路径");
+            if (!string.IsNullOrEmpty(cfgPath))
+            {
+                // 保存 → 读回。注意 ConfigStore 会把 exe/dll 之外的值也一起保留，
+                // 所以这里顺带验证「不会把其它键冲掉」。
+                DllInjector.ConfigStore.Save(@"C:\games\target.exe", @"C:\dll\hook.dll");
+                DllInjector.ConfigStore.Load(out string exe1, out string dll1);
+                CheckEq(exe1, @"C:\games\target.exe", "保存后能读回 exe");
+                CheckEq(dll1, @"C:\dll\hook.dll", "保存后能读回 dll");
+
+                DllInjector.ConfigStore.Method = DllInjector.NativeMethods.INJECT_MM;
+                CheckEq(DllInjector.ConfigStore.Method, DllInjector.NativeMethods.INJECT_MM,
+                        "注入方式能存能读（MM）");
+                DllInjector.ConfigStore.WindowPos = "10,20,720,700";
+                CheckEq(DllInjector.ConfigStore.WindowPos, "10,20,720,700", "窗口位置能存能读");
+
+                // 再存一次 exe/dll，前一步写的 method / winpos 必须还在
+                DllInjector.ConfigStore.Save(@"C:\games\other.exe", @"C:\dll\hook.dll");
+                CheckEq(DllInjector.ConfigStore.Method, DllInjector.NativeMethods.INJECT_MM,
+                        "保存 exe/dll 不会冲掉注入方式");
+                CheckEq(DllInjector.ConfigStore.WindowPos, "10,20,720,700",
+                        "保存 exe/dll 不会冲掉窗口位置");
+
+                // 原子写：临时文件必须被清理干净，不能留在磁盘上
+                Check(!File.Exists(cfgPath + ".tmp"), "原子写之后没有残留的 .tmp 文件");
+
+                // 缓存不能把外部修改当成不存在：模拟用户手工编辑配置文件
+                CheckEq(DllInjector.ConfigStore.Method, DllInjector.NativeMethods.INJECT_MM,
+                        "读取时命中缓存（值仍然正确）");
+                try
+                {
+                    File.WriteAllText(cfgPath, "method=2\nwinpos=5,6,700,600\n");
+                    CheckEq(DllInjector.ConfigStore.Method, DllInjector.NativeMethods.INJECT_APC,
+                            "外部编辑配置文件后能读到新值（缓存会失效）");
+                    CheckEq(DllInjector.ConfigStore.WindowPos, "5,6,700,600",
+                            "外部编辑后窗口位置同样读到新值");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine("           （跳过外部编辑检查: " + ex.Message + "）");
+                }
+
+                // 非法 method 值不能把注入方式搞成越界值（会索引到下拉框之外）
+                try
+                {
+                    File.WriteAllText(cfgPath, "method=99\n");
+                    CheckEq(DllInjector.ConfigStore.Method, DllInjector.NativeMethods.INJECT_CRT,
+                            "配置文件里的非法 method 退回 CRT（不会越界）");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine("           （跳过非法值检查: " + ex.Message + "）");
+                }
+
+                try { File.Delete(cfgPath); } catch { }
+            }
+
             // ---- 收尾 ------------------------------------------------------------
             Console.WriteLine("\n================================================");
             Console.WriteLine($"通过 {_pass} 项，失败 {_fail} 项");

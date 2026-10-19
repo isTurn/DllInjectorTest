@@ -104,6 +104,19 @@ jobs:
         shell: cmd
         run: test\TestReflectiveDll\build.bat
 
+      # 注入器本身的端到端测试：真的建进程、真的注入、真的调导出函数、真的卸载。
+      # 之前的 CI 对注入器只有 -checkdll 冒烟（只验证 PE 解析），五种注入链路
+      # 一条都没覆盖；这一步第一次跑就抓出了「反射注入假成功、目标进程已被打死」
+      # 这种纯单元测试永远看不见的缺陷。x64 / x86 各跑一次（测试主机位数必须与
+      # 目标进程一致，所以位数是编译期选择）。
+      - name: End-to-end injector tests (x64)
+        shell: cmd
+        run: test\DllInjectorE2E\build.bat
+
+      - name: End-to-end injector tests (x86)
+        shell: cmd
+        run: test\DllInjectorE2E\build.bat --x86
+
       # shellcode 与 .asm 的同步检查：Program.cs 里的四个 byte[] 是手工从 .obj
       # 抄过去的历史遗留，现在由 gen_shellcode.py --apply 直接回填。
       # 这里重新汇编 + 回填，再用 git diff 断言「仓库里提交的数组确实等于

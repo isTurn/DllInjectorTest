@@ -32,7 +32,7 @@
 - **暗色主题**：内置深色主题，长时间使用不刺眼
 - **窗口位置记忆**：自动记住上次的窗口大小与位置，下次启动原位恢复
 - **程序图标**：内置自定义注射器图标，任务栏 / 快捷方式统一显示
-- **命令行模式**：`-inject` / `-injectpid` / `-injectname` / `-eject` / `-checkdll`，支持多 DLL、启动参数、注入方式与批量注入选择，便于脚本自动化，退出码明确区分成败
+- **命令行模式**：`-inject` / `-injectpid` / `-injectname` / `-eject` / `-checkdll` / `-status` / `-help` / `-version`，支持多 DLL、启动参数、注入方式与批量注入选择，便于脚本自动化，退出码明确区分成败
 - **位数自动校验**：位数不匹配时拦截并给出清晰提示，避免目标程序白屏/崩溃
 - **完整日志**：界面日志 + 日志文件（`inject_log.txt`）双通道记录每一步结果
 - **支持中文路径**：DLL 路径以 UTF-16 写入远程进程，兼容中文目录/文件名
@@ -86,6 +86,7 @@ DllInjector-x64.exe -injectpid <pid1[,pid2...]> <dll1> [dll2 ...] [-method crt|n
 DllInjector-x64.exe -injectname <进程名> <dll1> [dll2 ...] [-method crt|ntc|rfi|mm] [-export <函数>] [-exportarg <参数>]
 DllInjector-x64.exe -eject <pid> <dll文件名>
 DllInjector-x64.exe -checkdll <dll1> [dll2 ...]
+DllInjector-x64.exe -status <pid> [dll...] [-pipe <管道名>]
 DllInjector-x64.exe -help | -version
 ```
 
@@ -96,6 +97,9 @@ DllInjector-x64.exe -help | -version
 - `-injectpid`：支持**多个 PID 用逗号分隔**，逐个批量注入并汇总结果
 - `-injectname`：按**进程名**批量注入，支持 `*` / `?` 通配（如 `cmd*`），位数不符自动跳过
 - `-checkdll`：**只做注入前 PE 体检**，不执行注入（返回 0 = 全部合格）
+- `-status`：**只读查询**，不动目标进程——打印进程位数与是否与本注入器匹配、指定 DLL 是否已在模块列表（给出基址）、
+  手动映射记录是否有效（`DllInjector.mmmap` 里的基址，PID 复用过的会被判失效）、文本 Hook 的命名管道是否在线
+  （`-pipe` 指定管道名，默认 `GalToolText`；能区分「没有这个管道」与「有管道但实例全被占满」）
 - `-help` / `-version`：打印完整用法 / 版本号后以 `0` 退出，不注入、不写日志
 - 退出码：`0` = 成功，`1` = 失败
 - 详细日志写入同目录下 `inject_log.txt`
@@ -282,7 +286,7 @@ WaitForSingleObject(15s) → GetExitCodeThread
 | `TextHookDll.def` | 导出表：统一 x86/x64 的无修饰导出名（x86 下 `__stdcall` 会修饰成 `_InstallConfig@4`） |
 | `TextHookDll.profiles.ini` | **引擎适配表模板**（随 DLL 一起分发）。改引擎适配只需改这个文件，不用重编译 DLL |
 | `TextHookClient.c` | 管道消费者，实时打印捕获到的文本；管道断开后自动重连（游戏重开、重新注入都不会让客户端自己退出） |
-| `TestTextHook.c` | **进程内端到端验证器**：自己加载 DLL、装钩子、用 GDI 输出文本、核对日志，全自动（自动跑 7 个场景，x64 + x86 都跑） |
+| `TestTextHook.c` | **进程内端到端验证器**：自己加载 DLL、装钩子、用 GDI 输出文本、核对日志，全自动（自动跑 8 个场景，x64 + x86 都跑） |
 | `build.bat` | 编译上述内容 + 验证用目标程序，**并自动跑两个架构的验证**（输出到 `test_output\`） |
 | `../TestTextTarget/TestTextTarget.c` | 验证目标：用 GDI 输出硬编码的日文/中文文本，便于确定性核对 |
 
@@ -432,7 +436,15 @@ test\TestReflectiveDll\build.bat     :: 编译反射 DLL 示例 + TestLoader 进
 test\TestHookDll\build.bat           :: 编译示例 DLL（x64 + x86，产物在 test_output\，并就地跑一遍导出函数验证）
 test\TextHookDll\build.bat           :: 编译文本 Hook DLL + 客户端 + 验证目标，并自动跑双架构验证 -> test_output\
 test\DllInjectorTests\build.bat      :: C# 纯逻辑回归测试（不需要 MSVC，只要 .NET 8 SDK）
+test\DllInjectorE2E\build.bat        :: 注入器端到端测试（真的建进程/注入/调导出/卸载，五种方式全覆盖）
+test\DllInjectorE2E\build.bat --x86  :: 同上，按 32 位跑（测试主机位数必须与目标进程一致）
 ```
+
+> `DllInjectorE2E` 会真的启动 `test_output\Target_*.exe`、真的注入、真的调用导出函数、
+> 真的卸载，所以它需要先跑过 `test\build_test.bat`、`test\TestHookDll\build.bat`、
+> `test\TestReflectiveDll\build.bat`（缺文件时脚本会直接打印 `MISSING_PREREQ` 并退出 1）。
+> 它是这个仓库里唯一能发现「反射注入报告成功、目标进程其实已经死了」这类问题的测试——
+> 只测纯函数永远看不见。
 
 > `test\ManualMap\build_shellcode.bat` 会**自动回填** `DllInjector\Program.cs` 里的四个 `byte[]`
 > （由 `gen_shellcode.py --apply` 完成，不再是手工复制）。
@@ -510,12 +522,16 @@ DllInjectorTest/
 │   │   ├── TextHookDll.def      #   导出表：统一 x86/x64 的无修饰导出名（避免 __stdcall 修饰差异）
 │   │   ├── TextHookDll.profiles.ini  # 引擎适配表模板（随 DLL 分发，改它不用重编译）
 │   │   ├── TextHookClient.c     #   管道消费者（控制台实时打印捕获到的文本）
-│   │   ├── TestTextHook.c       #   进程内端到端验证器（自动跑 7 个场景，x64 + x86 都跑）
+│   │   ├── TestTextHook.c       #   进程内端到端验证器（自动跑 8 个场景，x64 + x86 都跑）
 │   │   └── build.bat            #   编译 Hook DLL + 客户端 + 验证目标 + 验证器，并自动验证
-│   ├── DllInjectorTests/        # C# 纯逻辑回归测试（PE 解析 / DLL 分隔 / -method / 通配）
+│   ├── DllInjectorTests/        # C# 纯逻辑回归测试（PE 解析 / DLL 分隔 / -method / 通配 / 配置）
 │   │   ├── Program.cs           #   自带断言的控制台程序，不依赖任何 NuGet 测试框架
 │   │   ├── DllInjectorTests.csproj   # 把 DllInjector/Program.cs 原样链接进来编译
 │   │   └── build.bat            #   构建 + 运行，只需 .NET 8 SDK（不需要 MSVC）
+│   ├── DllInjectorE2E/          # 注入器端到端测试（真的建进程 / 注入 / 调导出 / 卸载）
+│   │   ├── Program.cs           #   覆盖 CRT / NTC / APC / RFI / MM + 卸载 + -status
+│   │   ├── DllInjectorE2E.csproj     # 同样链接 Program.cs，按 -p:PlatformTarget 出双架构
+│   │   └── build.bat            #   build.bat 跑 x64，build.bat --x86 跑 x86
 │   ├── TestTextTarget/          # 文本 Hook 的验证目标（GDI 输出硬编码日文/中文，便于确定性核对）
 │   │   └── TestTextTarget.c     #   可传 sjis（默认）/ gbk 选择 *A 系列编码，需与 cp= 配对
 │   ├── TestDll/                 # 自测用注入 DLL 源码（DllMain 写标记文件验证，支持前缀宏区分多 DLL）

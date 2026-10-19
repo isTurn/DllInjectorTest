@@ -7,6 +7,33 @@
 
 ## [Unreleased]
 
+### 新增
+- **注入器端到端测试 `test/DllInjectorE2E/`**：真的创建目标进程、真的注入、真的调用导出函数、真的卸载，覆盖全部五种注入方式（CRT / NTC / APC / RFI / MM）+ 注入到运行中进程 + 重复注入幂等 + 卸载 + 不存在的模块必须卸载失败 + `-status` 只读查询 + `-args` 透传，共 43 项断言，x64 与 x86 各跑一遍
+  - 此前 CI 对注入器本身只有 `-checkdll` 冒烟（只验证 PE 解析），五种注入链路一条都没有覆盖；纯逻辑测试（`DllInjectorTests`）也永远看不见「DLL 到底注进去了没有」
+  - 这个测试第一次跑就抓出了下面「修复」里的反射注入假成功
+  - `build.bat` 默认跑 x64，`build.bat --x86` 跑 x86——测试主机位数必须与目标进程一致，所以位数是编译期选择而不是运行时参数
+  - 输出目录按位数分成 `bin\x64\` / `bin\x86\` 并强制 `-t:Rebuild`：dotnet 的增量构建只看源码不看 `-p:PlatformTarget`，两个位数写进同一个 `bin\` 会静默复用上一次的程序集（实测 `--x86` 跑出来机器码仍是 `0x8664`，日志却写着「测试主机: 32 位」）
+- **CLI `-status <pid> [dll...] [-pipe <名称>]`**：只读查询，不动目标进程。打印进程位数与是否与本注入器匹配、指定 DLL 是否已在模块列表（给出基址）、手动映射记录是否有效（`DllInjector.mmmap` 里的基址，PID 被复用过的会判失效并说明原因）、文本 Hook 的命名管道是否在线
+  - 管道状态用 `WaitNamedPipe(name, 0)` 探测，**不真的建连接**——真连一下再断开会让服务端看到「连上就断」并重建实例，查询本身产生副作用
+  - 能区分三种状态：没有这个管道（`ERROR_FILE_NOT_FOUND`）、有管道但实例全被占满（`ERROR_SEM_TIMEOUT`，注意不是 `CreateFile` 才返回的 `ERROR_PIPE_BUSY`）、有空闲实例
+- **文本里的控制字符会被清洗**（`TextHookDll.c` 的 `SanitizeControls`）：把 `0x00–0x1F` 与 `0x7F–0x9F` 换成空格再组行。管道协议是「每行 `<magic>\t<pid>\t<hook>\t<text>\n`」，而 `text` 直接来自引擎缓冲区——里面的 `\n` 会把一句话拆成多条消息，`\t` 会让客户端的字段切分错位。设计文档承诺过「过滤控制字符」，代码此前并没有做
+- **去重从单槽改为 8 槽哈希表**：原先只有一个 `g_lastText` + `g_lastTick`，而 GalGame 常见「背景框 + 对话框」每帧交替绘制两处文本，两条互相顶掉 → 去重完全失效、队列被 60 帧/秒灌满。现在按「hook 名 + 文本」的 FNV-1a 哈希定址，命中且未过期才丢，否则占用空槽或最旧槽
+- **文本 Hook 的统计计数器**：`上报 / 过滤（低于 minLen）/ 队列溢出丢弃` 三个计数，卸载时快照、下一轮首次 `InstallConfig` 时在启动横幅里报一行。此前队列满时静默丢弃，使用者只看到「文本少了」，分不清是钩子没抓到、编码错了、还是队列溢出
+- **`test/TextHookDll/TestTextHook.c` 场景 8（控制字符清洗）**：喂一段夹着 `\t` 和 `\r\n` 的 SJIS 文本，然后逐行扫描日志，要求「含文本的行里 tab 数 ≤ 3」（前三个是协议字段）且不含 `\r`
+- **`test/DllInjectorTests` 第 7 组（`ConfigStore`，12 项）**：原子写不留 `.tmp`、缓存命中、文件被外部改过后缓存失效、非法 `method` 退回 CRT、`Save` 不冲掉本次没设置的键。断言总数由 51 → 63
+
+### 修复
+- **反射式注入「假装成功」，目标进程已被打死**：`ReflectiveInjectIntoProcess` 把镜像按 `PAGE_READWRITE` 分配后从未提权，而远程线程入口 `baseAddr + loaderRva` 就在这块缓冲里——线程一取指即 `STATUS_ACCESS_VIOLATION(0xC0000005)`。成功判据只有 `if (code == 0)`，于是 0xC0000005 被当成「映射成功」，注入器打印「反射加载成功」+「核验通过」，而目标进程已经死了
+  - 修法一：展开镜像后、创建远程线程前把整块镜像提成 `PAGE_EXECUTE_READWRITE`。给 RWX 而不是 RX 是有理由的——`ReflectiveLoader` 自己的全局变量（已解析的 `CreateFileA` 等）落在这块缓冲的 `.data` 里，loader 运行期间要可写
+  - 修法二：成功判据增加 NTSTATUS 区间排除（`(code & 0xFFFFF000) == 0xC0000000`）。远程线程退出码是 DWORD，loader 崩掉时拿到的是 NTSTATUS（`0xC0000005` 访问违例、`0xC00000FD` 栈溢出），一样非零；而真实映射基址不可能落在该区间
+  - 这是「可执行内存一律 RWX → 改先 RW 写入再封 RX」那次加固引入的回归：反射镜像的封页调用点被一并改掉，但分配处的注释还停留在旧逻辑上，测试又完全没覆盖这条链路
+- **`ConfigStore` 写配置不是原子操作**：原先 `File.WriteAllLines` 直接覆盖，写到一半进程被杀就得到一个空文件——所有记忆（上次的 exe / dll / 注入方式 / 窗口位置）一次性丢失。现在先写 `*.tmp` 再 `File.Replace`（文件不存在时 `File.Move`），失败才退回直写，最后清掉残留 tmp
+- **`ConfigStore.Get()` 每次读属性都重读整个文件**：`Method` / `WindowPos` 的 getter 全走 `Get()`，而 `Get()` 每次都 `Reload()` → 每读一个属性一次磁盘 IO，且发生在 UI 线程上。现在按 `LastWriteTimeUtc` + `Length` 判断是否需要重读（不能退化成「只读一次」——用户会手工改 `DllInjector.config` 再切回窗口）
+
+### 变更
+- **`test/DllInjectorE2E` 接入 CI**：`native` job 新增两个步骤，`test\DllInjectorE2E\build.bat` 与 `--x86`
+- **文档同步**：README 的测试素材列表与目录树、`docs/index.html` 的构建代码块与命令行特性、`CONTRIBUTING.md` 的目录职责与提交前自检、`docs/text-hook-design.md` §10.1 的场景表（7 → 8 行）与场景 8 说明
+
 ## [1.1.0] - 2026-10-19
 
 ### 新增
@@ -27,7 +54,7 @@
   - 连接循环改用 `WaitNamedPipe` 处理 `ERROR_PIPE_BUSY`：四个实例全被占满时内核会在有空闲实例的瞬间唤醒，比固定 100ms 轮询更快也更省 CPU
 - **C# 侧纯逻辑回归测试**：新增 `test/DllInjectorTests/`，覆盖那些「错了不会崩、但会静默给出错误结果」的逻辑——PE 位数识别、导出表 RVA 解析、DLL 路径分隔、`-method` 解析（含全部别名与未知值回退）、进程名通配（含正则元字符转义）、PE 体检
   - 刻意**不引入 NuGet 测试框架**（零第三方依赖的约定），用自带断言的控制台程序；把 `DllInjector/Program.cs` **原样链接进来**编译，而不是引用 `DllInjector.exe`——这样测试跑的就是发布出去的那份代码，也不会出现「测的是另一份拷贝」的假通过
-  - 51 项断言，`test\DllInjectorTests\build.bat` 一条命令跑完，不需要 MSVC（只要 .NET 8 SDK）
+  - 63 项断言（含 12 项 `ConfigStore`：原子写不留 `.tmp`、文件被外部改过后缓存失效、非法 `method` 退回 CRT），`test\DllInjectorTests\build.bat` 一条命令跑完，不需要 MSVC（只要 .NET 8 SDK）
   - 为此把 `ParseMethod` / `WildcardMatch` 从 `private` 改为 `internal`（同程序集内可见，不扩大公开 API）
 - **`TestTextHook` 新增场景 7：通用转发器**：此前 `text=` / `len=` / `argc=` / `wide=` / `conv=` 这条路径**完全没有自动化覆盖**（`grep` 确认测试里从没出现过 `text=`），而它恰好是新代码里最危险的一段——按「参数个数 × 调用约定」生成 128 个 thunk，写错一个就弹歪栈，失败方式是**崩溃**而不是「抓不到文本」
   - 取巧之处：拿框架本来就认识的 `TextOutA` 来测，但 profile 里故意写 `text=4 / len=5 / argc=5 / wide=0 / conv=stdcall`，于是走的就是 `t->textArg > 0` 的通用分支，与「框架不认识的函数」完全同一条代码路径，不必编测试 DLL 就能验证真实参数布局

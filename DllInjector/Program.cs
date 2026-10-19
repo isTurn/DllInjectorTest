@@ -161,6 +161,9 @@ namespace DllInjector
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern uint QueueUserAPC(IntPtr pfnAPC, IntPtr hThread, UIntPtr dwData);
 
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern bool WaitNamedPipe(string lpNamedPipeName, uint nTimeOut);
+
         [DllImport("advapi32.dll", SetLastError = true)]
         public static extern bool OpenProcessToken(IntPtr processHandle, uint desiredAccess, out IntPtr tokenHandle);
 
@@ -1986,6 +1989,163 @@ namespace DllInjector
             }
         }
 
+        /// <summary>探测一个命名管道是否存在、是否还有空闲实例。</summary>
+        /// <param name="pipeName">不带 <c>\\.\pipe\</c> 前缀的管道名。</param>
+        /// <returns>0 = 不存在；1 = 存在且有空闲实例（可以立刻连上）；2 = 存在但实例全被占用；-1 = 其它错误。</returns>
+        /// <remarks>
+        /// 为什么用 WaitNamedPipe 而不是枚举 <c>\\.\pipe\</c>：枚举只能拿到一堆设备名，
+        /// 还得自己按名字过滤；WaitNamedPipe 直接回答了「这个具体名字现在能不能连」，
+        /// 而且它**不会真的建立连接**——用 CreateFile 探测会短暂占用一个实例，
+        /// 服务端会看到一次「连上就断」并把该实例重建，平白制造噪音。
+        /// 实测错误码（timeout 传 0）：
+        ///   管道不存在 → ERROR_FILE_NOT_FOUND(2)；
+        ///   存在但实例全忙 → ERROR_SEM_TIMEOUT(121)，注意这里**不是** ERROR_PIPE_BUSY(231)，
+        ///   后者是 CreateFile 才会返回的码；两个都认下来最稳妥。
+        /// </remarks>
+        private static int ProbePipe(string pipeName)
+        {
+            if (string.IsNullOrEmpty(pipeName)) return 0;
+            string full = @"\\.\pipe\" + pipeName;
+            if (NativeMethods.WaitNamedPipe(full, 0)) return 1;
+            return Marshal.GetLastWin32Error() switch
+            {
+                121 => 2,   // ERROR_SEM_TIMEOUT：WaitNamedPipe 等待超时 = 实例都忙着
+                231 => 2,   // ERROR_PIPE_BUSY：同一语义的另一个码
+                2 => 0,     // ERROR_FILE_NOT_FOUND：根本没有这个管道
+                3 => 0,     // ERROR_PATH_NOT_FOUND：同上（路径形式异常时的兜底）
+                _ => -1,
+            };
+        }
+
+        /// <summary>只读状态查询：报告目标进程的位数、已加载模块、手动映射记录、文本 Hook 管道是否在线。</summary>
+        /// <remarks>
+        /// 用途是把「注入之后到底成没成」从「看日志猜」变成「一条命令问清楚」。
+        /// 尤其是手动映射注入的 DLL 不进目标进程模块列表，光看任务管理器永远找不到它，
+        /// 只能靠 <c>DllInjector.mmmap</c> 里的记录回答，这里就把它一并报出来。
+        /// 全程只读：不挂起目标、不写内存、不改任何记录。
+        /// </remarks>
+        public static bool Status(int pid, string[] dllNames, string pipeName, Action<string> log)
+        {
+            log("================ 状态查询 ================");
+            if (pid <= 0) { log("错误: 无效 PID"); return false; }
+
+            System.Diagnostics.Process proc;
+            try { proc = System.Diagnostics.Process.GetProcessById(pid); }
+            catch { log($"进程 {pid} 不存在。"); return false; }
+
+            try
+            {
+                log($"进程: {pid}  {proc.ProcessName}");
+                try { log($"启动时间: {proc.StartTime:yyyy-MM-dd HH:mm:ss}"); }
+                catch { log("启动时间: 无权限读取（权限不足）"); }
+
+                // ---- 位数 ----
+                int toolBits = IntPtr.Size * 8;
+                int targetBits = 0;
+                IntPtr hProcess = NativeMethods.OpenProcess(NativeMethods.PROCESS_ACCESS_FOR_INJECT, false, pid);
+                if (hProcess == IntPtr.Zero)
+                {
+                    log($"警告: 无法打开进程 - {NativeMethods.LastErrorText()}（可能需要管理员权限）");
+                }
+                else
+                {
+                    try
+                    {
+                        bool wow64 = false;
+                        if (NativeMethods.IsWow64Process(hProcess, out wow64)) targetBits = wow64 ? 32 : 64;
+                    }
+                    finally { NativeMethods.CloseHandle(hProcess); }
+                }
+                if (targetBits != 0)
+                    log($"位数: {targetBits} 位（当前注入器 {toolBits} 位，{(targetBits == toolBits ? "匹配" : "不匹配——注入会被拦截")}）");
+
+                // ---- 已加载模块 ----
+                // 只在给了 DLL 名时逐个查；不给就只报模块总数，避免刷屏。
+                var loaded = new System.Collections.Generic.Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+                int moduleCount = 0;
+                try
+                {
+                    foreach (System.Diagnostics.ProcessModule m in proc.Modules)
+                    {
+                        moduleCount++;
+                        try
+                        {
+                            string fn = Path.GetFileName(m.FileName);
+                            if (!string.IsNullOrEmpty(fn) && !loaded.ContainsKey(fn)) loaded[fn] = m.BaseAddress.ToInt64();
+                        }
+                        catch { /* 个别模块取不到路径，跳过 */ }
+                    }
+                    log($"模块总数: {moduleCount}");
+                }
+                catch (Exception ex)
+                {
+                    log("警告: 无法枚举模块列表 - " + ex.Message);
+                }
+
+                if (moduleCount > 0)
+                {
+                    if (dllNames != null && dllNames.Length > 0)
+                    {
+                        foreach (var dll in dllNames)
+                        {
+                            string name = Path.GetFileName(dll.Trim().Trim('"'));
+                            if (string.IsNullOrEmpty(name)) continue;
+                            if (loaded.TryGetValue(name, out long b))
+                                log($"  已加载: {name}  基址 0x{b:X}（常规注入）");
+                            else
+                                log($"  未在模块列表: {name}（可能没注入、已卸载，或者是手动映射——见下）");
+                        }
+                    }
+                }
+
+                // ---- 手动映射记录 ----
+                // 这些 DLL 不在模块列表里，只有本工具的记录知道它们在哪。
+                // 报之前必须校验记录是否仍然可信（进程可能已退出、PID 可能被复用）。
+                bool anyMm = false;
+                foreach (var kv in MmBases)
+                {
+                    if (!TryParseMmKey(kv.Key, out int recPid, out string recPath)) continue;
+                    if (recPid != pid) continue;
+                    if (dllNames != null && dllNames.Length > 0)
+                    {
+                        bool wanted = false;
+                        foreach (var dll in dllNames)
+                        {
+                            if (string.Equals(Path.GetFileName(dll.Trim().Trim('"')), Path.GetFileName(recPath),
+                                    StringComparison.OrdinalIgnoreCase)) { wanted = true; break; }
+                        }
+                        if (!wanted) continue;
+                    }
+                    anyMm = true;
+                    string verdict = IsMmRecordValid(pid, kv.Value.StartTicks, out string why)
+                        ? "记录有效" : "记录已失效: " + why;
+                    log($"  手动映射记录: {Path.GetFileName(recPath)}  基址 0x{kv.Value.Base:X}（{verdict}）");
+                }
+                if (anyMm) log("  说明: 手动映射的 DLL 不会出现在模块列表里，只能靠上面的记录定位。");
+
+                // ---- 文本 Hook 管道 ----
+                if (!string.IsNullOrEmpty(pipeName))
+                {
+                    int st = ProbePipe(pipeName);
+                    string text = st switch
+                    {
+                        0 => @"未发现（该进程可能没装文本 Hook，或 pipe= 用的不是这个名字）",
+                        1 => "在线，且有空闲实例（TextHookClient 可以连上）",
+                        2 => "在线，但所有实例都被占用（4 个消费者都已连上）",
+                        _ => "探测失败（其它错误）",
+                    };
+                    log($@"文本 Hook 管道: \\.\pipe\{pipeName} — {text}");
+                }
+
+                log("===== 状态查询完成 =====");
+                return true;
+            }
+            finally
+            {
+                proc.Dispose();
+            }
+        }
+
         /// <summary>在目标进程内远程调用 LoadLibraryW 加载 DLL。失败时通过 out 返回已分配资源，由调用方负责清理。
         /// <paramref name="rfiModule"/>：反射式注入成功后返回的映射模块句柄（非 RFI 时为 IntPtr.Zero）。</summary>
         private static bool LoadLibraryIntoProcess(IntPtr hProcess, IntPtr hTargetThread, string dllPath, int method, Action<string> log,
@@ -2663,8 +2823,11 @@ namespace DllInjector
 
             // 4. 分配"内存布局"镜像（SizeOfImage）。x86 反射 DLL 对全局量/常量采用绝对寻址，必须落在映像基址；
             //    x64 走 RIP 相对寻址，映像基址分配失败时可回退任意地址。
-            //    先按 RW 分配：这块缓冲只是「搬运源」，ReflectiveLoader 从里面读字节、复制到自己新分配的内存。
-            //    写完各节后再封成 RX —— 因为远程线程的入口就在这块缓冲里（base + loaderRva），它需要执行权限。
+            //    先按 RW 分配只是为了写得进去：远程线程的入口就是这块缓冲里的 ReflectiveLoader
+            //    （baseAddr + loaderRva），所以写完各节后必须立刻补上执行权限，否则线程一取指就是
+            //    STATUS_ACCESS_VIOLATION(0xC0000005)，目标进程当场被打死。
+            //    这里给 RWX 而不是 RX：ReflectiveLoader 自己的全局变量（已解析的 CreateFileA 等）
+            //    就落在这块缓冲的 .data 里，loader 运行期间需要可写。跑完之后再收成 RX。
             IntPtr baseAddr = NativeMethods.VirtualAllocEx(hProcess, new IntPtr(imageBase), (UIntPtr)sizeOfImage,
                 NativeMethods.MEM_COMMIT | NativeMethods.MEM_RESERVE, NativeMethods.PAGE_READWRITE);
             if (baseAddr == IntPtr.Zero && !is32)
@@ -2702,6 +2865,16 @@ namespace DllInjector
             remoteBuf = baseAddr;
             log($"已按内存布局展开反射 DLL（{numSections} 节，镜像 {sizeOfImage} 字节）到目标进程基址 0x{baseAddr.ToInt64():X}（映像基址 0x{imageBase:X}）。");
 
+            // 5.5 把镜像页从 RW 提成 RWX —— 必须在创建远程线程之前。
+            //     漏了这一步的表现极具误导性：注入器照样打印「反射加载成功」，
+            //     因为线程退出码是 0xC0000005（非 0，被当成成功），而目标进程已经死了。
+            if (!NativeMethods.VirtualProtectEx(hProcess, baseAddr, (UIntPtr)sizeOfImage,
+                    NativeMethods.PAGE_EXECUTE_READWRITE, out uint oldProtect))
+            {
+                log("错误: 反射镜像页无法设为可执行（ReflectiveLoader 就在这块内存里，必须有执行权限）- " + NativeMethods.LastErrorText());
+                return IntPtr.Zero;
+            }
+
             // 6. 计算 ReflectiveLoader 在目标进程中的地址（base + RVA）并创建远程线程（参数 NULL，Loader 通过返回地址自行定位基址）
             IntPtr loaderAddr = new IntPtr(baseAddr.ToInt64() + loaderRva);
             log($"ReflectiveLoader RVA 0x{loaderRva:X} -> 目标地址 0x{loaderAddr.ToInt64():X}，创建远程线程...");
@@ -2724,6 +2897,17 @@ namespace DllInjector
             if (code == 0)
             {
                 log("警告: ReflectiveLoader 返回 0，反射映射失败（检查 DLL 的 ReflectiveLoader 实现是否完整）。");
+                return IntPtr.Zero;
+            }
+            // 只判「非 0」是不够的：远程线程的退出码是一个 DWORD，loader 在映射过程中崩掉时
+            // 拿到的是 NTSTATUS（0xC0000005 访问违例、0xC00000FD 栈溢出等），这些值一样非 0。
+            // 曾经因此长期「假成功」——注入器打印成功，目标进程其实当场被打死了。
+            // NTSTATUS 错误码都在 0xC0000000..0xC0000FFF，而真实映射基址不可能落在这里
+            // （x64 用户态基址远高于该区间，x86 用户态上限 0x7FFFFFFF），所以按这个区间排除。
+            if ((code & 0xFFFFF000u) == 0xC0000000u)
+            {
+                log($"警告: ReflectiveLoader 以 NTSTATUS 0x{code:X8} 结束，说明它在映射途中崩溃了"
+                    + "（目标进程可能已经退出）。请确认 DLL 的 ReflectiveLoader 不依赖尚未填充的 IAT。");
                 return IntPtr.Zero;
             }
             log($"反射加载成功！DLL 已由 ReflectiveLoader 自行映射执行（模块句柄 0x{code:X}）。");
@@ -2955,6 +3139,9 @@ namespace DllInjector
     {
         private static string _path;
         private static readonly Dictionary<string, string> _data = new();
+        private static bool _loaded;              // 缓存是否已从磁盘填充过
+        private static DateTime _stamp;           // 上次读取时的文件时间戳（UTC）
+        private static long _stampLen = -1;       // 上次读取时的文件长度
 
         static ConfigStore()
         {
@@ -2984,38 +3171,116 @@ namespace DllInjector
         public static string ConfigPath => _path ?? "";
 
         /// <summary>重新从磁盘读取全部配置</summary>
-        private static void Reload()
+        /// <remarks>
+        /// 只在文件真的变了（时间戳或长度不同）时才重新解析。
+        /// 为什么需要这层缓存：<see cref="Get"/> 会被 <see cref="Method"/>、
+        /// <see cref="WindowPos"/> 的 getter 各自调用，而这些 getter 都跑在 UI 线程上；
+        /// 每次都 ReadAllLines + Split 一遍，等于每读一个属性就做一次完整文件 IO。
+        /// 但它**不能**退化成「只读一次」：用户会手工编辑 DllInjector.config 再切回窗口，
+        /// 那时必须看到新值，否则就像配置没生效一样。
+        /// </remarks>
+        private static void ReloadIfNeeded()
         {
+            if (_path == null) return;
+
+            DateTime mtime;
+            long length;
+            try
+            {
+                var fi = new FileInfo(_path);
+                if (!fi.Exists)
+                {
+                    // 文件被删了：清掉缓存，下次 Get 返回默认值
+                    if (_loaded) { _data.Clear(); _loaded = false; _stamp = default; _stampLen = -1; }
+                    return;
+                }
+                mtime  = fi.LastWriteTimeUtc;
+                length = fi.Length;
+            }
+            catch { return; }   // 权限/占用问题：沿用现有缓存，不让读配置变成异常源
+
+            if (_loaded && mtime == _stamp && length == _stampLen) return;
+
             _data.Clear();
-            if (_path == null || !File.Exists(_path)) return;
-            var lines = File.ReadAllLines(_path);
-            if (lines.Length == 0) return;
-            // 兼容旧格式：第一行不含 '=' 时视为纯 exe/dll 两行
-            if (!lines[0].Contains('='))
+            try
             {
-                _data["exe"] = lines[0].Trim();
-                if (lines.Length > 1) _data["dll"] = lines[1].Trim();
-                return;
+                var lines = File.ReadAllLines(_path);
+                if (lines.Length > 0)
+                {
+                    // 兼容旧格式：第一行不含 '=' 时视为纯 exe/dll 两行
+                    if (!lines[0].Contains('='))
+                    {
+                        _data["exe"] = lines[0].Trim();
+                        if (lines.Length > 1) _data["dll"] = lines[1].Trim();
+                    }
+                    else
+                    {
+                        foreach (var line in lines)
+                        {
+                            int i = line.IndexOf('=');
+                            if (i > 0) _data[line.Substring(0, i).Trim()] = line.Substring(i + 1).Trim();
+                        }
+                    }
+                }
+                _stamp = mtime;
+                _stampLen = length;
+                _loaded = true;
             }
-            foreach (var line in lines)
-            {
-                int i = line.IndexOf('=');
-                if (i > 0) _data[line.Substring(0, i).Trim()] = line.Substring(i + 1).Trim();
-            }
+            catch { /* 读失败：保持空表，按默认值走 */ }
         }
 
+        /// <summary>把内存里的键值写回磁盘（原子替换）</summary>
+        /// <remarks>
+        /// 为什么不用 File.WriteAllLines 直接覆盖：写到一半进程被杀（用户在注入
+        /// 过程中关窗口、或者机器断电），配置文件就变成半截甚至空文件——下次启动
+        /// 所有记忆全丢，而且用户完全不知道发生了什么。
+        /// 改为「写临时文件 → File.Replace 原子替换」：任何时刻磁盘上都存在一个
+        /// 完整的旧版本或新版本，不存在中间态。
+        /// </remarks>
         private static void Flush()
         {
             if (_path == null) return;
             var lines = new System.Collections.Generic.List<string>();
             foreach (var kv in _data)
                 lines.Add(kv.Key + "=" + kv.Value);
-            File.WriteAllLines(_path, lines, new UTF8Encoding(false));
+
+            string tmp = _path + ".tmp";
+            try
+            {
+                File.WriteAllLines(tmp, lines, new UTF8Encoding(false));
+                if (File.Exists(_path))
+                {
+                    // File.Replace 需要备份文件名参数；传 null 表示不留备份
+                    File.Replace(tmp, _path, null);
+                }
+                else
+                {
+                    File.Move(tmp, _path);
+                }
+            }
+            catch
+            {
+                // 原子替换失败（目录只读、被杀软占用等）时退回直接覆盖，
+                // 至少保住「这次能存上」，而不是让用户的选择无声消失。
+                try { File.WriteAllLines(_path, lines, new UTF8Encoding(false)); } catch { }
+            }
+            finally
+            {
+                try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
+            }
+
+            // 刚写的内容就是缓存内容，刷新一下戳记，避免下次 Get 又白读一遍
+            try
+            {
+                var fi = new FileInfo(_path);
+                if (fi.Exists) { _stamp = fi.LastWriteTimeUtc; _stampLen = fi.Length; _loaded = true; }
+            }
+            catch { }
         }
 
         private static string Get(string key, string def = "")
         {
-            Reload();
+            ReloadIfNeeded();
             return _data.TryGetValue(key, out var v) ? v : def;
         }
 
@@ -3030,7 +3295,7 @@ namespace DllInjector
         public static void Save(string exe, string dll)
         {
             if (_path == null) return;
-            Reload();
+            ReloadIfNeeded();
             _data["exe"] = exe ?? "";
             _data["dll"] = dll ?? "";
             Flush();
@@ -3045,14 +3310,14 @@ namespace DllInjector
         public static int Method
         {
             get { int m; return int.TryParse(Get("method", "0"), out m) && m >= NativeMethods.INJECT_CRT && m <= NativeMethods.INJECT_MM ? m : NativeMethods.INJECT_CRT; }
-            set { if (_path == null) return; Reload(); _data["method"] = value.ToString(); Flush(); }
+            set { if (_path == null) return; ReloadIfNeeded(); _data["method"] = value.ToString(); Flush(); }
         }
 
         /// <summary>窗口位置 "x,y,w,h"，空表示未记忆</summary>
         public static string WindowPos
         {
             get { return Get("winpos", ""); }
-            set { if (_path == null) return; Reload(); _data["winpos"] = value; Flush(); }
+            set { if (_path == null) return; ReloadIfNeeded(); _data["winpos"] = value; Flush(); }
         }
     }
 
@@ -3116,11 +3381,13 @@ namespace DllInjector
             //   -injectname <进程名> <dll1> [dll2...] [-method crt|ntc|rfi|mm] [-export <函数>] [-exportarg <参数>]            （按进程名批量，支持 * ? 通配）
             //   -eject      <pid> <dll文件名>
             //   -checkdll   <dll1> [dll2...]   （注入前 PE 体检，不执行注入）
+            //   -status     <pid> [dll...] [-pipe <名称>]   （只读状态查询）
             if (args.Length >= 1 &&
                 (string.Equals(args[0], "-inject", StringComparison.OrdinalIgnoreCase) ||
                  string.Equals(args[0], "-injectpid", StringComparison.OrdinalIgnoreCase) ||
                  string.Equals(args[0], "-injectname", StringComparison.OrdinalIgnoreCase) ||
                  string.Equals(args[0], "-eject", StringComparison.OrdinalIgnoreCase) ||
+                 string.Equals(args[0], "-status", StringComparison.OrdinalIgnoreCase) ||
                  string.Equals(args[0], "-checkdll", StringComparison.OrdinalIgnoreCase)))
             {
                 int code = 1;
@@ -3221,6 +3488,24 @@ namespace DllInjector
                         else
                             log("错误: 无效 PID: " + args[1]);
                     }
+                    else if (string.Equals(args[0], "-status", StringComparison.OrdinalIgnoreCase) && args.Length >= 2)
+                    {
+                        // -status <pid> [dll...] [-pipe <名称>]
+                        if (int.TryParse(args[1], out int stPid) && stPid > 0)
+                        {
+                            var stDlls = new System.Collections.Generic.List<string>();
+                            string stPipe = "GalToolText";   // 与 TextHookDll 的默认值一致
+                            for (int i = 2; i < args.Length; i++)
+                            {
+                                if (string.Equals(args[i], "-pipe", StringComparison.OrdinalIgnoreCase))
+                                { if (i + 1 < args.Length) stPipe = args[++i]; continue; }
+                                stDlls.Add(args[i]);
+                            }
+                            ok = InjectorCore.Status(stPid, stDlls.ToArray(), stPipe, log);
+                        }
+                        else
+                            log("错误: 无效 PID: " + args[1]);
+                    }
                     else if (string.Equals(args[0], "-checkdll", StringComparison.OrdinalIgnoreCase) && args.Length >= 2)
                     {
                         // -checkdll <dll...>：仅做注入前 PE 体检
@@ -3303,6 +3588,7 @@ namespace DllInjector
             sb.AppendLine("  DllInjector.exe -injectpid <pid1[,pid2...]> <dll...> [-method <方式>] [-export <函数>] [-exportarg <参数>]");
             sb.AppendLine("  DllInjector.exe -injectname <进程名> <dll...> [-method <方式>] [-export <函数>] [-exportarg <参数>]");
             sb.AppendLine("  DllInjector.exe -eject     <pid> <dll文件名>");
+            sb.AppendLine("  DllInjector.exe -status    <pid> [dll...] [-pipe <管道名>]");
             sb.AppendLine("  DllInjector.exe -checkdll  <dll...>");
             sb.AppendLine("  DllInjector.exe -help | -version");
             sb.AppendLine();
@@ -3316,6 +3602,7 @@ namespace DllInjector
             sb.AppendLine("  -exportarg 内部的多个参数用 || 分隔，会被打包成 LPVOID 数组传给导出函数。");
             sb.AppendLine();
             sb.AppendLine("  -injectname 的进程名支持 * 和 ? 通配，位数不符的进程会自动跳过。");
+            sb.AppendLine("  -status   只读查询：进程位数、模块是否已加载、手动映射基址、文本 Hook 管道是否在线。");
             sb.AppendLine("  退出码：0 = 成功，1 = 失败。");
             return sb.ToString();
         }

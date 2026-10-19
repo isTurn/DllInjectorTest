@@ -200,8 +200,28 @@ static BOOL                g_initialized = FALSE;
 static char                g_pipeName[128] = "GalToolText";
 
 static CRITICAL_SECTION    g_textCs;      // 保护去重状态
-static wchar_t             g_lastText[2048];
-static DWORD               g_lastTick    = 0;
+
+// 去重表：多槽而不是单槽。
+// 为什么不能只记「最近一条」：GalGame 常见「背景框 + 对话框」每帧交替绘制两处
+// 文本，单槽时两条互相顶掉，去重等于完全失效，队列会被 60 帧/秒灌满。
+// 槽位用文本哈希定址，命中且未过期就丢弃，否则占用空槽/最旧槽。
+#define DEDUP_SLOTS 8
+typedef struct {
+    unsigned int hash;      // hookName + 文本的 FNV-1a 哈希，0 = 空槽
+    DWORD        tick;      // 该条上一次上报的时刻
+} DedupSlot;
+static DedupSlot           g_dedup[DEDUP_SLOTS];
+
+// 统计：这三个数决定「抓不到文本」时该往哪个方向查。
+// 全 0 = 钩子压根没被调用；filtered 大 = 抓到的是碎片（长度阈值太高）；
+// dropped 大 = 消费端跟不上或管道卡住。
+static volatile LONG       g_statEmitted  = 0;
+static volatile LONG       g_statFiltered = 0;
+static volatile LONG       g_statDropped  = 0;
+
+// 上一轮的统计快照。StopHooks 时写进来，下一次 StartHooks 时作为横幅的一行输出：
+// 卸载之后管道已经在关，再往队列里塞东西也发不出去，所以只能留到下一轮报。
+static char                g_lastStats[256] = "";
 
 // 原始函数地址（各模块 IAT 槽里存的是同一个 gdi32 函数地址，故共用一份即可）
 typedef BOOL (WINAPI *pTextOutA)(HDC, int, int, LPCSTR, int);
@@ -312,12 +332,15 @@ static void Enqueue(const char* line)
     EnterCriticalSection(&g_qCs);
     if (g_qCount >= QUEUE_LIMIT) {
         // 队列满了：丢弃最旧的。宁可丢文本，也不能拖慢游戏。
+        // 但必须计数——否则使用者只看到「文本少了」，分不清是钩子没抓到、
+        // 编码错了、还是队列溢出，这是最难远程排查的一类问题。
         QNode* old = g_qHead;
         g_qHead = old->next;
         if (!g_qHead) g_qTail = NULL;
         g_qCount--;
         free(old->line);
         free(old);
+        InterlockedIncrement(&g_statDropped);
     }
     if (g_qTail) g_qTail->next = n; else g_qHead = n;
     g_qTail = n;
@@ -489,39 +512,99 @@ static DWORD WINAPI PipeThreadProc(LPVOID param)
 // 文本提取与上报
 // ---------------------------------------------------------------------------
 
+// 把控制字符就地换成空格。
+// 为什么必须做：管道协议是「一行一条消息」（以 \n 分帧），文本里只要含一个
+// 换行，一条消息就被拆成两条；含 \t 则客户端按 tab 切字段时会错位，表现为
+// 「hook 列里带着文本」。GalGame 里一句话分多行显示很常见，这不是理论问题。
+// 只替换 C0/C1 控制字符，全角空格（U+3000）等可见空白保留。
+static void SanitizeControls(wchar_t* w, int n)
+{
+    for (int i = 0; i < n; i++)
+    {
+        wchar_t c = w[i];
+        if ((c < 0x20) || (c >= 0x7F && c < 0xA0))
+            w[i] = L' ';
+    }
+}
+
+// FNV-1a：给去重表算 key。不用 CRC32 是因为它要多一张表，这里只需要
+// 「同一句话算同一个数」，分布好坏影响很小。
+static unsigned int HashText(const char* hookName, const wchar_t* w, int n)
+{
+    unsigned int h = 2166136261u;
+    for (const char* p = hookName; p && *p; p++)
+        h = (h ^ (unsigned char)*p) * 16777619u;
+    h = (h ^ 0xFFu) * 16777619u;          // 分隔符，避免 "ab"+"c" 与 "a"+"bc" 撞
+    for (int i = 0; i < n; i++)
+    {
+        unsigned int c = (unsigned int)w[i];
+        h = (h ^ (c & 0xFFu)) * 16777619u;
+        h = (h ^ ((c >> 8) & 0xFFu)) * 16777619u;
+    }
+    return h ? h : 1u;                    // 0 留给「空槽」
+}
+
 static void EmitText(const wchar_t* w, const char* hookName)
 {
     if (!w || !*w) return;
 
     int n = (int)wcslen(w);
     while (n > 0 && iswspace(w[n - 1])) n--;          // 去掉尾部空白
-    if (n < g_minLen) return;
     if (n > 2047) n = 2047;
 
-    // 去重：游戏每帧重绘，同一句话每秒可能触发几十次
-    EnterCriticalSection(&g_textCs);
+    // 去重和过滤都要用清洗后的文本，所以先拷一份再处理，
+    // 避免改到调用方的缓冲区（有些引擎的缓冲区是只读的）。
+    wchar_t clean[2048];
+    memcpy(clean, w, (size_t)n * sizeof(wchar_t));
+    clean[n] = 0;
+    SanitizeControls(clean, n);
+
+    if (n < g_minLen) { InterlockedIncrement(&g_statFiltered); return; }
+
+    // 去重：游戏每帧重绘，同一句话每秒可能触发几十次。
+    // 多槽按 hash 定址，先找同 key 的槽判断是否在窗口内，找不到就占用
+    // 「空槽 / 最旧槽」。用最旧淘汰而不是清空重来，是为了让交替绘制的
+    // 两条文本各自保留自己的时间戳。
+    unsigned int key = HashText(hookName, clean, n);
     DWORD now = GetTickCount();
-    if (wcsncmp(g_lastText, w, (size_t)n) == 0 && g_lastText[n] == 0 &&
-        (now - g_lastTick) < g_dedupMs)
+    EnterCriticalSection(&g_textCs);
+    int freeIdx = -1, oldestIdx = 0;
+    BOOL dup = FALSE;
+    for (int i = 0; i < DEDUP_SLOTS; i++)
+    {
+        if (g_dedup[i].hash == 0) { if (freeIdx < 0) freeIdx = i; continue; }
+        if (g_dedup[i].hash == key)
+        {
+            if ((now - g_dedup[i].tick) < g_dedupMs) { dup = TRUE; }
+            else { g_dedup[i].tick = now; }
+            freeIdx = i;
+            break;
+        }
+        if ((int)(now - g_dedup[oldestIdx].tick) < (int)(now - g_dedup[i].tick))
+            oldestIdx = i;   // 找 tick 最早的那个（模运算下用差值比较更稳）
+    }
+    if (dup)
     {
         LeaveCriticalSection(&g_textCs);
+        InterlockedIncrement(&g_statFiltered);
         return;
     }
-    wcsncpy_s(g_lastText, 2048, w, (size_t)n);
-    g_lastTick = now;
+    int slot = (freeIdx >= 0) ? freeIdx : oldestIdx;
+    if (g_dedup[slot].hash != key) { g_dedup[slot].hash = key; }
+    g_dedup[slot].tick = now;
     LeaveCriticalSection(&g_textCs);
 
     // 统一转 UTF-8 输出
     char utf8[8192];
-    int m = WideCharToMultiByte(CP_UTF8, 0, w, n, utf8, (int)sizeof(utf8) - 1, NULL, NULL);
-    if (m <= 0) return;
+    int m = WideCharToMultiByte(CP_UTF8, 0, clean, n, utf8, (int)sizeof(utf8) - 1, NULL, NULL);
+    if (m <= 0) { InterlockedIncrement(&g_statFiltered); return; }
     utf8[m] = 0;
 
     char line[8704];
     int len = _snprintf_s(line, sizeof(line), _TRUNCATE,
                           "GalToolText\t%lu\t%s\t%s\n",
                           GetCurrentProcessId(), hookName, utf8);
-    if (len > 0) Enqueue(line);
+    if (len > 0) { Enqueue(line); InterlockedIncrement(&g_statEmitted); }
 }
 
 static void EmitAnsi(const char* s, int len, const char* hookName)
@@ -1759,6 +1842,14 @@ static BOOL StartHooks(void)
     g_stop         = 0;
     g_patchedCount = 0;
 
+    // 去重表与统计计数器必须每轮清零。
+    // 不复位去重表的后果：上一轮的最后几条还占着槽位和时间戳，重装后
+    // 同样的文本会在窗口内被当成重复丢掉，表现为「重装之后头几句不见了」。
+    memset(g_dedup, 0, sizeof(g_dedup));
+    g_statEmitted  = 0;
+    g_statFiltered = 0;
+    g_statDropped  = 0;
+
     // 临界区只初始化一次，且**永不删除**。
     // 原因：StopHooks 是有界等待（DllMain 里不能无限期阻塞），万一某个线程
     // 没能在超时内退出，删掉临界区就等于让它在已释放的对象上 EnterCriticalSection。
@@ -1853,6 +1944,20 @@ static BOOL StartHooks(void)
         Enqueue(gpa);
     }
 
+    // 运行期统计单独一行。这一行是「钩子装好了，但文本要么少、要么乱」时
+    // 区分原因的直接依据：
+    //   emitted=0                → 钩子根本没被调用（函数选错 / 引擎走的不是这条路）
+    //   filtered 远大于 emitted  → 抓到的是碎片或重复（minlen 太高 / 同一句被反复重绘）
+    //   dropped > 0              → 队列溢出，消费端跟不上或管道卡住
+    // 报的是「上一轮卸载时」留下的快照（见 StopHooks）：本轮刚清零，报 0 没意义。
+    if (g_lastStats[0]) {
+        char stats[512];
+        _snprintf_s(stats, sizeof(stats), _TRUNCATE,
+                    "[TextHookDll] 上一轮统计：%s\n", g_lastStats);
+        Enqueue(stats);
+        g_lastStats[0] = 0;
+    }
+
     // profile 来源单独一行：使用者最常问的就是「我改的那个文件到底有没有被读到」
     if (g_profileFileMsg[0]) {
         char msg2[1024];
@@ -1870,6 +1975,13 @@ static BOOL StartHooks(void)
 static void StopHooks(void)
 {
     if (!g_initialized) return;
+
+    // 先把统计快照存下来——管道马上要关，这些数字之后就没地方报了。
+    // 用 _TRUNCATE 不用硬边界：这里在 DllMain(DETACH) 里也可能被调用，
+    // 任何一次「无效参数」都是直接终止目标进程。
+    _snprintf_s(g_lastStats, sizeof(g_lastStats), _TRUNCATE,
+                "上报 %ld 条，过滤 %ld 次，队列溢出丢弃 %ld 条",
+                (long)g_statEmitted, (long)g_statFiltered, (long)g_statDropped);
 
     g_stop = 1;
     if (g_qEvent)    SetEvent(g_qEvent);

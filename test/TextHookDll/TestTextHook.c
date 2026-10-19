@@ -499,6 +499,98 @@ static void RunGenericScenario(const wchar_t* iniGeneric)
 }
 
 // ---------------------------------------------------------------------------
+// 场景 8：文本里的控制字符必须被清洗
+//
+// 为什么值得单独一个场景：管道协议是「一行一条消息」（以 \n 分帧）。
+// 文本里只要含一个换行，一条消息就被拆成两条；含 \t 则客户端按 tab 切字段
+// 时会错位（表现为「hook 列里带着文本，且文本被打印两遍」）。
+// GalGame 里一句话分多行显示非常常见，所以这是实战会遇到的问题，不是理论问题。
+//
+// 这个场景不需要新 profile —— 用内置 generic-gdi 就够，重点是把带 \t / \r / \n
+// 的字节喂进去，然后断言日志里出现的是「用空格连接的一整行」。
+// ---------------------------------------------------------------------------
+
+// "こんにちは" + TAB + "こんにちは" + CRLF + "こんにちは"（全部 SJIS）
+static const char kSjisWithControls[] =
+    "\x82\xb1\x82\xf1\x82\xc9\x82\xbf\x82\xcd"
+    "\x09"
+    "\x82\xb1\x82\xf1\x82\xc9\x82\xbf\x82\xcd"
+    "\x0d\x0a"
+    "\x82\xb1\x82\xf1\x82\xc9\x82\xbf\x82\xcd";
+
+static void RunSanitizeScenario(void)
+{
+    printf("\n  --- 场景 8：文本里的 \\t / \\r / \\n 必须被替换成空格（不能拆行）---\n");
+
+    DeleteFileW(g_logPath);
+
+    DWORD rc = g_InstallConfig((LPVOID)L"engine=generic-gdi|cp=932|dedup=0|log=1");
+    Check(rc > 0, "InstallConfig 返回成功（控制字符场景）");
+    Sleep(700);
+
+    HDC     hScreen = GetDC(NULL);
+    HDC     hMem    = CreateCompatibleDC(hScreen);
+    HBITMAP hBmp    = CreateCompatibleBitmap(hScreen, 800, 600);
+    HGDIOBJ hOld    = SelectObject(hMem, hBmp);
+    TextOutA(hMem, 10, 10, kSjisWithControls, (int)strlen(kSjisWithControls));
+    SelectObject(hMem, hOld);
+    DeleteObject(hBmp);
+    DeleteDC(hMem);
+    ReleaseDC(NULL, hScreen);
+
+    Sleep(1200);
+
+    size_t sz = 0;
+    char* log = ReadWholeFile(g_logPath, &sz);
+    if (!log) {
+        Check(0, "读取 texthook_log.txt（控制字符场景）");
+        g_Unhook(NULL);
+        return;
+    }
+
+    // 正向：三句 hello 被空格连成一整行。\t → 1 个空格，\r\n → 2 个空格。
+    char hello[128];
+    ToUtf8(kExpectHello, hello, sizeof(hello));
+    char expect[256];
+    sprintf_s(expect, sizeof(expect), "%s %s  %s", hello, hello, hello);
+    Check(LogContains(log, expect),
+          "\\t / \\r / \\n 被替换成空格，整段文本留在同一行");
+
+    // 反向：逐行扫描，含 hello 的那条消息里不能再出现 tab / CR。
+    // 只看「这一行是不是被拆开了」不够——拆开之后每一段都还是合法的 hello，
+    // 所以必须直接检查分隔符有没有被清掉。
+    int badLines = 0, helloLines = 0;
+    for (const char* p = log; p && *p; ) {
+        const char* e = strchr(p, '\n');
+        size_t n = e ? (size_t)(e - p) : strlen(p);
+        char line[4096];
+        if (n >= sizeof(line)) n = sizeof(line) - 1;
+        memcpy(line, p, n);
+        line[n] = 0;
+
+        if (strstr(line, hello)) {
+            helloLines++;
+            // 消息格式是 "GalToolText\t<pid>\t<hook>\t<text>"，前三个 tab 是协议字段，
+            // 第四个及以后才属于文本内容。
+            int tabs = 0;
+            for (const char* q = line; *q; q++) if (*q == '\t') tabs++;
+            if (tabs > 3 || strchr(line, '\r')) badLines++;
+        }
+        if (!e) break;
+        p = e + 1;
+    }
+    Check(helloLines > 0, "日志里确实有含 hello 的消息行");
+    Check(badLines == 0, "文本字段内没有残留 tab / CR（消息没有被切碎）");
+
+    free(log);
+
+    g_Unhook(NULL);
+    Sleep(400);
+    Check(CountIatSlotsInsideDll(g_hDllUnderTest) == 0,
+          "Unhook 后 IAT 已还原（控制字符场景）");
+}
+
+// ---------------------------------------------------------------------------
 // 场景 5：命名管道
 //
 // 为什么必须有：前面 4 个场景全程没有客户端连管道，只靠 texthook_log.txt
@@ -683,7 +775,7 @@ int main(int argc, char** argv)
     printf("================================================\n");
 
     if (argc < 2) {
-        printf("用法: TestTextHook.exe <TextHookDll 路径> [sample ini 路径] [只跑的场景号 1-7]\n");
+        printf("用法: TestTextHook.exe <TextHookDll 路径> [sample ini 路径] [只跑的场景号 1-8]\n");
         return 1;
     }
 
@@ -838,6 +930,9 @@ int main(int argc, char** argv)
     // ---- 7. 场景 7：通用转发器 ----------------------------------------------
     //      放在场景 5 之前：场景 5 会额外做多轮安装/卸载，前面的场景要保持各自干净。
     if (!only || only == 7) RunGenericScenario(iniGeneric);
+
+    // ---- 7b. 场景 8：控制字符清洗 -------------------------------------------
+    if (!only || only == 8) RunSanitizeScenario();
 
     // ---- 8. 场景 5：命名管道 ------------------------------------------------
     //      必须在最后跑：它会额外做多轮安装/卸载，前面的场景要保持各自干净。

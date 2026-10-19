@@ -1,0 +1,37 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    注入器的端到端测试。与 test/DllInjectorTests 的区别：
+      - DllInjectorTests 只测纯函数（SplitDlls / ParseMethod / PE 解析 / ConfigStore），
+        不需要真的启动目标进程，因此在任何机器上都能跑；
+      - 本工程**真的**创建目标进程、真的注入、真的调用导出函数、真的卸载，
+        所以它要求先跑过 test\build_test.bat 与 test\TestHookDll\build.bat
+        （test_output\ 里要有 Target_x64.exe / TestHookDll-x64.dll 等产物）。
+
+    同样把 DllInjector/Program.cs 原样链接进来，而不是启动 DllInjector.exe 子进程：
+    这样能直接读回 InjectorCore 的返回值、MmBases 记录，也能断言「注入后模块确实在
+    模块列表里」——只看子进程退出码的话，日志里说什么都得靠解析文本猜。
+    代价是 DllInjector/Program.cs 里也有一个 Main，所以必须显式指定 StartupObject。
+
+    PlatformTarget 由命令行传入（-p:PlatformTarget=x86），因为测试主机必须与目标
+    进程同位数：64 位主机只能测 Target_x64.exe，32 位主机只能测 Target_x86.exe。
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>DllInjectorE2E</AssemblyName>
+    <RootNamespace>DllInjectorE2E</RootNamespace>
+    <StartupObject>DllInjectorE2E.E2EMain</StartupObject>
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+    <SatelliteResourceLanguages>zh-Hans</SatelliteResourceLanguages>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Program.cs" />
+    <Compile Include="..\..\DllInjector\Program.cs" Link="DllInjector\Program.cs" />
+  </ItemGroup>
+
+</Project>

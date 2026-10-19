@@ -61,7 +61,8 @@ test/                        测试素材（源码 + 部分已编译产物）
   ├─ TestReflectiveDll/      自包含反射加载器示例
   ├─ ManualMap/              手动映射 / 卸载 shellcode（.asm 源码 + 生成脚本）
   ├─ TextHookDll/            GalGame 文本 Hook（IAT Hook + 管道推送 + 进程内端到端验证）
-  └─ DllInjectorTests/       C# 纯逻辑回归测试（链接 Program.cs 编译，自带断言）
+  ├─ DllInjectorTests/       C# 纯逻辑回归测试（链接 Program.cs 编译，自带断言）
+  └─ DllInjectorE2E/         注入器端到端测试（真的建进程 / 注入 / 调导出 / 卸载，双架构）
 
 tools/git-api-sync.py        受限网络下用 GitHub Git Data API 推拉（github.com 不通时用）
 
@@ -98,6 +99,9 @@ docs/index.html              GitHub Pages 展示页
 - [ ] `build.bat` 能成功产出 x64 + x86 两个版本
 - [ ] 若改动涉及注入逻辑，用 `test\build_test.bat` 的素材实测过，且 x64 / x86 **双架构都验证**
 - [ ] `test\DllInjectorTests\build.bat` 通过（纯逻辑回归，改过 `Program.cs` 就该跑）
+- [ ] 若改动涉及注入链路（`LoadLibraryIntoProcess` / `InjectToProcess` / 反射 / 手动映射 / 卸载），
+      `test\DllInjectorE2E\build.bat` 与 `test\DllInjectorE2E\build.bat --x86` 都要通过 ——
+      它真的建进程、真的注入、真的调导出、真的卸载，纯函数测试看不见这条链路
 - [ ] 若改过 `test\ManualMap\*.asm`，跑过 `test\ManualMap\build_shellcode.bat`（会自动回填字节数组）
 - [ ] `README.md` / `docs/index.html` / `CHANGELOG.md` 中受影响的内容已同步更新
 - [ ] 没有提交构建产物与运行时文件（`out/`、`dist/`、`bin/`、`obj/`、`test_output/`、`*.obj`、`inject_log.txt`、`DllInjector.config` 等，见 `.gitignore`）

@@ -75,6 +75,13 @@
   - 构建矩阵改为 `include:` 形式，为每个 `rid` 配一个**同位数**的探针 DLL，避免出现「用 x64 探针验 x86 产物」这种假通过
   - `release` 改为 `needs: [build, native]`，发布说明改用 `${{ github.ref_name }}`（此前硬编码 `v1.0.0`，打任何 tag 都会生成错误的标题）
 
+- **`tools/git-api-sync.py`：受限网络下用 GitHub Git Data API 推拉仓库**：本环境里 `github.com:443` 不通（`git fetch` / `git push` 报 `Connection was reset` 或 `Failed to connect to github.com:443`），只有 `api.github.com` 可达，于是改用 `/git/blobs` → `/git/trees` → `/git/commits` → `/git/refs` 这条通道搬运对象
+  - 两个方向都**逐字节重放**：推上去的提交 SHA 与本地完全一致，拉下来的历史是完整提交链而非压平的快照，脚本对每一项都断言
+  - 过程中踩到三个会让 SHA 变化的坑，都已修掉：`subprocess.run(text=True)` 用系统 locale（本机 GBK）解码中文提交消息会变成 U+FFFD（改为一律取 bytes 再显式 UTF-8 解码）；`git log --format=%B` 会在消息末尾补一个换行（改为直接读 `git cat-file commit` 的原始字节）；tree 对象必须是二进制 `<mode> <name>\0<20 字节原始 SHA>`，且目录 mode 要写 `40000` 而不是 API 返回的 `040000`（零填充会被 fsck 判成 `zeroPaddedFilemode` 并拒绝写入）
+  - 拉取侧还有两个 API 的信息损失：日期被归一化成 UTC（原始时区偏移丢失）、提交消息末尾换行被吃掉。两者都用候选搜索解决——先试本地历史里出现过的偏移、再试一组常见值；消息则「带换行」与「不带换行」两种都试。候选只算哈希不落库，避免在对象库里留下一堆 dangling commit
+  - `push` 拒绝改写历史（父提交必须是远端 tip）；`fetch` 只快进、不强推本地分支
+  - `api()` 带重试：本环境下 `api.github.com` 约有一半的新建连接会先卡 21 秒再以 `WinError 10060` 失败，失败是**连接级**的，重试通常一两次就通；不重试的话拉几十个 blob 必然中途失败，留下半满的对象库
+
 - **SeDebugPrivilege 自动提权**：注入 / 卸载前自动尝试启用调试权限，以管理员运行时即可打开并注入 SYSTEM 等高权限 / 其他会话进程；普通权限令牌下仅提示、不阻断普通进程注入
 - **批量化注入**：GUI「批量注入」弹出进程多选对话框（按名称筛选），勾选多个进程一次性注入并汇总成功/失败结果；CLI 新增 `-injectname <进程名>`（支持 `*` `?` 通配）与 `-injectpid` 多 PID 逗号分隔批量注入；位数不符的进程自动跳过
 - **注入前 PE 体检**：注入前自动对每个 DLL 做结构体检（有效 PE、位数、是否为 DLL、导出表、重定位段、可执行段），不合格直接拦截并给出原因；CLI 新增 `-checkdll <dll...>` 单独体检命令

@@ -59,7 +59,11 @@ test/                        测试素材（源码 + 部分已编译产物）
   ├─ TestTarget/             自测目标程序（回显命令行参数）
   ├─ TestHookDll/            导出函数调用示例（InstallHook / Init / InstallConfig / InstallMulti）
   ├─ TestReflectiveDll/      自包含反射加载器示例
-  └─ ManualMap/              手动映射 / 卸载 shellcode（.asm 源码 + 生成脚本）
+  ├─ ManualMap/              手动映射 / 卸载 shellcode（.asm 源码 + 生成脚本）
+  ├─ TextHookDll/            GalGame 文本 Hook（IAT Hook + 管道推送 + 进程内端到端验证）
+  └─ DllInjectorTests/       C# 纯逻辑回归测试（链接 Program.cs 编译，自带断言）
+
+tools/git-api-sync.py        受限网络下用 GitHub Git Data API 推拉（github.com 不通时用）
 
 docs/index.html              GitHub Pages 展示页
 ```
@@ -93,6 +97,8 @@ docs/index.html              GitHub Pages 展示页
 
 - [ ] `build.bat` 能成功产出 x64 + x86 两个版本
 - [ ] 若改动涉及注入逻辑，用 `test\build_test.bat` 的素材实测过，且 x64 / x86 **双架构都验证**
+- [ ] `test\DllInjectorTests\build.bat` 通过（纯逻辑回归，改过 `Program.cs` 就该跑）
+- [ ] 若改过 `test\ManualMap\*.asm`，跑过 `test\ManualMap\build_shellcode.bat`（会自动回填字节数组）
 - [ ] `README.md` / `docs/index.html` / `CHANGELOG.md` 中受影响的内容已同步更新
 - [ ] 没有提交构建产物与运行时文件（`out/`、`dist/`、`bin/`、`obj/`、`test_output/`、`*.obj`、`inject_log.txt`、`DllInjector.config` 等，见 `.gitignore`）
 - [ ] 没有为了「顺手」而重构无关代码（请让 PR 保持聚焦）

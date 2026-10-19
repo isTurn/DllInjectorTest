@@ -89,10 +89,13 @@ test/TestReflectiveDll/TestLoader-*.exe
 /*.idb
 /*.tlog
 
+# ---- Python (tools/git-api-sync.py, test/ManualMap/gen_shellcode.py) ----
+__pycache__/
+*.pyc
+
 # ---- OS junk ----
 Thumbs.db
 ehthumbs.db
-Desktop.ini
-$RECYCLE.BIN/
+Desktop.ini$RECYCLE.BIN/
 *.lnk
 .DS_Store

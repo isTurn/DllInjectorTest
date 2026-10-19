@@ -435,6 +435,26 @@ test\DllInjectorTests\build.bat      :: C# 纯逻辑回归测试（不需要 MSV
 > `--check` 只比对不写入：仓库里的数组与 `.asm` 汇编结果不一致时以非零码退出，
 > CI 用它挡住「改了 `.asm` 却忘了重新生成」的情况。
 
+### 在受限网络下同步仓库（GitHub API）
+
+某些环境里 `github.com:443` 不通（`git fetch` / `git push` 报
+`Connection was reset` 或 `Failed to connect to github.com:443`），但
+`api.github.com` 可达。`tools/git-api-sync.py` 走 Git Data API 搬运对象，
+**不需要** smart-HTTP 通道：
+
+```bash
+python tools/git-api-sync.py status                # 本地 vs 远端
+python tools/git-api-sync.py push                  # 把本地新提交推上去
+python tools/git-api-sync.py fetch                 # 把远端新提交拉下来
+```
+
+两个方向都是**逐字节重放**：推上去的提交 SHA 与本地完全一致，拉下来的
+历史也是完整提交链而不是压平的快照，脚本会断言这一点。`push` 拒绝改写
+历史（父提交必须是远端 tip）；`fetch` 只会快进，不会强推本地分支。
+
+> 远端返回的日期被归一化成 UTC、提交消息末尾的换行会被吃掉，脚本对这两项
+> 都做了候选搜索，命中后校验 SHA —— 细节见脚本开头的说明。
+
 ## 目录结构
 
 ```
@@ -486,6 +506,8 @@ DllInjectorTest/
 ├── docs/
 │   ├── index.html               # GitHub Pages 展示页
 │   └── text-hook-design.md      # 多引擎文本 Hook 适配架构设计
+├── tools/
+│   └── git-api-sync.py          # 受限网络下用 GitHub Git Data API 推/拉（逐字节保 SHA）
 ├── screenshot.png              # 界面截图
 ├── build.bat                   # 一键构建脚本（x64 + x86）
 ├── CHANGELOG.md

@@ -424,8 +424,8 @@ set "ProgramFiles=%SystemDrive%\Program Files"
 test\build_test.bat                  :: 编译测试 DLL 与目标程序 -> test_output\
 test\ManualMap\build_shellcode.bat   :: 汇编手动映射 shellcode 并回填 Program.cs 的字节数组
 test\ManualMap\build_shellcode.bat --check  :: 只校验 Program.cs 与 .asm 是否同步（CI 用）
-test\TestReflectiveDll\build.bat     :: 编译反射 DLL 示例 + TestLoader 进程内验证器
-test\TestHookDll\build.bat           :: 编译示例 DLL（x64 + x86，产物就放在 test\TestHookDll\）
+test\TestReflectiveDll\build.bat     :: 编译反射 DLL 示例 + TestLoader 进程内验证器（产物在 test_output\）
+test\TestHookDll\build.bat           :: 编译示例 DLL（x64 + x86，产物在 test_output\，并就地跑一遍导出函数验证）
 test\TextHookDll\build.bat           :: 编译文本 Hook DLL + 客户端 + 验证目标，并自动跑双架构验证 -> test_output\
 test\DllInjectorTests\build.bat      :: C# 纯逻辑回归测试（不需要 MSVC，只要 .NET 8 SDK）
 ```
@@ -434,6 +434,20 @@ test\DllInjectorTests\build.bat      :: C# 纯逻辑回归测试（不需要 MSV
 > （由 `gen_shellcode.py --apply` 完成，不再是手工复制）。
 > `--check` 只比对不写入：仓库里的数组与 `.asm` 汇编结果不一致时以非零码退出，
 > CI 用它挡住「改了 `.asm` 却忘了重新生成」的情况。
+
+> **这些脚本都不会写仓库里已提交的文件。** 四个随仓库分发的样例 DLL
+> （`test\TestHookDll\TestHookDll-{x64,x86}.dll`、`test\TestReflectiveDll\TestReflectiveDll-{x64,x86}.dll`）
+> 默认由脚本重新编译到 `test_output\`，源码目录里那份保持不动，所以跑完回归
+> `git status` 是干净的。确实要刷新已提交的那份（只有维护者发布新样例时才需要）：
+>
+> ```bat
+> test\TestHookDll\build.bat --update-shipped
+> test\TestReflectiveDll\build.bat --update-shipped
+> ```
+>
+> 两个脚本都带 `/Brepro`，同一条工具链下重复构建产出的字节完全一致——
+> 否则每跑一次都会因为 PE 头里的时间戳而变化，`git status` 永远脏，
+> 「这份二进制到底改没改」也无从判断。
 
 ### 在受限网络下同步仓库（GitHub API）
 
@@ -479,7 +493,7 @@ DllInjectorTest/
 │   │   ├── TestReflectiveDll-x64.dll  #   加载成功后写 C:\Windows\Temp\rfi_call_log.txt 两行日志
 │   │   ├── TestReflectiveDll-x86.dll
 │   │   ├── TestLoader.c         #   进程内验证反射加载器（按内存布局展开后直接调用 ReflectiveLoader）
-│   │   └── TestLoader-x64.exe / -x86.exe   #   由 build.bat 一并编译，默认加载同目录同架构的反射 DLL
+│   │   └── build.bat            #   产物落 test_output\；TestLoader-{x64,x86}.exe 也编在那里，默认加载同目录同架构的反射 DLL
 │   ├── ManualMap/               # 手动映射注入 shellcode（源码 + 编译中间物，字节已内嵌注入器）
 │   │   ├── ManualMap_x64.asm    #   x64 手动映射器（1202 字节，已实机验证 Init=42 / InstallHook=1）
 │   │   ├── ManualMap_x86.asm    #   x86 手动映射器（956 字节，已实机验证 Init=42 / InstallHook=1）

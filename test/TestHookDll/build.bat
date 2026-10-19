@@ -2,9 +2,24 @@
 rem ============================================================================
 rem  Build the "call an export after injection" sample DLL (TestHookDll).
 rem
-rem  Output (next to this script - these binaries are shipped with the repo):
+rem  Output (default: test_output\, NOT next to the sources):
 rem    TestHookDll-x64.dll   64-bit
 rem    TestHookDll-x86.dll   32-bit
+rem    TestLoad-x64.exe      in-process validator, x64
+rem    TestLoad-x86.exe      in-process validator, x86
+rem
+rem  Why test_output\ instead of the source directory: the two DLLs are
+rem  committed to the repository (they are the probe DLLs CI uses for the
+rem  published binary's smoke test), so writing them in place made every single
+rem  build dirty the working tree with two binary diffs that carry no source
+rem  change -- just a fresh PE timestamp. Regression runs then needed a
+rem  "git checkout -- test/TestHookDll/*.dll" afterwards, and forgetting it
+rem  meant accidentally committing rebuilt binaries.
+rem
+rem  To deliberately refresh the committed copies (only a maintainer shipping a
+rem  new sample build needs this), pass --update-shipped:
+rem
+rem    test\TestHookDll\build.bat --update-shipped
 rem
 rem  It then builds and runs TestLoad.c for BOTH bitnesses, so the export names
 rem  and the return codes are verified on the spot instead of being taken on
@@ -13,6 +28,10 @@ rem
 rem  Notes:
 rem    - Paths are derived from this script's own location, so the repository
 rem      can live anywhere.
+rem    - /Brepro makes the output byte-identical across rebuilds with the same
+rem      toolchain (it zeroes the PE timestamp and the PDB path). Without it,
+rem      two consecutive builds of the same source differ, so "did the shipped
+rem      binary actually change?" cannot be answered from a diff.
 rem    - Visual Studio is located with vswhere.exe (any edition).
 rem    - Messages are ASCII-only on purpose: cmd.exe reads .bat files using the
 rem      console code page, so non-ASCII text would be garbled.
@@ -31,6 +50,11 @@ rem ============================================================================
 setlocal
 set "SRC=%~dp0"
 set "OUT=%~dp0..\..\test_output"
+
+rem Where the two DLLs land. Default is the scratch output directory; the
+rem committed copies under the source tree are only rewritten on request.
+set "DLLOUT=%OUT%\"
+if /i "%~1"=="--update-shipped" set "DLLOUT=%SRC%"
 
 rem cl writes .obj / .exp / .lib into the CURRENT directory (not next to the
 rem source). Without this cd, invoking the script from the repo root scatters
@@ -63,39 +87,41 @@ if not exist "%VC%\vcvars64.bat" (
 echo [INFO] Visual Studio: %VSPATH%
 echo [INFO] source        : %SRC%
 echo [INFO] verifier out  : %OUT%
+echo [INFO] dll out       : %DLLOUT%
 echo.
 
 if not exist "%OUT%" md "%OUT%"
 
-rem Stale log would make the verification below unprovable.
-if exist "%SRC%hook_call_log.txt" del /q "%SRC%hook_call_log.txt"
+rem Stale log would make the verification below unprovable. The DLL writes it
+rem next to itself, which is now the scratch output directory.
+if exist "%DLLOUT%hook_call_log.txt" del /q "%DLLOUT%hook_call_log.txt"
 
 rem ---- x64 -----------------------------------------------------------------
 call "%VC%\vcvars64.bat" >nul
 
-cl /nologo /LD /O2 /utf-8 "%SRC%TestHookDll.c" /link /DEF:"%SRC%TestHookDll.def" /OUT:"%SRC%TestHookDll-x64.dll"
+cl /nologo /Brepro /LD /O2 /utf-8 "%SRC%TestHookDll.c" /link /Brepro /DEF:"%SRC%TestHookDll.def" /OUT:"%DLLOUT%TestHookDll-x64.dll"
 if errorlevel 1 goto :fail
 
-cl /nologo /O2 /utf-8 "%SRC%TestLoad.c" /link /OUT:"%OUT%\TestLoad-x64.exe" /SUBSYSTEM:CONSOLE
+cl /nologo /Brepro /O2 /utf-8 "%SRC%TestLoad.c" /link /Brepro /OUT:"%OUT%\TestLoad-x64.exe" /SUBSYSTEM:CONSOLE
 if errorlevel 1 goto :fail
 
 echo.
 echo ---- verify x64 -------------------------------------------------------
-"%OUT%\TestLoad-x64.exe" "%SRC%TestHookDll-x64.dll"
+"%OUT%\TestLoad-x64.exe" "%DLLOUT%TestHookDll-x64.dll"
 if errorlevel 1 goto :fail
 
 rem ---- x86 -----------------------------------------------------------------
 call "%VC%\vcvars32.bat" >nul
 
-cl /nologo /LD /O2 /utf-8 "%SRC%TestHookDll.c" /link /DEF:"%SRC%TestHookDll.def" /OUT:"%SRC%TestHookDll-x86.dll"
+cl /nologo /Brepro /LD /O2 /utf-8 "%SRC%TestHookDll.c" /link /Brepro /DEF:"%SRC%TestHookDll.def" /OUT:"%DLLOUT%TestHookDll-x86.dll"
 if errorlevel 1 goto :fail
 
-cl /nologo /O2 /utf-8 "%SRC%TestLoad.c" /link /OUT:"%OUT%\TestLoad-x86.exe" /SUBSYSTEM:CONSOLE
+cl /nologo /Brepro /O2 /utf-8 "%SRC%TestLoad.c" /link /Brepro /OUT:"%OUT%\TestLoad-x86.exe" /SUBSYSTEM:CONSOLE
 if errorlevel 1 goto :fail
 
 echo.
 echo ---- verify x86 -------------------------------------------------------
-"%OUT%\TestLoad-x86.exe" "%SRC%TestHookDll-x86.dll"
+"%OUT%\TestLoad-x86.exe" "%DLLOUT%TestHookDll-x86.dll"
 if errorlevel 1 goto :fail
 
 rem ---- clean intermediates left next to the source -------------------------
@@ -105,20 +131,25 @@ echo.
 echo ============================================================
 echo   BUILD OK - both bitnesses built and verified
 echo.
+echo   Output: %DLLOUT%
+echo.
 echo   Inspect the exports by hand if you want:
-echo     dumpbin /exports TestHookDll-x64.dll
-echo     dumpbin /exports TestHookDll-x86.dll
+echo     dumpbin /exports "%DLLOUT%TestHookDll-x64.dll"
+echo     dumpbin /exports "%DLLOUT%TestHookDll-x86.dll"
 echo   Expected on both: InstallHook / Init / InstallConfig / InstallMulti
 echo   (an x86 build without the .def would show _InstallHook@4 etc.)
 echo.
-echo   The calls above also wrote %SRC%hook_call_log.txt
+echo   The calls above also wrote %DLLOUT%hook_call_log.txt
 echo   End-to-end injection (needs the injector built first):
 rem Do NOT join these two lines with a trailing caret: cmd would splice the
 rem literal word "echo" into the output. Two separate echo lines instead.
-echo     DllInjector-x64.exe -inject your_target.exe TestHookDll-x64.dll
+echo     DllInjector-x64.exe -inject your_target.exe "%DLLOUT%TestHookDll-x64.dll"
 rem Inside double quotes cmd does NOT consume a caret, so "a^|b" would print the
 rem caret literally. A plain | inside quotes is safe and prints as intended.
 echo         -export InstallConfig -exportarg "server=1.2.3.4|port=8080"
+echo.
+echo   To refresh the copies committed under test\TestHookDll\, rerun with
+echo     test\TestHookDll\build.bat --update-shipped
 echo ============================================================
 endlocal
 exit /b 0

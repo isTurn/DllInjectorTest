@@ -91,8 +91,8 @@ jobs:
         shell: cmd
         run: test\TestHookDll\build.bat
 
-      # 反射式注入素材。注意它会重写 test/TestHookDll/*.dll 之外的同名产物，
-      # 但输出目录就是它自己，不会影响上面两步。
+      # 反射式注入素材。产物同样落在 test_output\（脚本默认不再写源码目录），
+      # 所以与上面两步互不干扰。
       - name: Build reflective-injection material
         shell: cmd
         run: test\TestReflectiveDll\build.bat

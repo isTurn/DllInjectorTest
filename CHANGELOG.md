@@ -152,6 +152,10 @@
 - 「刷新」按钮点击时的空引用异常（对象未设置为对象实例）
 
 ### 变更
+- **测试素材的构建脚本不再写仓库里已提交的文件**：`test\TestHookDll\build.bat` 与 `test\TestReflectiveDll\build.bat` 原先把 4 个随仓库分发的样例 DLL 直接输出到源码目录（`/OUT:"%SRC%TestHookDll-x64.dll"`），于是每跑一次回归 `git status` 就多出 4 个 `M`——它们只差一个 PE 时间戳，没有任何源码变化，必须手工 `git checkout --` 才能复原，忘记复原就会误提交重新编译的二进制
+  - 默认输出改到 `test_output\`（与 `test\build_test.bat`、`test\TextHookDll\build.bat` 一致），仓库里那份保持不动；要刷新已提交的副本必须显式传 `--update-shipped`
+  - 顺带给两个脚本的每个 `cl` / `/link` 加 `/Brepro`：它把 PE 时间戳与 PDB 路径清零，因此同一条工具链下重复构建产出的字节完全一致。没有它，`--update-shipped` 每次都产生新 diff，「这份二进制到底改没改」永远无从判断
+  - 两个脚本现在都会打印实际输出目录；`test\TestReflectiveDll\build.bat` 的 `TestLoader-*.exe` 也一并落到 `test_output\`，而 `TestLoader.c` 是按自身所在目录推导默认 DLL 路径的，两者同目录，兄弟关系不受影响
 - **`.editorconfig` 与 `.gitattributes` 的行尾约定统一**：原 `[*] end_of_line = crlf` 与 `.gitattributes` 的 `*.cs/*.c/*.h/*.md text eol=lf` 冲突（编辑器按 crlf 保存、git 按 lf 检出，每次保存都产生纯换行 diff）。改为 `[*] end_of_line = lf`，并显式声明 `[*.{bat,cmd,ps1}] end_of_line = crlf`
 - **`.gitattributes` 给 `.editorconfig` / `.gitignore` / `.yml` / `.ini` / `.html` / `.py` 补上 `eol=lf`**：这些文件原先落在 `* text=auto` 之下，在 `core.autocrlf=true` 的 Windows 克隆里会被检出成 CRLF——与 `.editorconfig` 自己声明的 `lf` 相矛盾，`git diff` 还会刷一串 `LF will be replaced by CRLF the next time Git touches it` 警告。现在两处声明一致，`git status` 干净
 - **`.gitignore` 补上仓库根目录的 MSVC 中间文件**：`cl.exe` 把 `.obj` / `.exp` / `.lib` 写在**当前工作目录**（不是源码旁边），从仓库根跑一次编译就会在根目录留下六个文件，而原有规则是 `test/**/*.obj`，盖不住根目录。新增 `/*.obj` `/*.exp` `/*.lib` 等

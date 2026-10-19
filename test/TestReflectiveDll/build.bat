@@ -2,15 +2,33 @@
 rem ============================================================================
 rem  Build the reflective DLL test material (self-contained ReflectiveLoader).
 rem
-rem  Output (next to the sources):
+rem  Output (default: test_output\, NOT next to the sources):
 rem    TestReflectiveDll-x64.dll
 rem    TestReflectiveDll-x86.dll
 rem    TestLoader-x64.exe          (in-process validator for the x64 DLL)
 rem    TestLoader-x86.exe          (in-process validator for the x86 DLL)
 rem
+rem  Why test_output\ instead of the source directory: the two DLLs are
+rem  committed to the repository, so writing them in place made every build
+rem  dirty the working tree with binary diffs that carry no source change --
+rem  just a fresh PE timestamp. Regression runs then needed a
+rem  "git checkout -- test/TestReflectiveDll/*.dll" afterwards.
+rem
+rem  TestLoader resolves its default DLL path from its own directory, so keeping
+rem  both in test_output\ preserves that sibling relationship.
+rem
+rem  To deliberately refresh the committed DLLs (only a maintainer shipping a
+rem  new sample build needs this), pass --update-shipped:
+rem
+rem    test\TestReflectiveDll\build.bat --update-shipped
+rem
 rem  Notes:
 rem    - Paths are derived from this script's own location, so the repository
 rem      can live anywhere.
+rem    - /Brepro makes the output byte-identical across rebuilds with the same
+rem      toolchain (it zeroes the PE timestamp and the PDB path). Without it,
+rem      two consecutive builds of the same source differ, so "did the shipped
+rem      binary actually change?" cannot be answered from a diff.
 rem    - The Visual Studio installation is located with vswhere.exe, so any
 rem      edition (Community / Professional / Enterprise) and any install path
 rem      works, as long as the C++ build tools are installed.
@@ -20,7 +38,12 @@ rem ============================================================================
 
 setlocal
 set "SRC=%~dp0"
-set "OUT=%SRC%"
+set "OUT=%~dp0..\..\test_output"
+
+rem Where the DLLs land. Default is the scratch output directory; the committed
+rem copies under the source tree are only rewritten on request.
+set "DLLOUT=%OUT%\"
+if /i "%~1"=="--update-shipped" set "DLLOUT=%SRC%"
 
 rem cl / ml write .obj next to the SOURCE file, not next to the script, but
 rem the linker resolves the /link /OUT: paths and the .obj argument relative to
@@ -54,22 +77,25 @@ if not exist "%VC%\vcvars64.bat" (
 )
 echo [INFO] Visual Studio: %VSPATH%
 echo [INFO] source        : %SRC%
+echo [INFO] output        : %DLLOUT%
 echo.
+
+if not exist "%OUT%" md "%OUT%"
 
 rem ---- x64 -----------------------------------------------------------------
 call "%VC%\vcvars64.bat" >nul
 ml64 /nologo /c "%SRC%ReflectiveLoader_x64.asm" || goto :fail
-cl /nologo /utf-8 /LD /O2 "%SRC%TestReflectiveDll.c" "%SRC%ReflectiveLoader_x64.obj" /link /OUT:"%OUT%TestReflectiveDll-x64.dll" /DEF:"%SRC%Reflective.def"
+cl /nologo /Brepro /utf-8 /LD /O2 "%SRC%TestReflectiveDll.c" "%SRC%ReflectiveLoader_x64.obj" /link /Brepro /OUT:"%DLLOUT%TestReflectiveDll-x64.dll" /DEF:"%SRC%Reflective.def"
 if errorlevel 1 goto :fail
-cl /nologo /utf-8 /O2 "%SRC%TestLoader.c" /link /OUT:"%OUT%TestLoader-x64.exe" /SUBSYSTEM:CONSOLE
+cl /nologo /Brepro /utf-8 /O2 "%SRC%TestLoader.c" /link /Brepro /OUT:"%OUT%\TestLoader-x64.exe" /SUBSYSTEM:CONSOLE
 if errorlevel 1 goto :fail
 
 rem ---- x86 -----------------------------------------------------------------
 call "%VC%\vcvars32.bat" >nul
 ml /nologo /c "%SRC%ReflectiveLoader_x86.asm" || goto :fail
-cl /nologo /utf-8 /LD /O2 "%SRC%TestReflectiveDll.c" "%SRC%ReflectiveLoader_x86.obj" /link /OUT:"%OUT%TestReflectiveDll-x86.dll" /DEF:"%SRC%Reflective.def"
+cl /nologo /Brepro /utf-8 /LD /O2 "%SRC%TestReflectiveDll.c" "%SRC%ReflectiveLoader_x86.obj" /link /Brepro /OUT:"%DLLOUT%TestReflectiveDll-x86.dll" /DEF:"%SRC%Reflective.def"
 if errorlevel 1 goto :fail
-cl /nologo /utf-8 /O2 "%SRC%TestLoader.c" /link /OUT:"%OUT%TestLoader-x86.exe" /SUBSYSTEM:CONSOLE
+cl /nologo /Brepro /utf-8 /O2 "%SRC%TestLoader.c" /link /Brepro /OUT:"%OUT%\TestLoader-x86.exe" /SUBSYSTEM:CONSOLE
 if errorlevel 1 goto :fail
 
 rem ---- clean intermediates -------------------------------------------------
@@ -77,9 +103,13 @@ del /q "%SRC%*.obj" "%SRC%*.exp" "%SRC%*.lib" 2>nul
 
 echo BUILD_DONE
 echo.
+echo  Output: %DLLOUT%
 echo  Validate in-process (writes C:\Windows\Temp\rfi_call_log.txt on success):
-echo    %OUT%TestLoader-x64.exe
-echo    %OUT%TestLoader-x86.exe
+echo    "%OUT%\TestLoader-x64.exe"
+echo    "%OUT%\TestLoader-x86.exe"
+echo.
+echo  To refresh the copies committed under test\TestReflectiveDll\, rerun with
+echo    test\TestReflectiveDll\build.bat --update-shipped
 endlocal
 exit /b 0
 

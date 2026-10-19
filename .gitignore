@@ -61,10 +61,13 @@ test_output/
 # test/TestReflectiveDll/TestReflectiveDll-*.dll) are intentionally shipped with
 # the repository, so they are deliberately NOT ignored here.
 #
-# The validator executables next to them are NOT shipped: TestLoader-*.exe is
-# rebuilt by test\TestReflectiveDll\build.bat on every run, and nothing consumes
-# the committed copy (CI builds it, local runs build it). Committing them would
-# only add a fresh binary diff to every build.
+# The validator executables are NOT shipped either: TestLoader-*.exe is rebuilt
+# by test\TestReflectiveDll\build.bat into test_output\ on every run.
+#
+# Both build scripts default to writing into test_output\ and only refresh the
+# committed copies above when given an explicit "--update-shipped" argument, so a
+# regression run leaves the working tree clean instead of producing four binary
+# diffs (pure PE timestamps) that would otherwise have to be reverted by hand.
 test/**/*.obj
 test/**/*.exp
 test/**/*.lib

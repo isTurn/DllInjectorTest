@@ -83,22 +83,45 @@ static void DirOf(const wchar_t* path, wchar_t* out, size_t cch)
 }
 
 // 把整份文件读进内存（二进制），返回 malloc 的缓冲区，调用方 free
+//
+// 用 Win32 而不是 _wfopen_s 的原因：DLL 的写线程是「每条日志一次
+// fopen("ab")/fwrite/fclose」，它持有文件的瞬间，CRT 的 fopen 会撞上共享冲突。
+// MSVC 把 ERROR_SHARING_VIOLATION 映射成 EACCES(errno 13)，于是我们会偶尔读出
+// 「文件不存在」。以前 Sleep(1200) 把这段时间盖住了，改成轮询之后立刻暴露。
+// 这里显式要求 FILE_SHARE_READ|WRITE，并在共享冲突时重试几次，把这个窗口吃干净。
 static char* ReadWholeFile(const wchar_t* path, size_t* pSize)
 {
-    FILE* f = NULL;
-    if (_wfopen_s(&f, path, L"rb") != 0 || !f) return NULL;
+    HANDLE h = INVALID_HANDLE_VALUE;
+    for (int tries = 0; tries < 20; tries++)
+    {
+        h = CreateFileW(path, GENERIC_READ,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h != INVALID_HANDLE_VALUE) break;
+        DWORD e = GetLastError();
+        if (e != ERROR_SHARING_VIOLATION) return NULL;   // 真不存在就别重试
+        Sleep(10);
+    }
+    if (h == INVALID_HANDLE_VALUE) return NULL;
 
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
-    long sz = ftell(f);
-    if (sz < 0) { fclose(f); return NULL; }
-    rewind(f);
+    LARGE_INTEGER li;
+    if (!GetFileSizeEx(h, &li)) { CloseHandle(h); return NULL; }
+    if (li.QuadPart < 0 || li.QuadPart > 64 * 1024 * 1024) { CloseHandle(h); return NULL; }
 
-    char* buf = (char*)malloc((size_t)sz + 1);
-    if (!buf) { fclose(f); return NULL; }
+    size_t sz = (size_t)li.QuadPart;
+    char* buf = (char*)malloc(sz + 1);
+    if (!buf) { CloseHandle(h); return NULL; }
 
-    size_t rd = fread(buf, 1, (size_t)sz, f);
+    size_t rd = 0;
+    while (rd < sz)
+    {
+        DWORD chunk = 0;
+        if (!ReadFile(h, buf + rd, (DWORD)(sz - rd), &chunk, NULL) || chunk == 0) break;
+        rd += chunk;
+    }
+    CloseHandle(h);
+
     buf[rd] = 0;
-    fclose(f);
     if (pSize) *pSize = rd;
     return buf;
 }
@@ -256,6 +279,52 @@ static int CountIatSlotsInsideDll(HMODULE hDll)
     return leaked;
 }
 
+// 这两个全局状态被 WaitLog / HasLeakedSlots 用到，所以必须声明在使用点之前
+static const wchar_t* g_logPath       = NULL;
+static HMODULE        g_hDllUnderTest = NULL;
+
+// 「还有槽没还原」——给 WaitWhileTrue 当回调用。
+// 注意 CountIatSlotsInsideDll 的三态：0 = 干净，-1 = 取不到 DLL 范围，>0 = 泄漏数。
+// -1 也算「不正常」，所以判据是 != 0；否则取不到范围时会被当成已还原。
+static int HasLeakedSlots(void)
+{
+    return CountIatSlotsInsideDll(g_hDllUnderTest) != 0;
+}
+
+// ---------------------------------------------------------------------------
+// 等待日志落盘
+//
+// 为什么不再用固定 Sleep：写线程是「队列一有东西就 SetEvent 立刻醒」的，
+// 一行文本从入队到 fclose 通常只要几毫秒。原来的 Sleep(700) / Sleep(1200)
+// 把最坏情况当成了常态，8 个场景累积下来就是几十秒纯等待——跑一轮全量回归
+// 一半时间花在 Sleep 上。这里改成轮询：正常情况下立刻返回，超时预算还是
+// 原来那个量，所以「等不到」的语义没变。
+// ---------------------------------------------------------------------------
+
+static int WaitLog(const char* needle, int timeoutMs)
+{
+    DWORD start = GetTickCount();
+    for (;;)
+    {
+        size_t sz = 0;
+        char* log = ReadWholeFile(g_logPath, &sz);
+        int found = (log && needle && strstr(log, needle)) ? 1 : 0;
+        free(log);
+        if (found) return 1;
+        if ((int)(GetTickCount() - start) >= timeoutMs) return 0;
+        Sleep(20);
+    }
+}
+
+// 等某个条件成立（用于「卸载后 IAT 必须还原」这类不需要读日志的检查）。
+// g_Unhook 内部会同步等写线程和管道线程退出，正常情况下返回时就已经还原了；
+// 留这个短窗口只是不想让断言依赖那个实现细节。
+static void WaitWhileTrue(int (*stillBad)(void), int timeoutMs)
+{
+    DWORD start = GetTickCount();
+    while (stillBad() && (int)(GetTickCount() - start) < timeoutMs) Sleep(20);
+}
+
 // ---------------------------------------------------------------------------
 // 场景
 // ---------------------------------------------------------------------------
@@ -269,9 +338,6 @@ typedef struct {
     int            expectWide;        // 是否应抓到 kWideOnlyFromTextOutW
 } Scenario;
 
-static const wchar_t* g_logPath     = NULL;
-static HMODULE        g_hDllUnderTest = NULL;
-
 // 跑一个场景：清日志 -> 装钩子 -> 输出文本 -> 查日志 -> 卸钩子
 static void RunScenario(const Scenario* sc)
 {
@@ -283,8 +349,10 @@ static void RunScenario(const Scenario* sc)
     DWORD rc = g_InstallConfig((LPVOID)sc->cfg);
     Check(rc > 0, "InstallConfig 返回成功");
 
-    // 等启动横幅落盘（写线程是独立线程，最快 500ms 一轮）
-    Sleep(700);
+    // 等启动横幅整组落盘。锚点选「动态取址：」这一行，因为它固定排在
+    // 逐目标报告行之后——只等「已安装 profile=」会在多线程抢跑时提前返回，
+    // 后面的「N 个模块 / N 个槽」还没刷出来，断言就会误判成「没挂上」。
+    WaitLog("动态取址：", 3000);
 
     size_t sz = 0;
     char* log = ReadWholeFile(g_logPath, &sz);
@@ -298,16 +366,16 @@ static void RunScenario(const Scenario* sc)
 
     free(log);
 
-    // 输出文本，再等写线程刷出去
-    EmitAllText();
-    Sleep(1200);
-
-    log = ReadWholeFile(g_logPath, &sz);
-    if (!log) { Check(0, "重新读取 texthook_log.txt"); return; }
-
     char utf8Hello[128], utf8Wide[128];
     ToUtf8(kExpectHello, utf8Hello, sizeof(utf8Hello));
     ToUtf8(kWideOnlyFromTextOutW, utf8Wide, sizeof(utf8Wide));
+
+    // 输出文本，然后等**最后**一个应当被捕获的文本落盘（宽字符排在后面）
+    EmitAllText();
+    WaitLog(sc->expectWide ? utf8Wide : utf8Hello, 3000);
+
+    log = ReadWholeFile(g_logPath, &sz);
+    if (!log) { Check(0, "重新读取 texthook_log.txt"); return; }
 
     if (sc->expectHello) {
         Check(LogContains(log, utf8Hello), "抓到 TextOutA 的 SJIS 文本并正确转成 UTF-8");
@@ -325,7 +393,7 @@ static void RunScenario(const Scenario* sc)
 
     DWORD uh = g_Unhook(NULL);
     (void)uh;   // 恒返回 1，单看它证明不了什么，真正的验证在下面
-    Sleep(400);
+    WaitWhileTrue(HasLeakedSlots, 2000);
 
     // 卸载是否真的生效：主 EXE 的 IAT 槽不应再指向 DLL 内部。
     // 这条检查就是用来抓「主 EXE 被重复挂钩 → 卸载时把槽还原成替换函数」的。
@@ -360,7 +428,7 @@ static void RunDynamicScenario(void)
     static const wchar_t cfg[] = L"engine=generic-gdi|cp=932|dedup=0|log=1";
     DWORD rc = g_InstallConfig((LPVOID)cfg);
     Check(rc > 0, "InstallConfig 返回成功（动态取址场景）");
-    Sleep(700);
+    WaitLog("动态取址：", 3000);
 
     // 装好钩子后再取一次：必须被重定向到 DLL 内部
     void* dynTextOutA = (void*)GetProcAddress(hGdi, "TextOutA");
@@ -390,7 +458,11 @@ static void RunDynamicScenario(void)
         ReleaseDC(NULL, hScreen);
     }
 
-    Sleep(1200);
+    {
+        char waitHello[128];
+        ToUtf8(kExpectHello, waitHello, sizeof(waitHello));
+        WaitLog(waitHello, 3000);
+    }
     size_t sz = 0;
     char* log = ReadWholeFile(g_logPath, &sz);
     if (log) {
@@ -407,7 +479,7 @@ static void RunDynamicScenario(void)
     }
 
     g_Unhook(NULL);
-    Sleep(400);
+    WaitWhileTrue(HasLeakedSlots, 2000);
 
     // 卸载后必须还原：GetProcAddress 又要返回真实地址
     void* afterTextOutA = (void*)GetProcAddress(hGdi, "TextOutA");
@@ -443,7 +515,7 @@ static void RunGenericScenario(const wchar_t* iniGeneric)
 
     DWORD rc = g_InstallConfig((LPVOID)cfg);
     Check(rc > 0, "InstallConfig 返回成功（通用转发器场景）");
-    Sleep(700);
+    WaitLog("动态取址：", 3000);
 
     size_t sz = 0;
     char* log = ReadWholeFile(g_logPath, &sz);
@@ -473,11 +545,12 @@ static void RunGenericScenario(const wchar_t* iniGeneric)
     DeleteDC(hMem);
     ReleaseDC(NULL, hScreen);
 
-    Sleep(1200);
+    char utf8Hello[128];
+    ToUtf8(kExpectHello, utf8Hello, sizeof(utf8Hello));
+    WaitLog(utf8Hello, 3000);
+
     log = ReadWholeFile(g_logPath, &sz);
     if (log) {
-        char utf8Hello[128];
-        ToUtf8(kExpectHello, utf8Hello, sizeof(utf8Hello));
         Check(LogContains(log, utf8Hello),
               "通用转发器按 text=4 / len=5 正确取到文本并转成 UTF-8");
 
@@ -493,7 +566,7 @@ static void RunGenericScenario(const wchar_t* iniGeneric)
     }
 
     g_Unhook(NULL);
-    Sleep(400);
+    WaitWhileTrue(HasLeakedSlots, 2000);
     Check(CountIatSlotsInsideDll(g_hDllUnderTest) == 0,
           "Unhook 后 IAT 已还原（通用转发器槽位也要还原干净）");
 }
@@ -526,7 +599,7 @@ static void RunSanitizeScenario(void)
 
     DWORD rc = g_InstallConfig((LPVOID)L"engine=generic-gdi|cp=932|dedup=0|log=1");
     Check(rc > 0, "InstallConfig 返回成功（控制字符场景）");
-    Sleep(700);
+    WaitLog("动态取址：", 3000);
 
     HDC     hScreen = GetDC(NULL);
     HDC     hMem    = CreateCompatibleDC(hScreen);
@@ -538,7 +611,7 @@ static void RunSanitizeScenario(void)
     DeleteDC(hMem);
     ReleaseDC(NULL, hScreen);
 
-    Sleep(1200);
+    WaitLog("こんにちは", 3000);
 
     size_t sz = 0;
     char* log = ReadWholeFile(g_logPath, &sz);
@@ -585,7 +658,7 @@ static void RunSanitizeScenario(void)
     free(log);
 
     g_Unhook(NULL);
-    Sleep(400);
+    WaitWhileTrue(HasLeakedSlots, 2000);
     Check(CountIatSlotsInsideDll(g_hDllUnderTest) == 0,
           "Unhook 后 IAT 已还原（控制字符场景）");
 }

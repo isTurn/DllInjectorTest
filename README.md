@@ -465,6 +465,21 @@ test\DllInjectorE2E\build.bat --x86  :: 同上，按 32 位跑（测试主机位
 > 否则每跑一次都会因为 PE 头里的时间戳而变化，`git status` 永远脏，
 > 「这份二进制到底改没改」也无从判断。
 
+> **输入没变时整段跳过。** 每个脚本开头都会把「自己的输入清单」算成一份内容指纹
+> （`test/_uptodate.bat`，逐个文件取 SHA1 后顺序拼接），指纹与上次成功构建一致、
+> 且产物都还在，就直接打印 `[SKIP] ... nothing to do.` 退出，不编译也不跑验证。
+> 一轮全量回归因此从约 78 秒降到几秒（`test\TextHookDll\build.bat` 除外：它一旦真跑
+> 就是 15 秒左右，因为验证要连管道、还要真的挂钩再卸载）。
+>
+> 判断用**内容哈希，不用时间戳**：`dir /o-d` 跨目录取最新文件会漏项、顺序也不对
+> （实测 4 个输入只输出 3 个），而时间戳更无法回答「编译选项改过没有」。
+> 所以输入清单里也放了脚本自身 `%~f0`——把 `/O2` 改成 `/O1` 同样会触发重建。
+>
+> 三种情况一定会重建：输入改了；产物被删了（`have` 会先查产物是否还在，
+> 因为指纹只覆盖输入）；`--force` 或 `--update-shipped`。
+> 指纹只在验证**通过之后**才 `commit` 转正，所以一次失败的构建不会留下
+> 「产物已是最新」的假记录。
+
 ### 在受限网络下同步仓库（GitHub API）
 
 某些环境里 `github.com:443` 不通（`git fetch` / `git push` 报
@@ -536,7 +551,8 @@ DllInjectorTest/
 │   │   └── TestTextTarget.c     #   可传 sjis（默认）/ gbk 选择 *A 系列编码，需与 cp= 配对
 │   ├── TestDll/                 # 自测用注入 DLL 源码（DllMain 写标记文件验证，支持前缀宏区分多 DLL）
 │   ├── TestTarget/              # 自测用目标程序源码（支持命令行参数回显）
-│   └── build_test.bat           # 编译测试素材的脚本（MSVC，自动定位 Visual Studio）
+│   ├── build_test.bat           # 编译测试素材的脚本（MSVC，自动定位 Visual Studio）
+│   └── _uptodate.bat            # 输入指纹助手：内容没变就跳过重建（各 build.bat 共用）
 ├── docs/
 │   ├── index.html               # GitHub Pages 展示页
 │   └── text-hook-design.md      # 多引擎文本 Hook 适配架构设计

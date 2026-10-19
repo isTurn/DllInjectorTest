@@ -263,11 +263,36 @@ static void FileLogLine(const char* utf8Line)
     if (slash) *(slash + 1) = 0;
     swprintf_s(file, MAX_PATH, L"%stexthook_log.txt", dir);
 
-    // 以二进制追加写原始 UTF-8 字节（不能用 ccs=UTF-8，那是给宽字符准备的）
-    FILE* f = NULL;
-    if (_wfopen_s(&f, file, L"ab") != 0 || !f) return;
-    fwrite(utf8Line, 1, strlen(utf8Line), f);
-    fclose(f);
+    // 以二进制追加写原始 UTF-8 字节（不能用 ccs=UTF-8，那是给宽字符准备的）。
+    //
+    // 用 CreateFileW 而不是 _wfopen_s("ab")，有两个必须的理由：
+    //   1) 共享冲突。._wfopen_s 默认以「独占」方式打开，任何别的进程正开着
+    //      这个日志（tail、编辑器、我们的验证程序）时，fopen 直接失败，而
+    //      下面的分支会**静默丢掉这一行**——表现为日志里少一条启动横幅，
+    //      看起来像「钩子没装上」。加 FILE_SHARE_READ|WRITE 就没有这个问题。
+    //   2) 便于重试。偶尔撞上真的独占者时，重试几次比丢一行要好。
+    // FILE_APPEND_DATA 已经是原子追加语义，不需要再 SeekToEnd。
+    HANDLE h = INVALID_HANDLE_VALUE;
+    for (int tries = 0; tries < 5; tries++)
+    {
+        h = CreateFileW(file, FILE_APPEND_DATA | SYNCHRONIZE,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h != INVALID_HANDLE_VALUE) break;
+        if (GetLastError() != ERROR_SHARING_VIOLATION) return;
+        Sleep(10);
+    }
+    if (h == INVALID_HANDLE_VALUE) return;
+
+    size_t len = strlen(utf8Line);
+    size_t done = 0;
+    while (done < len)
+    {
+        DWORD chunk = 0;
+        if (!WriteFile(h, utf8Line + done, (DWORD)(len - done), &chunk, NULL) || chunk == 0) break;
+        done += chunk;
+    }
+    CloseHandle(h);
 }
 
 // ---------------------------------------------------------------------------

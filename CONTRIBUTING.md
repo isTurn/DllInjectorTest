@@ -29,6 +29,11 @@ test\build_test.bat
 test\ManualMap\build_shellcode.bat
 ```
 
+> 各 `build.bat` 开头都有一道**增量门**（共用 `test/_uptodate.bat`）：把自身输入清单算成
+> 内容指纹（逐文件 SHA1 顺序拼接），和上次成功构建一致且产物都在，就打印
+> `[SKIP] ... nothing to do.` 直接退出。改过输入、删过产物、或带 `--force` 才会真的重建。
+> 因此重复跑全量回归不会反复重新编译没动过的东西。
+
 `build.bat` 产物：
 
 | 路径 | 说明 |
@@ -103,6 +108,8 @@ docs/index.html              GitHub Pages 展示页
       `test\DllInjectorE2E\build.bat` 与 `test\DllInjectorE2E\build.bat --x86` 都要通过 ——
       它真的建进程、真的注入、真的调导出、真的卸载，纯函数测试看不见这条链路
 - [ ] 若改过 `test\ManualMap\*.asm`，跑过 `test\ManualMap\build_shellcode.bat`（会自动回填字节数组）
+- [ ] 若改了 `test/` 下的构建脚本或 C 源码，留意增量门的输入清单（`_uptodate.bat check` 后面那串）——
+      新增一个源文件却不加进清单，脚本会在源码变动后错误地跳过重建
 - [ ] `README.md` / `docs/index.html` / `CHANGELOG.md` 中受影响的内容已同步更新
 - [ ] 没有提交构建产物与运行时文件（`out/`、`dist/`、`bin/`、`obj/`、`test_output/`、`*.obj`、`inject_log.txt`、`DllInjector.config` 等，见 `.gitignore`）
 - [ ] 没有为了「顺手」而重构无关代码（请让 PR 保持聚焦）

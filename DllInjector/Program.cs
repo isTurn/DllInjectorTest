@@ -1678,7 +1678,10 @@ namespace DllInjector
             if (!string.IsNullOrEmpty(exportFunc) && injected.Count > 0)
             {
                 if (method == NativeMethods.INJECT_APC)
-                    log("提示: QueueUserAPC 为异步加载，DLL 可能尚未加载完成，导出函数调用可能失败。");
+                {
+                    // 先等 APC 把 DLL 真正装进去，否则导出函数必定拿不到模块基址
+                    WaitApcloaded(pi.dwProcessId, injected.ToArray(), log);
+                }
                 if (method == NativeMethods.INJECT_RFI)
                     log("提示: 反射式注入不自动调用导出函数（反射 DLL 不进入进程模块列表，且 Loader 返回句柄经线程退出码截断无法可靠定位），初始化请由 DLL 在 ReflectiveLoader / DllMain 内自行完成。");
                 else
@@ -2919,32 +2922,75 @@ namespace DllInjector
             return new IntPtr(code);
         }
 
+        /// <summary>
+        /// 静默查询目标进程模块列表里这个 DLL 的基址（不打日志），未加载返回 <see cref="IntPtr.Zero"/>。
+        /// 单独抽出来是为了让 APC 等待能安静地轮询——那里每 100ms 打一条日志只会刷屏。
+        /// 返回基址而不是 bool：核验那边要把基址写进日志，拿 bool 就得再枚举一遍。
+        /// </summary>
+        private static IntPtr FindModuleBaseByName(int pid, string dllPath)
+        {
+            string name = Path.GetFileName(dllPath);
+            try
+            {
+                using var proc = System.Diagnostics.Process.GetProcessById(pid);
+                foreach (System.Diagnostics.ProcessModule m in proc.Modules)
+                {
+                    try
+                    {
+                        if (string.Equals(Path.GetFileName(m.FileName), name, StringComparison.OrdinalIgnoreCase))
+                            return m.BaseAddress;
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+            return IntPtr.Zero;
+        }
+
+        /// <summary>
+        /// 等待 APC 队列里的 LoadLibraryW 真正执行完。
+        ///
+        /// QueueUserAPC 是异步的：恢复主线程只是让 APC “可以”执行，真正跑起来要等目标主线程
+        /// 进入可告警等待（SleepEx / WaitForSingleObjectEx / GetMessage 消息循环）。
+        /// 不等就直接调导出函数，会撞上“模块还没加载”：注入器先打一行
+        /// “未找到已加载的模块”的错误，紧接着核验又报“核验通过”——两条互相矛盾的输出。
+        /// 这不是测试间歇性问题，而是产品对异步路径的常识性忽视。
+        /// </summary>
+        private static bool WaitApcloaded(int pid, string[] dlls, Action<string> log, int timeoutMs = 3000)
+        {
+            bool allSeen = true;
+            foreach (var dll in dlls)
+            {
+                string name = Path.GetFileName(dll);
+                bool seen = false;
+                int waited = 0;
+                for (; waited < timeoutMs && !seen; waited += 100)
+                {
+                    if (FindModuleBaseByName(pid, dll) != IntPtr.Zero) { seen = true; break; }
+                    System.Threading.Thread.Sleep(100);
+                }
+                if (seen)
+                    log($"APC 已执行：{name} 已加载（等了约 {waited}ms），可以调导出函数。");
+                else
+                {
+                    log($"警告: 等待 {timeoutMs}ms 后 {name} 仍未加载（目标主线程可能不在可告警等待）。");
+                    allSeen = false;
+                }
+            }
+            return allSeen;
+        }
+
         /// <summary>注入结果核验：按文件名在目标进程模块列表中查找（带重试容忍枚举时序延迟）</summary>
         public static bool VerifyModuleLoaded(int pid, string dllPath, Action<string> log)
         {
             string name = Path.GetFileName(dllPath);
             for (int attempt = 0; attempt < 3; attempt++)
             {
-                try
+                IntPtr baseAddr = FindModuleBaseByName(pid, dllPath);
+                if (baseAddr != IntPtr.Zero)
                 {
-                    using var proc = System.Diagnostics.Process.GetProcessById(pid);
-                    foreach (System.Diagnostics.ProcessModule m in proc.Modules)
-                    {
-                        try
-                        {
-                            if (string.Equals(Path.GetFileName(m.FileName), name, StringComparison.OrdinalIgnoreCase))
-                            {
-                                log($"核验通过：{name} 已在目标进程模块列表（基址 0x{m.BaseAddress.ToInt64():X}）。");
-                                return true;
-                            }
-                        }
-                        catch { }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    log("警告: 无法枚举目标进程模块（权限不足？）" + ex.Message);
-                    return false;
+                    log($"核验通过：{name} 已在目标进程模块列表（基址 0x{baseAddr.ToInt64():X}）。");
+                    return true;
                 }
                 System.Threading.Thread.Sleep(300);
             }

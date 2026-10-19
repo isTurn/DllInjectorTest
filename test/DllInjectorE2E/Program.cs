@@ -74,16 +74,38 @@ namespace DllInjectorE2E
             return null;
         }
 
-        /// <summary>等目标进程把 args_&lt;pid&gt;.txt 写出来（它启动后的第一件事），最多等 ms 毫秒。</summary>
+        /// <summary>
+        /// 本轮测试开始时刻。目标进程写的 marker 文件按 PID 命名，而 PID 会被复用：
+        /// 上一轮留下的 args_&lt;pid&gt;.txt 会让"文件已存在"这类判断立刻为真，读到的是旧内容。
+        /// 实测 test_output 里攒了 354 个历史 marker，于是"参数原样到达"这条断言
+        /// 每十几次就失败一次，看起来像注入器丢了引号，其实读的是别人的文件。
+        /// </summary>
+        private static DateTime _runStartUtc;
+
+        /// <summary>
+        /// 等目标进程写出 marker 文件，最多等 ms 毫秒。
+        /// 不只看"存在"，还要看修改时间晚于本轮开始——否则会命中上一轮的同名旧文件。
+        /// </summary>
         private static bool WaitForFile(string path, int ms)
         {
             var sw = Stopwatch.StartNew();
             while (sw.ElapsedMilliseconds < ms)
             {
-                if (File.Exists(path)) return true;
+                if (IsFresh(path)) return true;
                 Thread.Sleep(50);
             }
-            return File.Exists(path);
+            return IsFresh(path);
+        }
+
+        private static bool IsFresh(string path)
+        {
+            try
+            {
+                if (!File.Exists(path)) return false;
+                // 容 2 秒的时钟粒度/写入延迟，正常运行不会撞上这个窗口
+                return File.GetLastWriteTimeUtc(path) >= _runStartUtc.AddSeconds(-2);
+            }
+            catch { return false; }
         }
 
         /// <summary>杀进程并等它真的消失（否则下一个用例可能撞上还没退干净的旧 PID）。</summary>
@@ -98,6 +120,51 @@ namespace DllInjectorE2E
                 }
             }
             catch { /* 已经退了，正好 */ }
+        }
+
+        /// <summary>
+        /// 把当前所有同名进程的 PID 记下来。
+        /// 存在的理由：InjectorCore.Run 内部自己 CreateProcess，返回时 pi.hProcess 已经关掉了，
+        /// 外部拿不到 PID，没法收尾。只能用「跑之前快照、跑完之后杀掉新增的那些」这种笨办法。
+        /// </summary>
+        private static HashSet<int> SnapshotIds(string procName)
+        {
+            var ids = new HashSet<int>();
+            try
+            {
+                foreach (var p in Process.GetProcessesByName(procName))
+                {
+                    ids.Add(p.Id);
+                    p.Dispose();
+                }
+            }
+            catch { }
+            return ids;
+        }
+
+        /// <summary>
+        /// 跑一次 Run，然后杀掉这次新起的目标进程。
+        ///
+        /// 这不是洁癖：目标 exe 留在那里不退出，下一次 build_test.bat 链接时就会
+        /// LNK1104「无法打开文件 Target_x64.exe」——链接器没法覆盖正在运行的映像。
+        /// 早期版本忘了收尾，跑几轮全量回归之后 test_output 里能攒下二十个僵尸进程。
+        /// </summary>
+        private static bool RunAndReap(string target, string[] dlls, string args, int method,
+                                       string exportFunc, string exportArg, Action<string> log)
+        {
+            string procName = Path.GetFileNameWithoutExtension(target);
+            HashSet<int> before = SnapshotIds(procName);
+            try
+            {
+                return InjectorCore.Run(target, dlls, args, method, exportFunc, exportArg, log);
+            }
+            finally
+            {
+                foreach (int pid in SnapshotIds(procName))
+                {
+                    if (!before.Contains(pid)) KillAndWait(pid);
+                }
+            }
         }
 
         private static bool ModuleLoaded(int pid, string dllPath)
@@ -119,6 +186,7 @@ namespace DllInjectorE2E
         private static int Main()
         {
             try { Console.OutputEncoding = System.Text.Encoding.UTF8; } catch { }
+            _runStartUtc = DateTime.UtcNow;
 
             Console.WriteLine("================================================");
             Console.WriteLine(" DllInjector 端到端测试");
@@ -146,6 +214,14 @@ namespace DllInjectorE2E
                 return 1;
             }
 
+            // 顺手清掉历次运行留下的 marker（按 PID 命名，会一直累积）。
+            // 它们本身不再影响判断（WaitForFile 会看修改时间），但留着只会让人怀疑"这是谁的"。
+            try
+            {
+                foreach (var f in Directory.GetFiles(outDir, "args_*.txt")) File.Delete(f);
+            }
+            catch { }
+
             // ManualMap 会把基址记进 DllInjector.mmmap（优先注入器同目录）。测试里先把
             // 记录清空，避免上一次失败的残留让「卸载」那步走错分支。
             InjectorCore.LoadMmMap();
@@ -160,7 +236,7 @@ namespace DllInjectorE2E
                 {
                     if (File.Exists(hookLog)) File.Delete(hookLog);
                     var log = new LogSink();
-                    bool ok = InjectorCore.Run(target, new[] { hookDll }, "", NativeMethods.INJECT_CRT,
+                    bool ok = RunAndReap(target, new[] { hookDll }, "", NativeMethods.INJECT_CRT,
                         "InstallHook", "E2E-CRT", log.Write);
                     Check(ok, "Run 返回成功");
                     Check(log.Has("注入流程完成"), "日志出现「注入流程完成」");
@@ -185,7 +261,7 @@ namespace DllInjectorE2E
                 {
                     if (File.Exists(hookLog)) File.Delete(hookLog);
                     var log = new LogSink();
-                    bool ok = InjectorCore.Run(target, new[] { hookDll }, "", NativeMethods.INJECT_NTC,
+                    bool ok = RunAndReap(target, new[] { hookDll }, "", NativeMethods.INJECT_NTC,
                         "InstallHook", "E2E-NTC", log.Write);
                     Check(ok, "Run 返回成功");
                     Check(log.Has("注入流程完成"), "日志出现「注入流程完成」");
@@ -209,7 +285,7 @@ namespace DllInjectorE2E
                 {
                     if (File.Exists(hookLog)) File.Delete(hookLog);
                     var log = new LogSink();
-                    bool ok = InjectorCore.Run(target, new[] { hookDll }, "", NativeMethods.INJECT_APC,
+                    bool ok = RunAndReap(target, new[] { hookDll }, "", NativeMethods.INJECT_APC,
                         "InstallHook", "E2E-APC", log.Write);
                     Check(ok, "Run 返回成功");
                     Check(log.Has("排队到目标主线程 APC"), "走了 APC 路径（而不是被降级）");
@@ -238,7 +314,7 @@ namespace DllInjectorE2E
                     // 测试自己写错了，不是产品错。
                     long before = File.Exists(rfiLog) ? new FileInfo(rfiLog).Length : 0;
                     var log = new LogSink();
-                    bool ok = InjectorCore.Run(target, new[] { rfiDll }, "", NativeMethods.INJECT_RFI,
+                    bool ok = RunAndReap(target, new[] { rfiDll }, "", NativeMethods.INJECT_RFI,
                         "Init", "", log.Write);
                     Check(ok, "Run 返回成功");
                     Check(log.Has("反射加载成功"), "日志出现「反射加载成功」");
@@ -269,7 +345,7 @@ namespace DllInjectorE2E
                     foreach (var kv in InjectorCore.MmBases) beforeKeys.Add(kv.Key);
 
                     var log = new LogSink();
-                    bool ok = InjectorCore.Run(target, new[] { rfiDll }, "", NativeMethods.INJECT_MM,
+                    bool ok = RunAndReap(target, new[] { rfiDll }, "", NativeMethods.INJECT_MM,
                         "", "", log.Write);
                     Check(ok, "Run 返回成功");
                     Check(log.Has("手动映射成功"), "日志出现「手动映射成功」");

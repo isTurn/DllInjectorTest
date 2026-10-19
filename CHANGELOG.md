@@ -13,6 +13,11 @@
   - 这个测试第一次跑就抓出了下面「修复」里的反射注入假成功
   - `build.bat` 默认跑 x64，`build.bat --x86` 跑 x86——测试主机位数必须与目标进程一致，所以位数是编译期选择而不是运行时参数
   - 输出目录按位数分成 `bin\x64\` / `bin\x86\` 并强制 `-t:Rebuild`：dotnet 的增量构建只看源码不看 `-p:PlatformTarget`，两个位数写进同一个 `bin\` 会静默复用上一次的程序集（实测 `--x86` 跑出来机器码仍是 `0x8664`，日志却写着「测试主机: 32 位」）
+- **测试素材构建脚本带增量门（`test/_uptodate.bat`）**：每个 `build.bat` 开头把自身输入清单算成一份**内容指纹**（逐文件 `certutil -hashfile ... SHA1` 后顺序拼接），指纹与上次成功构建一致且产物都还在，就打印 `[SKIP] ... nothing to do.` 直接退出，不编译也不跑验证
+  - 用**内容哈希而不是时间戳**：`dir /o-d` 跨目录取最新文件会漏项、顺序也不对（实测 4 个输入只输出 3 个），而时间戳更无法回答「编译选项改过没有」
+  - 输入清单里也放了脚本自身 `%~f0`：`/O2` 改成 `/O1` 同样会触发重建
+  - 两道保守措施：`have` 先查产物是否还在（指纹只覆盖输入，删掉 `test_output\` 不能让 stamp 说产物还是最新的）；指纹先写入 `<name>.fp.new`，**只有验证通过后 `commit` 才转正**，一次失败的构建不会留下假记录
+  - `--force` / `--update-shipped` 强制重建；全量回归冷态 77.8 秒 → 热态几秒
 - **CLI `-status <pid> [dll...] [-pipe <名称>]`**：只读查询，不动目标进程。打印进程位数与是否与本注入器匹配、指定 DLL 是否已在模块列表（给出基址）、手动映射记录是否有效（`DllInjector.mmmap` 里的基址，PID 被复用过的会判失效并说明原因）、文本 Hook 的命名管道是否在线
   - 管道状态用 `WaitNamedPipe(name, 0)` 探测，**不真的建连接**——真连一下再断开会让服务端看到「连上就断」并重建实例，查询本身产生副作用
   - 能区分三种状态：没有这个管道（`ERROR_FILE_NOT_FOUND`）、有管道但实例全被占满（`ERROR_SEM_TIMEOUT`，注意不是 `CreateFile` 才返回的 `ERROR_PIPE_BUSY`）、有空闲实例
@@ -27,11 +32,23 @@
   - 修法一：展开镜像后、创建远程线程前把整块镜像提成 `PAGE_EXECUTE_READWRITE`。给 RWX 而不是 RX 是有理由的——`ReflectiveLoader` 自己的全局变量（已解析的 `CreateFileA` 等）落在这块缓冲的 `.data` 里，loader 运行期间要可写
   - 修法二：成功判据增加 NTSTATUS 区间排除（`(code & 0xFFFFF000) == 0xC0000000`）。远程线程退出码是 DWORD，loader 崩掉时拿到的是 NTSTATUS（`0xC0000005` 访问违例、`0xC00000FD` 栈溢出），一样非零；而真实映射基址不可能落在该区间
   - 这是「可执行内存一律 RWX → 改先 RW 写入再封 RX」那次加固引入的回归：反射镜像的封页调用点被一并改掉，但分配处的注释还停留在旧逻辑上，测试又完全没覆盖这条链路
+- **`test/DllInjectorE2E` 泄漏目标进程，下一次构建直接 `LNK1104`**：`InjectorCore.Run` 自己 `CreateProcess` 并在返回前关掉 `pi.hProcess`，外部拿不到 PID；E2E 只对第 6–9 组显式 `Process.Start` 的进程调了 `KillAndWait`，第 1–5 组的 5 个 `Run` 从未收尾。实测一轮下来攒了 **20 个残留 `Target_*.exe`**，而链接器无法覆盖正在运行的 exe
+  - 修法：新增 `SnapshotIds` 与 `RunAndReap`——跑前快照同名进程的 PID 集合，`finally` 里只杀本轮新增的那些
+  - 不是洁癖：留在那里下一次链接就报 `LNK1104: 无法打开文件 ...Target_x64.exe`
+- **`TextHookDll` 日志写失败时静默丢行**：`FileLogLine` 用 `_wfopen_s(..., L"ab")`，而 CRT 默认独占打开——另一个进程（验证器、`tail`、编辑器）正开着日志时 fopen 直接失败，而原代码**丢掉这一行就返回**。表现是「启动横幅里少一条靶子目标」，看起来像钩子没装上
+  - 修法：改 `CreateFileW(..., FILE_APPEND_DATA | SYNCHRONIZE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, ..., OPEN_ALWAYS, ...)` + `WriteFile`，且只对 `ERROR_SHARING_VIOLATION` 重试 5 次 × 10ms。`FILE_APPEND_DATA` 本身就是原子追加，不需要 `SeekToEnd`
+  - 验证端对称修一处：`TestTextHook.c` 的 `ReadWholeFile` 也从 `_wfopen_s` 改成 `CreateFileW` + 共享标志，否则读取侧会报 `EACCES`、断言随机变红
 - **`ConfigStore` 写配置不是原子操作**：原先 `File.WriteAllLines` 直接覆盖，写到一半进程被杀就得到一个空文件——所有记忆（上次的 exe / dll / 注入方式 / 窗口位置）一次性丢失。现在先写 `*.tmp` 再 `File.Replace`（文件不存在时 `File.Move`），失败才退回直写，最后清掉残留 tmp
 - **`ConfigStore.Get()` 每次读属性都重读整个文件**：`Method` / `WindowPos` 的 getter 全走 `Get()`，而 `Get()` 每次都 `Reload()` → 每读一个属性一次磁盘 IO，且发生在 UI 线程上。现在按 `LastWriteTimeUtc` + `Length` 判断是否需要重读（不能退化成「只读一次」——用户会手工改 `DllInjector.config` 再切回窗口）
 
+- **APC 注入后立即调导出函数，模块还没装进去**：`QueueUserAPC` 是异步的——`ResumeThread` 只是让目标主线程“可以”执行 APC，真正跑起来要等它进入可告警等待（`SleepEx` / `WaitForSingleObjectEx` / 消息循环）。而 `Run()` 恢复线程后就直接去调导出函数，于是日志里出现互相矛盾的两行：先报「未在目标进程中找到已加载的模块」（`CallExport` 拿不到基址），紧接着核验又报「核验通过」（`VerifyModuleLoaded` 有 3 × 300ms 重试）
+  - 修法：新增 `WaitApcloaded`，导出调用前每 100ms 轮询模块列表（上限 3000ms），安静探针抽成 `IsModuleLoadedByName` 供轮询复用；`VerifyModuleLoaded` 也改用它，不再重复枚举两遍
+  - 表现是 x86 下的间歇性失败（八次里一次），很容易被当成“测试不稳”而忽略；实际上目标程序的 `SleepEx(1000, TRUE)` 越慢、APC 越容易推迟到调导出函数之后
+
 ### 变更
 - **`test/DllInjectorE2E` 接入 CI**：`native` job 新增两个步骤，`test\DllInjectorE2E\build.bat` 与 `--x86`
+- **验证器的固定等待改成轮询**：`TestTextHook.c` 里 8 个场景共 40 秒的 `Sleep(700)` / `Sleep(1200)` 换成 `WaitLog`（轮询日志直到出现期望内容）与 `WaitWhileTrue`（轮询 IAT 是否已还原）。写线程本来就是入队即 `SetEvent` 唤醒，一行文本落盘只需几毫秒，固定 `Sleep` 把最坏情况当成了常态；`test\TextHookDll\build.bat` 因此从 48.9 秒降到 15.5 秒
+  - 轮询一上就把固定等待盖住的三个竞态全暴露出来了（上面两条修复，加上「等待锚点选得太早」：只等「已安装 profile=」会在横幅逐条落盘的中途提前返回，现在统一改等排在最后的「动态取址：」那行）
 - **文档同步**：README 的测试素材列表与目录树、`docs/index.html` 的构建代码块与命令行特性、`CONTRIBUTING.md` 的目录职责与提交前自检、`docs/text-hook-design.md` §10.1 的场景表（7 → 8 行）与场景 8 说明
 
 ## [1.1.0] - 2026-10-19

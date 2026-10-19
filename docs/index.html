@@ -440,7 +440,8 @@ test\DllInjectorTests\build.bat</pre>
     <div class="sec-head">
       <span class="kicker">Build</span>
       <h2>从源码构建</h2>
-      <p>需要 <b>.NET 8 SDK</b>，一条命令构建 x64 / x86 双版本；也可使用仓库内置 GitHub Actions 自动构建。</p>
+      <p>需要 <b>.NET 8 SDK</b>，一条命令构建 x64 / x86 双版本；也可使用仓库内置 GitHub Actions 自动构建。
+        测试材料的构建脚本都带增量门：输入没变就直接跳过，重跑全量回归几秒完事。</p>
     </div>
     <pre><span class="c"># 一键构建（x64 + x86）</span>
 build.bat
@@ -454,6 +455,9 @@ test\DllInjectorE2E\build.bat --x86
 
 <span class="c"># 原生测试材料的构建 + 双架构端到端验证（需 VS C++ 生成工具）</span>
 test\TextHookDll\build.bat
+
+<span class="c"># 输入没变时上面这些脚本会打印 [SKIP] 直接跳过；--force 强制重建</span>
+test\TextHookDll\build.bat --force
 
 <span class="c"># 或使用 CI：打 v* 标签自动构建并发布 Release</span>
 git tag v1.2.3 <span class="s">&amp;&amp;</span> git push origin v1.2.3</pre>

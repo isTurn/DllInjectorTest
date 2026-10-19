@@ -72,6 +72,42 @@ echo.
 
 if not exist "%OUT%" md "%OUT%"
 
+rem ---- incremental gate ----------------------------------------------------
+rem  Skip the whole script (compile AND verification) when none of the inputs
+rem  changed since the last successful run. The fingerprint is the SHA1 of every
+rem  input below, in order; see test\_uptodate.bat for why content hashing is
+rem  used rather than timestamps.
+rem
+rem  The script itself is in the list: the compile/link flags live in it, so
+rem  changing /O2 to /O1 must trigger a rebuild even though no .c file moved.
+rem
+rem  Two guards keep the skip honest:
+rem    - "have" checks the products still exist. The fingerprint only covers
+rem      inputs, so deleting test_output must not leave a stamp claiming that
+rem      products which are no longer there are current.
+rem    - "commit" is only reached after the checks below pass, so a failed build
+rem      never leaves a stamp behind.
+rem
+rem  --update-shipped must always rebuild: its whole purpose is regenerating the
+rem  committed binaries, and skipping would silently leave them stale.
+set "FORCE_REBUILD="
+if /i "%~1"=="--force" set "FORCE_REBUILD=1"
+if /i "%~1"=="--update-shipped" set "FORCE_REBUILD=1"
+
+call "%~dp0..\_uptodate.bat" have "%OUT%\TextHookDll-x64.dll" "%OUT%\TextHookDll-x86.dll" "%OUT%\TextHookClient.exe" "%OUT%\TestTextHook-x64.exe" "%OUT%\TestTextHook-x86.exe" "%OUT%\TextTarget_x64.exe" "%OUT%\TextTarget_x86.exe" "%OUT%\TextHookDll.profiles.ini"
+if errorlevel 1 goto :build
+
+call "%~dp0..\_uptodate.bat" check text-hook-dll "%SRC%TextHookDll.c" "%SRC%TextHookDll.def" "%SRC%TextHookClient.c" "%SRC%TestTextHook.c" "%SRC%TextHookDll.profiles.ini" "%TARGET%\TestTextTarget.c" "%~f0" "%~dp0..\_uptodate.bat"
+if errorlevel 1 goto :build
+
+echo [SKIP] %~nx0: inputs unchanged and products present - nothing to do.
+echo         Pass --force to rebuild anyway.
+echo BUILD_DONE
+endlocal
+exit /b 0
+
+:build
+
 rem Ship the profile template next to the DLL: the DLL auto-loads it from
 rem its own directory.
 copy /y "%SRC%TextHookDll.profiles.ini" "%OUT%\TextHookDll.profiles.ini" >nul
@@ -152,6 +188,9 @@ echo         (loaded from the DLL's own directory; no rebuild needed).
 echo         The startup banner in texthook_log.txt reports which file was
 echo         read and which profiles were loaded.
 echo ============================================================
+
+rem Only now, after every check above passed, is the new fingerprint promoted.
+call "%~dp0..\_uptodate.bat" commit text-hook-dll
 endlocal
 exit /b 0
 

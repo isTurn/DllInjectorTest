@@ -422,7 +422,15 @@ test\TextHookDll\build.bat
 不是人工约定。
 
 `TestTextHook` 把整条链路收进**一个进程**：自己 `LoadLibrary`、自己调 `InstallConfig`
-装钩子、自己用 GDI 输出文本、自己读 `texthook_log.txt` 判断结果。它跑的 8 个场景：
+装钩子、自己用 GDI 输出文本、自己读 `texthook_log.txt` 判断结果。
+
+它等待结果的方式是**轮询而不是固定 `Sleep`**：`WaitLog` 一直读日志直到出现期望内容，
+`WaitWhileTrue` 一直查 IAT 直到没有残留槽。早期用 `Sleep(700)` / `Sleep(1200)`，
+把最坏情况当成常态，一轮要 49 秒；而且它能“通过”完全是因为等得够久——
+真正的竞态（日志文件共享冲突、广告还没刷完就断言）全被盖住了。
+改成轮询后降到 15 秒，且一上就暴露了三个真实缺陷（见 `CHANGELOG.md`）。
+
+它跑的 8 个场景：
 
 | 场景 | 目的 |
 | --- | --- |

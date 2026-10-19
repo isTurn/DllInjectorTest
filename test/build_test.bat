@@ -55,6 +55,27 @@ echo.
 
 if not exist "%OUT%" md "%OUT%"
 
+rem ---- Skip everything below if nothing changed since the last success ---
+rem  The input list is every .c file PLUS this script and _uptodate.bat. The
+rem  compiler flags live inside this script, so hashing it means "changed an
+rem  optimisation flag" forces a rebuild exactly like editing a .c file does.
+rem  Set FORCE_REBUILD=1 (or pass --force) to bypass.
+set "FORCE_REBUILD="
+if /i "%~1"=="--force" set "FORCE_REBUILD=1"
+
+call "%~dp0_uptodate.bat" have "%OUT%\TestDllA_x64.dll" "%OUT%\TestDllB_x64.dll" "%OUT%\Target_x64.exe" "%OUT%\TestDllA_x86.dll" "%OUT%\TestDllB_x86.dll" "%OUT%\Target_x86.exe"
+if errorlevel 1 goto :build
+
+call "%~dp0_uptodate.bat" check test-material "%SRC%TestDll\TestDll.c" "%SRC%TestTarget\TestTarget.c" "%~f0" "%~dp0_uptodate.bat"
+if errorlevel 1 goto :build
+
+echo [SKIP] test material is already up to date
+echo BUILD_DONE
+endlocal
+exit /b 0
+
+:build
+
 rem ---- x64 -----------------------------------------------------------------
 call "%VC%\vcvars64.bat" >nul
 cl /nologo /utf-8 /LD /O2 /DMARKER_PREFIX=\"attachA\" "%SRC%TestDll\TestDll.c" /link /OUT:"%OUT%\TestDllA_x64.dll"
@@ -76,6 +97,8 @@ if errorlevel 1 goto :fail
 rem ---- clean intermediates left next to the sources ------------------------
 del /q "%SRC%TestDll\*.obj" "%SRC%TestDll\*.exp" "%SRC%TestDll\*.lib" 2>nul
 del /q "%SRC%TestTarget\*.obj" "%SRC%TestTarget\*.exp" "%SRC%TestTarget\*.lib" 2>nul
+
+call "%~dp0_uptodate.bat" commit test-material
 
 echo BUILD_DONE
 endlocal

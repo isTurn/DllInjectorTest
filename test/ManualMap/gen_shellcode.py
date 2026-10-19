@@ -18,6 +18,11 @@ import os, re, struct, sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROGRAM_CS = os.path.normpath(os.path.join(HERE, '..', '..', 'DllInjector', 'Program.cs'))
 
+# Default indentation for the generated .cs snippets. When patching Program.cs
+# the indent actually used is the one already on the declaration line, so a
+# regeneration never re-indents the file (see find_array()).
+INDENT = '        '
+
 def extract_text(path):
     with open(os.path.join(HERE, path), 'rb') as f:
         data = f.read()
@@ -35,27 +40,35 @@ def extract_text(path):
             return blob
     raise SystemExit('no .text section in ' + path)
 
-def fmt(blob):
+def fmt(blob, indent=INDENT):
     lines = []
     for i in range(0, len(blob), 12):
         chunk = blob[i:i+12]
-        lines.append('        ' + ', '.join('0x%02X' % b for b in chunk) + ',')
+        lines.append(indent + ', '.join('0x%02X' % b for b in chunk) + ',')
     return '\n'.join(lines)
 
-def array_literal(cname, blob):
-    return ('        public static readonly byte[] %s =\n        {\n%s\n        };'
-            % (cname, fmt(blob)))
+def array_literal(cname, blob, indent=INDENT):
+    return ('%spublic static readonly byte[] %s =\n%s{\n%s\n%s};'
+            % (indent, cname, indent, fmt(blob, indent), indent))
 
 def find_array(text, cname):
-    """Return (start, end) character offsets of the whole array declaration."""
-    m = re.search(r'public static readonly byte\[\]\s+' + re.escape(cname) + r'\s*=\s*\{(.*?)\};',
-                  text, re.S)
+    """Return (start, end, indent) of the whole array declaration.
+
+    start includes the leading whitespace of the declaration line. That matters
+    for --apply: the replacement text carries its own indent, so if the match
+    started at "public" the old indent would survive and 8 more spaces would be
+    prepended on every run -- each regeneration would re-indent the array and
+    dirty Program.cs, which is exactly what CI's `git diff --exit-code`
+    check trips over.
+    """
+    m = re.search(r'(?m)^([ \t]*)public static readonly byte\[\]\s+' + re.escape(cname)
+                  + r'\s*=\s*\{.*?\};', text, re.S)
     if not m:
         raise SystemExit('array %s not found in Program.cs' % cname)
-    return m.start(), m.end()
+    return m.start(), m.end(), m.group(1)
 
 def bytes_in_array(text, cname):
-    s, e = find_array(text, cname)
+    s, e, _ = find_array(text, cname)
     body = text[s:e]
     return [int(v, 16) for v in re.findall(r'0x([0-9A-Fa-f]{2})', body)]
 
@@ -122,7 +135,7 @@ for obj, cname, csfile in jobs:
         continue
     blob = extract_text(obj)
     out.append((cname, blob))
-    with open(os.path.join(HERE, csfile), 'w', encoding='utf-8') as f:
+    with open(os.path.join(HERE, csfile), 'w', encoding='utf-8', newline='\n') as f:
         f.write(array_literal(cname, blob) + '\n')
     print('%s -> %s (%d bytes)' % (obj, csfile, len(blob)))
 
@@ -130,8 +143,8 @@ for obj, cname, csfile in jobs:
 if apply_mode:
     cs, has_bom = read_cs(PROGRAM_CS)
     for cname, blob in out:
-        s, e = find_array(cs, cname)
-        cs = cs[:s] + array_literal(cname, blob) + cs[e:]
+        s, e, indent = find_array(cs, cname)
+        cs = cs[:s] + array_literal(cname, blob, indent) + cs[e:]
     write_cs(PROGRAM_CS, cs, has_bom)
     print('APPLIED: patched %d array(s) into %s' % (len(out), PROGRAM_CS))
 

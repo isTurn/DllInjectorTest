@@ -46,14 +46,21 @@ jobs:
       # 只依据退出码判定（-checkdll 成功返回 0、失败返回 1），不解析输出文本——
       # 输出含中文，在非中文 locale 的 runner 上编码不可靠。
       # 注意 -checkdll 带参数，因此不会触发 GUI 模式的 UAC 提权重启。
+      #
+      # 必须用 Start-Process -Wait，不能用 & 调用：DllInjector.exe 是 WinExe
+      # （GUI 子系统，无控制台），PowerShell 的 & 对这类程序不会等待，
+      # $LASTEXITCODE 会拿到空值（日志里表现为 "exit code: " 后面什么都没有），
+      # 进而被误判成失败。Start-Process -Wait 会等进程真正退出再取 ExitCode。
       - name: Smoke-test published binary
         shell: pwsh
         run: |
           $exe = "out/${{ matrix.rid }}/DllInjector.exe"
           if (-not (Test-Path $exe)) { throw "not found: $exe" }
-          Write-Host "running: $exe -checkdll ${{ matrix.probe }}"
-          & $exe -checkdll "${{ matrix.probe }}"
-          $rc = $LASTEXITCODE
+          $probe = "${{ matrix.probe }}"
+          Write-Host "running: $exe -checkdll $probe"
+          $p = Start-Process -FilePath $exe -ArgumentList '-checkdll', $probe `
+                             -Wait -PassThru -NoNewWindow
+          $rc = $p.ExitCode
           Write-Host "exit code: $rc"
           if ($rc -ne 0) { throw "-checkdll failed (exit $rc)" }
 
@@ -102,10 +109,18 @@ jobs:
       # 这里重新汇编 + 回填，再用 git diff 断言「仓库里提交的数组确实等于
       # 当前 .asm 汇编出来的字节」。如果有人改了 .asm 却忘了重新生成，
       # 这一步会失败并把差异打出来。
+      #
+      # 两个 errorlevel 必须分开查：先查「脚本本身跑没跑成」，再查「跑成了但字节不一致」。
+      # 只查 git diff 的话，脚本因为环境问题失败（没装 Python、汇编器报错）时
+      # 仓库里的数组当然没变，git diff 反而通过，整个检查就静默失效了。
       - name: Verify shellcode arrays match the assembly sources
         shell: cmd
         run: |
           test\ManualMap\build_shellcode.bat
+          if errorlevel 1 (
+            echo SHELLCODE_BUILD_FAILED - test\ManualMap\build_shellcode.bat did not complete.
+            exit /b 1
+          )
           git diff --exit-code -- DllInjector\Program.cs
           if errorlevel 1 (
             echo SHELLCODE_OUT_OF_SYNC - run test\ManualMap\build_shellcode.bat locally and commit the result.
@@ -117,10 +132,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: native-test-output
-          path: |
-            test_output/
-            test/TestHookDll/hook_call_log.txt
-            test/TextHookDll/texthook_log.txt
+          # The build scripts write every product (DLLs, log files, verifiers)
+          # into test_output\, so that directory alone is enough. Listing the
+          # source directories again would only ever find stale files left over
+          # from older runs.
+          path: test_output/
           if-no-files-found: ignore
 
   release:

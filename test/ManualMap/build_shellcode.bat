@@ -77,7 +77,11 @@ if not defined PY (
     if not errorlevel 1 set "PY=py -3"
 )
 if not defined PY (
-    echo [ERROR] Python 3 not found (neither "python" nor the "py" launcher).
+    rem Parens inside a ( ... ) block must be escaped: cmd closes the block at
+    rem the first unescaped ")", so a bare ")" in an echo would truncate it and
+    rem leave a stray ")." for the parser. This bites even when the condition is
+    rem false - cmd parses the whole block before deciding whether to run it.
+    echo [ERROR] Python 3 not found ^(neither "python" nor the "py" launcher^).
     echo         gen_shellcode.py needs Python 3: https://www.python.org/downloads/
     echo         Tip: tick "Add python.exe to PATH" during installation.
     exit /b 1

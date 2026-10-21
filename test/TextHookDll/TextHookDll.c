@@ -67,6 +67,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>   // tolower（hint= 通配匹配用）
 #include <wchar.h>
 #include <wctype.h>   // iswspace
 
@@ -106,6 +107,8 @@ typedef struct {
 
 #define PROFILE_NAME_MAX 48
 
+#define HT_HINT_MAX 96
+
 typedef struct {
     char              name[PROFILE_NAME_MAX];
     UINT              codepage;     // 0 = 用系统 ANSI 代码页
@@ -113,6 +116,15 @@ typedef struct {
     int               targetCount;
     int               minLen;
     DWORD             dedupMs;
+
+    // ---- engine=auto 用的识别提示（都可留空 = 不参与判定）----
+    // hintExe  可以是通配符（`krkr*.exe`），与目标进程自身的 exe 文件名比对；
+    // hintClass 同样是通配符，与目标进程任意窗口的类名比对。
+    // 两个都给时要求**同时**命中，否则判为不匹配。
+    // 之所以要留 hintClass：同一引擎的不同游戏 exe 名千奇百怪，
+    // 但窗口类名往往是引擎框架写死的（例如 "kirikiri"），识别率高得多。
+    char              hintExe[HT_HINT_MAX];
+    char              hintClass[HT_HINT_MAX];
 } EngineProfile;
 
 // 通用 GDI 目标：TextOut / ExtTextOut / DrawText 的 A/W 两个版本。
@@ -180,6 +192,8 @@ static FileProfile g_fileProfiles[MAX_FILE_PROFILES];
 static int         g_fileProfileCount = 0;
 static BOOL        g_profilesLoaded   = FALSE;   // 是否已经尝试过加载（无论成功与否，只试一次）
 static BOOL        g_profileExplicit  = FALSE;   // engine= 是否被显式指定过
+static BOOL        g_autoRequested    = FALSE;   // engine=auto：请求按 hint 猜 profile
+static BOOL        g_autoMatched      = FALSE;   // 上一轮 auto 是否真的猜中（用于横幅提示）
 
 // profile 文件的加载结果描述 + 配置告警，由 StartHooks 在初始化完成后写入日志。
 // 注意：ApplyConfig 阶段队列和临界区都还没建好，绝不能在那里 Enqueue。
@@ -372,35 +386,79 @@ static void Enqueue(const char* line)
     g_qCount++;
     LeaveCriticalSection(&g_qCs);
 
-    if (g_qEvent) SetEvent(g_qEvent);
+    // TOCTOU 防护：StopHooks 会在确认线程都退出后关闭 g_qEvent。这里不加锁
+    // 就直接 SetEvent，一旦读到的是「关闭前那一刻的句柄值」，SetEvent 就作用在
+    // 一个已关闭（甚至已被系统回收改作他用）的句柄上。
+    // 先拷进局部变量再判空/SetEvent 不解决问题（仍然是两次读），
+    // 所以让「取句柄」和「用句柄」都处在同一把锁里，StopHooks 也在同一把锁里清空。
+    EnterCriticalSection(&g_qCs);
+    HANDLE qev = g_qEvent;
+    if (qev) SetEvent(qev);
+    LeaveCriticalSection(&g_qCs);
 }
-
 // 往管道写一行。管道句柄是**重叠（overlapped）**打开的——这是为了让管道线程
 // 的 ConnectNamedPipe 可以被停止事件打断——所以写也必须走重叠方式：
 // 对重叠句柄调用 WriteFile 时传 NULL lpOverlapped 是未定义行为
 // （MSDN 明确说会「错误地报告写完成」）。
-// 只在写线程里调用，所以共用一个 OVERLAPPED 事件是安全的。
+//
+// 两条曾经踩过的不变量，改这段代码前务必读一遍：
+//
+//  1) OVERLAPPED **绝不能放在本函数的栈帧里**。只要 WriteFile 返回
+//     ERROR_IO_PENDING，内核就持有了这个结构的指针；函数返回后调用方继续跑，
+//     那块栈内存会被后面的调用覆写，而内核稍后仍往里面写完成状态 —— 静默的
+//     内存破坏，症状是「偶尔有条文本变成乱码」或管道实例莫名被判断开。
+//     原实现超时后 CancelIoEx + 等 1 秒，1 秒也没等到就直接 return FALSE，
+//     正好落进这个坑。现在的规则：只有确认 I/O 已经完成（GetOverlappedResult
+//     返回，或 CancelIoEx 后等到完成）才 free；确认不了就**故意泄漏**这 64 字节，
+//     让内核手里的指针始终有效。泄漏一次远好过破坏内存。
+//
+//  2) 共用的 g_writeEvent 是自动复位的，用前必须 ResetEvent。上一次被放弃的
+//     写留下的残留信号会被下一次 WriteFile 立刻「吃掉」，于是
+//     GetOverlappedResult(..., FALSE) 返回 ERROR_IO_INCOMPLETE，一个健康的
+//     实例就被标成 g_pipeBroken[i] = 1 了。
 static BOOL PipeWrite(HANDLE h, const char* data, DWORD len)
 {
     if (h == INVALID_HANDLE_VALUE || !data || len == 0) return FALSE;
+    if (!g_writeEvent) return FALSE;
 
-    OVERLAPPED ov;
-    memset(&ov, 0, sizeof(ov));
-    ov.hEvent = g_writeEvent;
+    OVERLAPPED* ov = (OVERLAPPED*)calloc(1, sizeof(OVERLAPPED));
+    if (!ov) return FALSE;
+    ov->hEvent = g_writeEvent;
+
+    // 吃掉上一次残留的信号（见上面第 2 条）。
+    ResetEvent(g_writeEvent);
 
     DWORD written = 0;
-    if (WriteFile(h, data, len, &written, &ov)) return TRUE;
+    if (WriteFile(h, data, len, &written, ov)) { free(ov); return TRUE; }
 
     DWORD err = GetLastError();
-    if (err != ERROR_IO_PENDING) return FALSE;
+    if (err != ERROR_IO_PENDING) { free(ov); return FALSE; }
 
     // 客户端只读不写，正常情况很快完成；给个上限免得写线程被卡死
-    if (WaitForSingleObject(g_writeEvent, 2000) != WAIT_OBJECT_0) {
-        CancelIoEx(h, &ov);
-        WaitForSingleObject(g_writeEvent, 1000);
-        return FALSE;
+    if (WaitForSingleObject(g_writeEvent, 2000) == WAIT_OBJECT_0) {
+        BOOL ok = GetOverlappedResult(h, ov, &written, FALSE) ? TRUE : FALSE;
+        free(ov);
+        return ok;
     }
-    return GetOverlappedResult(h, &ov, &written, FALSE) ? TRUE : FALSE;
+
+    // 超时：先请求取消，再等内核把完成通知交回来。
+    // CancelIoEx 返回 FALSE 且 GetLastError()==ERROR_NOT_FOUND 说明这单其实
+    // 已经完成了（只是信号被别的东西吃掉），那就照常取结果。
+    if (!CancelIoEx(h, ov)) {
+        if (GetLastError() == ERROR_NOT_FOUND) {
+            ResetEvent(g_writeEvent);
+            BOOL ok = GetOverlappedResult(h, ov, &written, FALSE) ? TRUE : FALSE;
+            free(ov);
+            return ok;
+        }
+    }
+    if (WaitForSingleObject(g_writeEvent, 1000) == WAIT_OBJECT_0) {
+        free(ov);           // 内核已写回完成状态，结构可以安全释放
+        return FALSE;       // 但这次写本身按失败处理
+    }
+
+    // 仍然没有完成 → 内核还拿着 ov。故意泄漏，绝不 free。
+    return FALSE;
 }
 
 static DWORD WINAPI WriterThreadProc(LPVOID param)
@@ -412,6 +470,15 @@ static DWORD WINAPI WriterThreadProc(LPVOID param)
 
         for (;;)
         {
+            // 内层排空循环必须检查 g_stop：StopHooks 只有 2 秒有界等待，
+            // 而一次「消费者连上不读」就能让单条广播耗掉 3 秒（PipeWrite 的
+            // 2000 + 1000）。不检查的话队列里积压 10 条就要 30 秒，StopHooks
+            // 早就超时返回、CloseHandle 走人、UnhookAll 执行完，这个线程却仍在
+            // 跑 —— 一旦 DLL 被 FreeLibrary，它就踩在已卸载的映像上。
+            // 收到停止信号就丢弃剩余队列直接退出（残留的 QNode 随进程/映像消失，
+            // 比「线程活过 DLL 生命期」便宜得多）。
+            if (g_stop) return 0;
+
             QNode* n = NULL;
             EnterCriticalSection(&g_qCs);
             if (g_qHead) {
@@ -644,8 +711,45 @@ static void EmitAnsi(const char* s, int len, const char* hookName)
     if (cp == 0) cp = CP_ACP;
 
     wchar_t w[2048];
+
+    // cp=1200（UTF-16）不是合法的 MultiByteToWideChar **输入**代码页：
+    // 该函数拒绝 1200/1201（ERROR_INVALID_PARAMETER，实测 ret=0），因为它们描述的是
+    // 「宽字符」而不是「字节流」。老版本把 1200 写进了文档和内置 profile，结果是
+    // 只要引擎走 *A 函数，所有文本都在这里静默消失，而且连 g_statFiltered 都不加，
+    // 现场表现与「钩子根本没挂上」完全无法区分。
+    // 现在把 1200 当成「这就是 UTF-16 字节流，按小端直接搬」处理——这也正是
+    // 调用方写 cp=1200 时的真实意图。
+    if (cp == 1200 || cp == 1201)
+    {
+        int pairs = len / (int)sizeof(wchar_t);
+        if (pairs > 2000) pairs = 2000;
+        if (pairs <= 0) { InterlockedIncrement(&g_statFiltered); return; }
+        if (cp == 1201) {   // UTF-16BE：逐对调字节序
+            int k;
+            for (k = 0; k < pairs; k++)
+            {
+                unsigned char a = (unsigned char)s[k * 2 + 0];
+                unsigned char b = (unsigned char)s[k * 2 + 1];
+                w[k] = (wchar_t)((unsigned short)((unsigned)a << 8) | b);
+            }
+        }
+        else
+        {
+            memcpy(w, s, (size_t)pairs * sizeof(wchar_t));
+        }
+        w[pairs] = 0;
+        EmitText(w, hookName);
+        return;
+    }
+
     int n = MultiByteToWideChar(cp, 0, s, len, w, 2047);
-    if (n <= 0) return;
+    if (n <= 0)
+    {
+        // 转换失败必须计数。否则「上报 0 条、过滤 0 次」这种自相矛盾的统计
+        // 会让人误判成「钩子没被调用」，而真正的原因是代码页写错了。
+        InterlockedIncrement(&g_statFiltered);
+        return;
+    }
     w[n] = 0;
     EmitText(w, hookName);
 }
@@ -1098,10 +1202,17 @@ static pGetProcAddress real_GetProcAddress = NULL;
 // 我们的 GetProcAddress 替身：先问真的要地址，再看它是不是我们挂钩的目标。
 static FARPROC WINAPI Hook_GetProcAddress(HMODULE hMod, LPCSTR name)
 {
-    FARPROC real = real_GetProcAddress ? real_GetProcAddress(hMod, name) : NULL;
+    // 只读一次全局变量。写成 `real_GetProcAddress ? real_GetProcAddress(...) : NULL`
+    // 会读两遍：UnhookAll 把 real_GetProcAddress 置 NULL 恰好发生在两次读之间时，
+    // 就会去调一个空指针（谁都可能还留着这个替身的地址）。
+    // 变量类型必须是 pGetProcAddress 而不是 FARPROC：在 x64 上 FARPROC 是
+    // `INT_PTR (WINAPI*)()`、与带参的 pGetProcAddress 不同型，混用会触发 C4047。
+    pGetProcAddress real = real_GetProcAddress;
     if (!real) return NULL;
+    FARPROC result = real(hMod, name);
+    if (!result) return NULL;
 
-    void* p = (void*)real;
+    void* p = (void*)result;
     for (int i = 0; i < g_dynCount; i++)
     {
         if (g_dyn[i].targetAddr != p) continue;
@@ -1114,7 +1225,7 @@ static FARPROC WINAPI Hook_GetProcAddress(HMODULE hMod, LPCSTR name)
 
         return (FARPROC)g_dyn[i].replacement;
     }
-    return real;
+    return result;
 }
 
 // 登记一个「动态取址时要改写成 replacement」的目标。
@@ -1230,6 +1341,17 @@ static void HookAllModules(void)
     // 动态取址表每轮重装都要清空：上一轮的 targetAddr/replacement 指向的是
     // 上一轮的 profile，重装后可能整个 profile 都换了。
     g_dynCount = 0;
+
+    // ★ 通用转发器槽位同样必须每轮清空，而且要在下面的 RegisterGeneric 之前。
+    //   不清后果：GenIdForTarget 用指针相等认领 id，而 g_genTargets[i] 一旦写入
+    //   就再也没人释放；于是「Unhook → 改 ini → 再次 InstallConfig」（文档明确
+    //   宣传的免重编译工作流）会一直命中原槽位，沿用上一轮的 textArg/lenArg/argc/
+    //   conv 和上一轮记录的函数指针。x86 上 argc 从 5 变成 2 就会把栈弹歪，直接 AV。
+    //   另一个症状是连续用 8 个不同通用 profile 之后永久「通用挂钩槽位已满」。
+    memset(g_gen,        0, sizeof(g_gen));
+    // g_genTargets 是指针数组、元素带 const，直接传给 memset 会触发 C4090
+    // （「不同的 const 限定符」）。这里只是把它清零，显式转型表明意图。
+    memset((void*)g_genTargets, 0, sizeof(g_genTargets));
 
     for (int i = 0; i < n; i++)
     {
@@ -1408,6 +1530,125 @@ static void RefreshDefaultProfile(void)
     if (g_profileExplicit) return;
     const EngineProfile* p = FindProfileNarrow("generic-gdi");
     g_profile = p ? p : &kProfiles[0];
+}
+
+// ---------------------------------------------------------------------------
+// engine=auto：按 hintExe / hintClass 猜 profile
+//
+// 为什么需要：真实引擎的 profile 只能对着实机逆向填出来，而使用者手里只有
+// 一个游戏。让他在 ini 里写好 `hintExe=krkr*.exe` 之后，注入时**什么都不用传**
+// 就能选中对的 profile —— 这是「改 ini 不用重编译」这条承诺真正兑现的地方。
+//
+// 判定规则（都已写进 ini 注释，这里保持一致）：
+//   · 某个 profile 两个 hint 都为空 → 不参与 auto 判定（绝不误选）。
+//   · hintExe 与目标进程 exe 文件名比对，允许 * 和 ? 通配。
+//   · hintClass 与目标进程**任意**顶层窗口的类名比对，同样允许通配。
+//   · 两个 hint 都写了 → 必须同时命中。
+//   · 多个 profile 命中 → 取 ini 里靠前的那个（文件先于内置，符合覆盖语义）。
+// ---------------------------------------------------------------------------
+
+// 大小写无关的通配匹配，支持 *（任意长）与 ?（单字符）。
+// 用迭代式回溯而不是递归：pattern/text 都来自用户 ini，递归深度不受控。
+static BOOL HintMatch(const char* pat, const char* text)
+{
+    if (!pat || !text) return FALSE;
+    if (!pat[0]) return TRUE;          // 空 pattern 视作「命中」，由调用方先判空
+
+    const char* starPat = NULL;        // 最近一个 * 的位置
+    const char* starTxt = NULL;
+
+    while (*text) {
+        if (*pat == '?' ||
+            (*pat && tolower((unsigned char)*pat) == tolower((unsigned char)*text))) {
+            pat++;
+            text++;
+        } else if (*pat == '*') {
+            starPat = pat++;
+            starTxt = text;
+        } else if (starPat) {
+            // 回退：让上一个 * 多吞一个字符
+            pat  = starPat + 1;
+            text = ++starTxt;
+        } else {
+            return FALSE;
+        }
+    }
+    while (*pat == '*') pat++;
+    return (*pat == 0);
+}
+
+// 目标进程自身的 exe 文件名（不含路径）
+static void CurrentProcessExeName(char* out, size_t cch)
+{
+    out[0] = 0;
+    wchar_t w[MAX_PATH];
+    if (!GetModuleFileNameW(NULL, w, MAX_PATH)) return;
+    wchar_t* slash = wcsrchr(w, L'\\');
+    const wchar_t* base = slash ? slash + 1 : w;
+    WideCharToMultiByte(CP_ACP, 0, base, -1, out, (int)cch, NULL, NULL);
+}
+
+// EnumWindows 回调：目标进程任意顶层窗口的类名命中就算匹配
+typedef struct {
+    DWORD       pid;
+    const char* pattern;
+    BOOL        matched;
+} ClassProbe;
+
+static BOOL CALLBACK ClassProbeProc(HWND hWnd, LPARAM lp)
+{
+    ClassProbe* p = (ClassProbe*)lp;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hWnd, &pid);
+    if (pid != p->pid) return TRUE;
+
+    char cls[256];
+    if (GetClassNameA(hWnd, cls, (int)sizeof(cls)) <= 0) return TRUE;
+    if (HintMatch(p->pattern, cls)) {
+        p->matched = TRUE;
+        return FALSE;                  // 找到一个就够，停止枚举
+    }
+    return TRUE;
+}
+
+static BOOL HasWindowClassMatching(const char* pattern)
+{
+    ClassProbe probe;
+    probe.pid      = GetCurrentProcessId();
+    probe.pattern  = pattern;
+    probe.matched  = FALSE;
+    EnumWindows(ClassProbeProc, (LPARAM)&probe);
+    return probe.matched;
+}
+
+// 单个 profile 是否命中当前进程。两个 hint 都空 = 不参与判定。
+static BOOL ProfileHintsCurrentProcess(const EngineProfile* p)
+{
+    if (!p) return FALSE;
+    if (!p->hintExe[0] && !p->hintClass[0]) return FALSE;
+
+    if (p->hintExe[0]) {
+        char exe[MAX_PATH];
+        CurrentProcessExeName(exe, sizeof(exe));
+        if (!exe[0] || !HintMatch(p->hintExe, exe)) return FALSE;
+    }
+    if (p->hintClass[0] && !HasWindowClassMatching(p->hintClass)) return FALSE;
+    return TRUE;
+}
+
+// 在「文件 profile + 内置 profile」里按顺序找第一个命中的。
+// 顺序刻意与 FindProfileNarrow 一致：文件优先，同名覆盖内置。
+static const EngineProfile* ResolveAutoProfile(void)
+{
+    for (int i = 0; i < g_fileProfileCount; i++)
+        if (ProfileHintsCurrentProcess(&g_fileProfiles[i].prof))
+            return &g_fileProfiles[i].prof;
+
+    for (int i = 0; i < kProfileCount; i++)
+        if (ProfileHintsCurrentProcess(&kProfiles[i]))
+            return &kProfiles[i];
+
+    return NULL;
 }
 
 // 默认 profile 文件位置：DLL 同目录（和 texthook_log.txt 同一个地方）
@@ -1614,9 +1855,20 @@ static void LoadProfilesFromFile(const wchar_t* path)
                 break;
             }
         }
-        else if (_stricmp(key, "hook") == 0)
+        else if (_stricmp(key, "hint") == 0 || _stricmp(key, "hintclass") == 0 ||
+                 _stricmp(key, "hintwindow") == 0)
         {
-            if (fp->prof.targetCount >= MAX_FILE_TARGETS) {
+            // hint= / hintClass= 是同一个东西（窗口类名）。
+            // 用 _TRUNCATE 而不是报错：hint 只是给 auto 用的猜路提示，
+            // 写长了一点最多是识别不出来，没有任何理由让整个 profile 作废。
+            strncpy_s(fp->prof.hintClass, HT_HINT_MAX, val, _TRUNCATE);
+        }
+        else if (_stricmp(key, "hintexe") == 0 || _stricmp(key, "hintprocess") == 0)
+        {
+            strncpy_s(fp->prof.hintExe, HT_HINT_MAX, val, _TRUNCATE);
+        }
+        else if (_stricmp(key, "hook") == 0)
+        {            if (fp->prof.targetCount >= MAX_FILE_TARGETS) {
                 _snprintf_s(err, sizeof(err), _TRUNCATE,
                             "第 %d 行：hook 数量超过上限 %d", lineNo, MAX_FILE_TARGETS);
                 break;
@@ -1756,6 +2008,14 @@ static void EnsureProfilesLoaded(void)
 // 解析 "k=v|k=v"，返回解析出的键值对个数
 static int ApplyConfig(const wchar_t* cfg)
 {
+    // engine=auto 是「本次配置」的意图，每次 ApplyConfig 都要重算。
+    // 不复位的话：第一轮 engine=auto、第二轮 engine=generic-gdi 时
+    // g_autoRequested 还留着 1，横幅会报一串假的 auto 结果。
+    // g_profileExplicit 同理：只置不清会让「上一轮显式指定过」永久压住
+    // 后面所有 auto 请求。
+    g_autoRequested   = FALSE;
+    g_profileExplicit = FALSE;
+
     if (!cfg || !*cfg) return 0;
 
     // ---- 第一遍：profilefile= / nofile= 必须先于 engine= 生效 ----
@@ -1815,15 +2075,22 @@ static int ApplyConfig(const wchar_t* cfg)
         const wchar_t* v = val ? val : L"";
 
         if (_wcsicmp(key, L"engine") == 0) {
-            newProfile = FindProfile(v);
-            if (newProfile) {
-                g_profileExplicit = TRUE;
+            if (_wcsicmp(v, L"auto") == 0) {
+                // engine=auto：**不**置 g_profileExplicit，交给 StartHooks 去猜。
+                // 猜的时机必须晚于 profile 文件加载（这里可能正好在加载文件），
+                // 也晚于窗口创建——注入时游戏通常已经建好窗口了。
+                g_autoRequested = TRUE;
             } else {
-                // 静默沿用默认值最难排查，这里给出可用清单
-                char list[384];
-                BuildProfileList(list, sizeof(list));
-                _snprintf_s(g_configWarn, sizeof(g_configWarn), _TRUNCATE,
-                            "engine= 指定的 profile 未找到，已沿用默认；可用：%s", list);
+                newProfile = FindProfile(v);
+                if (newProfile) {
+                    g_profileExplicit = TRUE;
+                } else {
+                    // 静默沿用默认值最难排查，这里给出可用清单
+                    char list[384];
+                    BuildProfileList(list, sizeof(list));
+                    _snprintf_s(g_configWarn, sizeof(g_configWarn), _TRUNCATE,
+                                "engine= 指定的 profile 未找到，已沿用默认；可用：%s（或写 auto 自动识别）", list);
+                }
             }
         }
         else if (_wcsicmp(key, L"cp") == 0)     { g_codepage = (UINT)_wtoi(v); }
@@ -1858,6 +2125,21 @@ static BOOL StartHooks(void)
     // profile 决定挂哪些函数，必须先于 HookAllModules 就位。
     // InstallConfig 路径下 ApplyConfig 已经加载过，这里是给无参的 Init 兜底。
     EnsureProfilesLoaded();
+
+    // engine=auto 的兜底解析放在这里而不是 ApplyConfig 里：
+    // Init / InstallHook 这两条入口根本不经过 ApplyConfig，只有放在 StartHooks
+    // 才能让 auto 对三个入口表现一致。g_profileExplicit 为真时这里什么都不做，
+    // 所以显式 engine= 永远不会被 auto 抢走。
+    //
+    // 注意 g_autoMatched 是**每轮重算**的：使用者按文档改了 ini 里的 hint 之后
+    // 重新 InstallConfig，横幅要如实反映这一轮到底猜中没有。
+    if (!g_profileExplicit) {
+        const EngineProfile* autoP = ResolveAutoProfile();
+        g_autoMatched = (autoP != NULL);
+        if (autoP) g_profile = autoP;
+    } else {
+        g_autoMatched = FALSE;
+    }
 
     // ★ 重新安装时必须复位这些标志。
     //   StopHooks 会把 g_stop 置 1，而它此前从没被清回过——
@@ -1920,6 +2202,26 @@ static BOOL StartHooks(void)
                 g_codepage ? g_codepage : (g_profile ? g_profile->codepage : 0),
                 g_patchedCount, g_pipeName, GetCurrentProcessId());
     Enqueue(msg);
+
+    // engine=auto 的结果单独一行。这一行是「我写了 auto，到底猜中没有」的
+    // 唯一直接证据——否则使用者只能靠「挂到几个槽」反推，而猜错 profile
+    // 与引擎没走 IAT 在日志里是同一个现象。
+    if (g_autoRequested) {
+        char am[512];
+        if (g_autoMatched) {
+            _snprintf_s(am, sizeof(am), _TRUNCATE,
+                        "[TextHookDll] engine=auto 已命中 profile=%s（按 hintExe / hintClass 匹配）\n",
+                        g_profile ? g_profile->name : "?");
+        } else {
+            _snprintf_s(am, sizeof(am), _TRUNCATE,
+                        "[TextHookDll] engine=auto 未能命中任何 profile（没有任何 profile 的 "
+                        "hintExe= / hintClass= 与本进程匹配），已用默认 profile=%s；"
+                        "请在 %s 里给对应 profile 补上 hintExe= 或 hintClass=\n",
+                        g_profile ? g_profile->name : "?",
+                        g_profileFileMsg[0] ? "TextHookDll.profiles.ini" : "profile 文件");
+        }
+        Enqueue(am);
+    }
 
     // 逐条报告每个目标挂到了几个槽。
     // 为什么值得单独占一行：IAT Hook 最典型的失败是「装好了但一条文本也没有」，
@@ -2009,7 +2311,11 @@ static void StopHooks(void)
                 (long)g_statEmitted, (long)g_statFiltered, (long)g_statDropped);
 
     g_stop = 1;
-    if (g_qEvent)    SetEvent(g_qEvent);
+    // 取句柄与 SetEvent 都放进 g_qCs：Enqueue 也在同一把锁里读 g_qEvent，
+    // 这样下面的 CloseHandle 不会与 SetEvent 撞车（见 Enqueue 里的 TOCTOU 注释）。
+    EnterCriticalSection(&g_qCs);
+    if (g_qEvent) SetEvent(g_qEvent);
+    LeaveCriticalSection(&g_qCs);
     // ★ 关键：g_stop 只能被**轮询**，而管道线程可能正阻塞在 ConnectNamedPipe 上，
     //   永远轮询不到它。不唤醒的话 StopHooks 会超时返回，留下一个"僵尸"管道线程：
     //   它一直占着 \\.\pipe\<name> 的实例（每个实例都是一份占用），于是**下次安装**
@@ -2019,13 +2325,20 @@ static void StopHooks(void)
 
     // 有界等待：DllMain(DLL_PROCESS_DETACH) 里不能无限期阻塞。
     // 每个实例线程单独等，任一超时就记 allGone = FALSE。
+    //
+    // 写线程的上限给到 5 秒而不是 2 秒：它可能正卡在一次 PipeWrite 里，
+    // 而单次 PipeWrite 最坏要 3 秒（2000 等待 + 1000 取消确认）。
+    // 2 秒的上限意味着「只要卸载时刚好有一个客户端连上不读，就必然超时」。
+    // 排空循环内部也检查了 g_stop，所以正常情况下收到停止信号后
+    // 至多再完成一次写就会退出。
     BOOL allGone = TRUE;
     if (g_writerThread) {
-        allGone &= (WaitForSingleObject(g_writerThread, 2000) == WAIT_OBJECT_0);
+        allGone &= (WaitForSingleObject(g_writerThread, 5000) == WAIT_OBJECT_0);
         CloseHandle(g_writerThread); g_writerThread = NULL;
     }
     for (int i = 0; i < PIPE_INSTANCES; i++) {
         if (!g_pipeThread[i]) continue;
+        // 管道线程等的就是 g_stopEvent（重叠 ConnectNamedPipe），响应很快。
         allGone &= (WaitForSingleObject(g_pipeThread[i], 2000) == WAIT_OBJECT_0);
         CloseHandle(g_pipeThread[i]); g_pipeThread[i] = NULL;
     }
@@ -2035,9 +2348,21 @@ static void StopHooks(void)
     // 只有在确认线程都退出后才关闭它们可能仍在引用的对象；
     // 否则宁可泄漏这几个句柄，也不能让存活线程等在已关闭的事件上。
     if (allGone) {
+        EnterCriticalSection(&g_qCs);
         if (g_qEvent)    { CloseHandle(g_qEvent);    g_qEvent    = NULL; }
+        LeaveCriticalSection(&g_qCs);
         if (g_stopEvent) { CloseHandle(g_stopEvent); g_stopEvent = NULL; }
         if (g_writeEvent){ CloseHandle(g_writeEvent);g_writeEvent= NULL; }
+    }
+    else {
+        // 有线程活过了有界等待。这里**无法**补救：CloseHandle 不终止线程，
+        // 而一旦调用方随后 FreeLibrary，那条线程的 PC 还指着本映像的代码段，
+        // 必然 AV。能做的只有两件事：
+        //   1) 把事件对象全部留下不关（下面那条路已经做了），让存活线程不会
+        //      等在已销毁的内核对象上；
+        //   2) 明确报告出来，别让使用者以为是「干净卸载」。
+        OutputDebugStringW(L"[TextHookDll] 警告: 有工作线程未能及时退出，"
+                           L"此时卸载 DLL 可能导致目标进程崩溃。\n");
     }
 
     g_initialized = FALSE;

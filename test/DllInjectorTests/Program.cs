@@ -119,6 +119,37 @@ namespace DllInjectorTests
                     "非 PE 文件返回 0（不抛异常）");
             CheckEq(DllInjector.PeHelper.GetExeBitness(Path.Combine(root, "不存在.dll")), 0,
                     "不存在的文件返回 0（不抛异常）");
+            // AnyCPU 托管程序集：Machine 字段是 I386，但它不是「32 位程序」。
+            // 本测试程序自己就是一个 AnyCPU 托管 DLL，拿它当素材最真实。
+            // 旧逻辑会返回 32，于是在 x64 机器上把 AnyCPU 目标判成位数不匹配直接拒绝注入。
+            string anyCpu = Path.Combine(AppContext.BaseDirectory, "DllInjectorTests.dll");
+            if (File.Exists(anyCpu))
+            {
+                CheckEq(DllInjector.PeHelper.GetExeBitness(anyCpu),
+                        Environment.Is64BitOperatingSystem ? 64 : 32,
+                        "AnyCPU 托管程序集按宿主系统位数判定（不是无脑 32）");
+            }
+            else
+            {
+                Console.WriteLine("    [SKIP] 找不到 DllInjectorTests.dll，跳过 AnyCPU 判定检查");
+            }
+
+            // ---- 4b. -args 的引号还原 --------------------------------------------
+            Console.WriteLine("\n  --- Program.QuoteArgIfNeeded（-args 命令行还原）---");
+            CheckEq(DllInjector.Program.QuoteArgIfNeeded("plain"), "plain",
+                    "不含空格的参数原样保留");
+            CheckEq(DllInjector.Program.QuoteArgIfNeeded("My Game"), "\"My Game\"",
+                    "含空格的参数补引号");
+            CheckEq(DllInjector.Program.QuoteArgIfNeeded(""), "\"\"",
+                    "空参数给一对空引号（否则会被命令行解析吞掉）");
+            CheckEq(DllInjector.Program.QuoteArgIfNeeded("a\tb"), "\"a\tb\"",
+                    "含制表符也要补引号");
+            CheckEq(DllInjector.Program.QuoteArgIfNeeded("say\"hi\""), "say\"hi\"",
+                    "不含空格时引号无需转义（Windows 解析器不会拆它）");
+            CheckEq(DllInjector.Program.QuoteArgIfNeeded("a b\\"), "\"a b\\\\\"",
+                    "结尾反斜杠在引号内要翻倍");
+            CheckEq(DllInjector.Program.QuoteArgIfNeeded("a b\\\"c"), "\"a b\\\\\\\"c\"",
+                    "引号前的反斜杠要翻倍并转义引号");
 
             // ---- 5. 导出表解析 ---------------------------------------------------
             Console.WriteLine("\n  --- PeHelper.GetExportRva ---");

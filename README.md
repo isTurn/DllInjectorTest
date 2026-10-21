@@ -72,8 +72,8 @@ Release 里还会附带测试样例 DLL（`TestHookDll-*` / `TestReflectiveDll-*
 1. 在「运行中进程」右侧点击「刷新」，下拉框列出当前所有进程（名称 + PID）；
 2. 下拉选择目标进程；
 3. 点击「注入到进程」向它注入当前 DLL 输入框中的文件（可多个）；
-4. 或点击「卸载 DLL」把该进程中已加载的 DLL（以输入框文件名为准）卸载掉；
-5. **批量注入**：点击「批量注入」弹出进程多选对话框（列表显示 名称 + PID + 位数，可按名称筛选），勾选多个进程后确定，工具逐一注入并在日志中**汇总成功/失败结果**（位数不符的进程会自动跳过）。
+4. 或点击「卸载 DLL」把该进程中已加载的 DLL 卸载掉（以输入框文件名为准；**DLL 输入框里有多个 DLL 时**会弹出选择框，列出每个 DLL 在目标进程里的加载状态，选一个卸载——不会把 `a.dll;b.dll` 整串当成一个模块名）；
+5. **批量注入**：点击「批量注入」弹出进程多选对话框（列表显示 名称 + PID + 位数，可按名称筛选），勾选多个进程后确定，工具逐一注入并在日志中**汇总成功/失败结果**（位数不符的进程会自动跳过）。**只要有一个进程失败，本次批量注入就判为失败**，日志里会列出失败的 PID。
 
 > 注：注入其它进程（尤其以管理员/其它用户运行的进程）可能提示权限不足。图形界面非管理员启动时会自动弹出 UAC 提权；CLI 模式如遇权限不足请用管理员命令行运行。
 > 注入前工具会对每个 DLL 自动做 **PE 体检**（有效 PE / 位数 / 是否为 DLL / 导出表 / 重定位 / 可执行段），不合格直接拦截并给出原因。
@@ -95,14 +95,15 @@ DllInjector-x64.exe -help | -version
 - `-export`：注入成功后要调用的 DLL 导出函数名（可空）
 - `-exportarg`：传给该导出函数的参数；多个参数用 `||` 分隔（UTF-16，可空）
 - `-injectpid`：支持**多个 PID 用逗号分隔**，逐个批量注入并汇总结果
-- `-injectname`：按**进程名**批量注入，支持 `*` / `?` 通配（如 `cmd*`），位数不符自动跳过
+- `-injectname`：按**进程名**批量注入，支持 `*` / `?` 通配（如 `cmd*`），位数不符自动跳过；**自动排除注入器自身**（否则 `-injectname DllInjector hook.dll` 会把 DLL 注进正在执行注入的进程里）
+- 批量注入（`-injectpid` / `-injectname` 命中多个进程时）：**全部成功才返回 `0`**，只要有一个进程失败就返回 `1`，日志里列出失败 PID
 - `-checkdll`：**只做注入前 PE 体检**，不执行注入（返回 0 = 全部合格）
 - `-status`：**只读查询**，不动目标进程——打印进程位数与是否与本注入器匹配、指定 DLL 是否已在模块列表（给出基址）、
   手动映射记录是否有效（`DllInjector.mmmap` 里的基址，PID 复用过的会被判失效）、文本 Hook 的命名管道是否在线
   （`-pipe` 指定管道名，默认 `GalToolText`；能区分「没有这个管道」与「有管道但实例全被占满」）
 - `-help` / `-version`：打印完整用法 / 版本号后以 `0` 退出，不注入、不写日志
 - 退出码：`0` = 成功，`1` = 失败
-- 详细日志写入同目录下 `inject_log.txt`
+- 详细日志写入同目录下 `inject_log.txt`（图形界面同样写：每次启动覆写，首行记录版本号与启动时间，日志实时 flush）
 
 > **`|` 有两种含义，别混用**：作为**多个 DLL 之间的分隔符**时（DLL 输入框 / `-inject` 的 DLL 参数），`;`、`|`、换行都可以；而 `-exportarg` 里的 `|` 只是**普通字符**，原样传给导出函数（`InstallConfig` 正是用它分隔多个键值对）。
 > 所以 `-exportarg "engine=generic-gdi|cp=932"` 里的 `|` 不会被当成 DLL 分隔符——它整个是一份参数值。多个 DLL 请写在 `-exportarg` **之前**，或用 `;` 分隔以免看错。
@@ -286,7 +287,7 @@ WaitForSingleObject(15s) → GetExitCodeThread
 | `TextHookDll.def` | 导出表：统一 x86/x64 的无修饰导出名（x86 下 `__stdcall` 会修饰成 `_InstallConfig@4`） |
 | `TextHookDll.profiles.ini` | **引擎适配表模板**（随 DLL 一起分发）。改引擎适配只需改这个文件，不用重编译 DLL |
 | `TextHookClient.c` | 管道消费者，实时打印捕获到的文本；管道断开后自动重连（游戏重开、重新注入都不会让客户端自己退出） |
-| `TestTextHook.c` | **进程内端到端验证器**：自己加载 DLL、装钩子、用 GDI 输出文本、核对日志，全自动（自动跑 8 个场景，x64 + x86 都跑） |
+| `TestTextHook.c` | **进程内端到端验证器**：自己加载 DLL、装钩子、用 GDI 输出文本、核对日志，全自动（自动跑 9 个场景，x64 + x86 都跑） |
 | `build.bat` | 编译上述内容 + 验证用目标程序，**并自动跑两个架构的验证**（输出到 `test_output\`） |
 | `../TestTextTarget/TestTextTarget.c` | 验证目标：用 GDI 输出硬编码的日文/中文文本，便于确定性核对 |
 
@@ -351,6 +352,42 @@ hook=myengine.dll,RenderText
 校验是「全有或全无」：`argc` 越界、`text`/`len` 超出 `argc`、值不是数字，
 都会让整份文件不生效并退回内置。
 
+### 连 `engine=` 都不用写：`engine=auto` 自动选 profile
+
+给 profile 写上 `hintExe=` / `hintClass=`，注入时就只传 `engine=auto`：
+
+```ini
+[game-a]
+desc=游戏 A
+codepage=932
+hintExe=gamea*.exe          ; 目标进程 exe 名，支持 * 和 ?
+hintClass=TWin32Window*     ; 目标进程任意顶层窗口的类名，也支持通配
+hook=gdi32.dll,TextOutA
+```
+
+```bat
+DllInjector-x64.exe -inject gamea.exe test_output\TextHookDll-x64.dll ^
+    -export InstallConfig -exportarg "engine=auto|cp=932|log=1"
+```
+
+规则：
+
+| 项 | 行为 |
+| --- | --- |
+| 参与条件 | 两个 hint 都留空的 profile **不参与**判定（所以模板默认全注释时，行为与不写 auto 完全一样） |
+| 匹配 | `hintExe` 比对本进程 exe 文件名；`hintClass` 用 `EnumWindows` 遍历本进程顶层窗口比类名。都允许 `*` `?` 通配、大小写无关 |
+| 两个都写 | 必须**同时**命中 |
+| 多命中 | 取靠前的（文件 profile 先于内置，与「同名覆盖」语义一致） |
+| 别名 | `hint=` 等价于 `hintClass=` |
+| 判定结果 | 启动横幅**单独一行**报告命中 / 未命中；未命中会提示去补哪个键 |
+
+> 注意：写了 hint 的 profile 在**不传** `engine=` 时也会参与判定；`engine=auto`
+> 的作用是把这件事显式声明出来并强制打印结果。想彻底关掉就传一个具体的 `engine=<名字>`。
+
+为什么「未命中」要单独报一行：猜错 profile 和「引擎压根没走 IAT」在日志里长得一模一样
+（一条文本都没有）。把判定结果打出来，才能分清该改 hint 还是该查引擎的调用路径。
+
+
 > ⚠ **能力边界**：`text=` / `len=` 让 profile 不再局限于那 6 个函数，
 > 但**「第几个参数是文本」仍需自己数准**（看反汇编或头文件）。
 > 数错的后果不只是抓不到——把整数当指针读会让游戏崩掉，所以务必先在调试器里确认。
@@ -371,7 +408,7 @@ hook=myengine.dll,RenderText
 
 | 键 | 说明 |
 | --- | --- |
-| `engine` | 内置 `generic-gdi`（默认）/ `generic-gdi-sjis` / `generic-gdi-gbk` / `generic-unicode`，或 ini 文件里自定义的名字 |
+| `engine` | 内置 `generic-gdi`（默认）/ `generic-gdi-sjis` / `generic-gdi-gbk` / `generic-unicode`，或 ini 文件里自定义的名字，或 `auto`（按 `hintExe` / `hintClass` 自动挑） |
 | `profilefile` | 指定 profile 文件路径（默认取 DLL 同目录的 `TextHookDll.profiles.ini`） |
 | `nofile` | `1` 时完全不读 profile 文件，只用内置的 4 个（排查「是不是 ini 在作怪」时用） |
 | `cp` | 强制 `*A` 系列文本的代码页（932 = Shift-JIS，936 = GBK），覆盖 profile 默认值 |
@@ -379,9 +416,10 @@ hook=myengine.dll,RenderText
 | `log` | `1` 时同时落盘 `texthook_log.txt`（默认开，便于无客户端时验证） |
 | `minlen` / `dedup` | 最短文本长度（默认 2）/ 去重窗口毫秒（默认 200，游戏每帧重绘必须去重） |
 
-> **当前状态：一阶段 IAT Hook + 引擎适配表外部化 + 动态取址补漏。**
+> **当前状态：一阶段 IAT Hook + 引擎适配表外部化 + 动态取址补漏 + `engine=auto` 自动选 profile。**
 > 挂钩发生在游戏开跑之后（注入器的 `ResumeThread` 早于导出函数调用，会漏掉启动后约百毫秒的文本）。
-> profile 可以写成文件、不用重编译，也能挂框架不认识的函数；但**具体引擎 profile 仍需对着实机样本逆向填写**，
+> profile 可以写成文件、不用重编译，也能挂框架不认识的函数；写了 `hintExe` / `hintClass` 之后
+> 连 `engine=` 名字都不用传。但**具体引擎 profile 仍需对着实机样本逆向填写**，
 > 无法凭空推测。演进计划见设计文档第 8 节路线图。
 
 ## 从源码构建

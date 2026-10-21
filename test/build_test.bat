@@ -78,20 +78,20 @@ exit /b 0
 
 rem ---- x64 -----------------------------------------------------------------
 call "%VC%\vcvars64.bat" >nul
-cl /nologo /utf-8 /LD /O2 /DMARKER_PREFIX=\"attachA\" "%SRC%TestDll\TestDll.c" /link /OUT:"%OUT%\TestDllA_x64.dll"
+cl /nologo /W3 /utf-8 /LD /O2 /DMARKER_PREFIX=\"attachA\" "%SRC%TestDll\TestDll.c" /link /OUT:"%OUT%\TestDllA_x64.dll"
 if errorlevel 1 goto :fail
-cl /nologo /utf-8 /LD /O2 /DMARKER_PREFIX=\"attachB\" "%SRC%TestDll\TestDll.c" /link /OUT:"%OUT%\TestDllB_x64.dll"
+cl /nologo /W3 /utf-8 /LD /O2 /DMARKER_PREFIX=\"attachB\" "%SRC%TestDll\TestDll.c" /link /OUT:"%OUT%\TestDllB_x64.dll"
 if errorlevel 1 goto :fail
-cl /nologo /utf-8 /O2 "%SRC%TestTarget\TestTarget.c" /link /OUT:"%OUT%\Target_x64.exe" /SUBSYSTEM:CONSOLE
+cl /nologo /W3 /utf-8 /O2 "%SRC%TestTarget\TestTarget.c" /link /OUT:"%OUT%\Target_x64.exe" /SUBSYSTEM:CONSOLE
 if errorlevel 1 goto :fail
 
 rem ---- x86 -----------------------------------------------------------------
 call "%VC%\vcvars32.bat" >nul
-cl /nologo /utf-8 /LD /O2 /DMARKER_PREFIX=\"attachA\" "%SRC%TestDll\TestDll.c" /link /OUT:"%OUT%\TestDllA_x86.dll"
+cl /nologo /W3 /utf-8 /LD /O2 /DMARKER_PREFIX=\"attachA\" "%SRC%TestDll\TestDll.c" /link /OUT:"%OUT%\TestDllA_x86.dll"
 if errorlevel 1 goto :fail
-cl /nologo /utf-8 /LD /O2 /DMARKER_PREFIX=\"attachB\" "%SRC%TestDll\TestDll.c" /link /OUT:"%OUT%\TestDllB_x86.dll"
+cl /nologo /W3 /utf-8 /LD /O2 /DMARKER_PREFIX=\"attachB\" "%SRC%TestDll\TestDll.c" /link /OUT:"%OUT%\TestDllB_x86.dll"
 if errorlevel 1 goto :fail
-cl /nologo /utf-8 /O2 "%SRC%TestTarget\TestTarget.c" /link /OUT:"%OUT%\Target_x86.exe" /SUBSYSTEM:CONSOLE
+cl /nologo /W3 /utf-8 /O2 "%SRC%TestTarget\TestTarget.c" /link /OUT:"%OUT%\Target_x86.exe" /SUBSYSTEM:CONSOLE
 if errorlevel 1 goto :fail
 
 rem ---- clean intermediates left next to the sources ------------------------

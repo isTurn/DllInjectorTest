@@ -26,6 +26,13 @@
 - **文本 Hook 的统计计数器**：`上报 / 过滤（低于 minLen）/ 队列溢出丢弃` 三个计数，卸载时快照、下一轮首次 `InstallConfig` 时在启动横幅里报一行。此前队列满时静默丢弃，使用者只看到「文本少了」，分不清是钩子没抓到、编码错了、还是队列溢出
 - **`test/TextHookDll/TestTextHook.c` 场景 8（控制字符清洗）**：喂一段夹着 `\t` 和 `\r\n` 的 SJIS 文本，然后逐行扫描日志，要求「含文本的行里 tab 数 ≤ 3」（前三个是协议字段）且不含 `\r`
 - **`test/DllInjectorTests` 第 7 组（`ConfigStore`，12 项）**：原子写不留 `.tmp`、缓存命中、文件被外部改过后缓存失效、非法 `method` 退回 CRT、`Save` 不冲掉本次没设置的键。断言总数由 51 → 63
+- **`engine=auto`：按 `hintExe` / `hintClass` 自动选 profile**（`test/TextHookDll/TextHookDll.c`）：`EngineProfile` 新增两个提示字段，ini 里写 `hintExe=gamea*.exe` / `hintClass=TWin32Window*`（都支持 `*` `?` 通配，`hint=` 是 `hintClass=` 的别名），注入时只传 `engine=auto` 即可。`ResolveAutoProfile()` 按「文件 profile 先、内置后」的顺序取第一个命中的
+  - 两个 hint 都留空的 profile **不参与**判定（所以模板全注释时行为与以前完全一致）；两个都写则必须同时命中
+  - 判定结果在启动横幅里**单独一行**报告命中 / 未命中，未命中还提示去补哪个键。猜错 profile 与「引擎没走 IAT」在日志里是同一个现象（一条文本都没有），不报出来就分不清该改 hint 还是该查引擎的调用路径
+  - 实现是 `GetModuleFileNameW(NULL)` 取本进程 exe 名 + `EnumWindows` / `GetClassNameA` 遍历本进程顶层窗口；通配匹配用**迭代式回溯**而非递归（pattern 来自用户 ini，递归深度不受控）
+  - 此前 `docs/text-hook-design.md` §3.1 能力表把 `hintClass` / `hintExe` 标为「❌ 未实现」，是 S3 里唯一没兑现的一条
+- **`test/TextHookDll/TestTextHook.c` 场景 9（`engine=auto`）**：命中与未命中两半都跑。命中那半故意把第一个 profile 的 `hintExe` 写成永不匹配的名字，断言横幅报的是**第二个**——测的不只是「挑到了一个」，还包括「按顺序跳过不匹配的」；未命中那半断言横幅报「未能命中」并退回 `generic-gdi`，而不是沿用上一轮的文件 profile。`hintExe` 用 `TestTextHook*.exe` 通配而不是写死位数，同一份代码才能 x64 / x86 都跑
+- **`IsWow64Process2` 判位数**（`DllInjector/Program.cs`）：原先只用 `IsWow64Process` 的布尔值再 `? 32 : 64`，在 ARM64 Windows 上 x64 进程跑在 WOW64 层会被误判成 32 位，查询失败时又静默当成 64 位。现在优先用 `IsWow64Process2` 同时取 `processMachine` / `nativeMachine`，拿不到才退回旧接口
 
 ### 修复
 - **反射式注入「假装成功」，目标进程已被打死**：`ReflectiveInjectIntoProcess` 把镜像按 `PAGE_READWRITE` 分配后从未提权，而远程线程入口 `baseAddr + loaderRva` 就在这块缓冲里——线程一取指即 `STATUS_ACCESS_VIOLATION(0xC0000005)`。成功判据只有 `if (code == 0)`，于是 0xC0000005 被当成「映射成功」，注入器打印「反射加载成功」+「核验通过」，而目标进程已经死了
@@ -44,12 +51,82 @@
 - **APC 注入后立即调导出函数，模块还没装进去**：`QueueUserAPC` 是异步的——`ResumeThread` 只是让目标主线程“可以”执行 APC，真正跑起来要等它进入可告警等待（`SleepEx` / `WaitForSingleObjectEx` / 消息循环）。而 `Run()` 恢复线程后就直接去调导出函数，于是日志里出现互相矛盾的两行：先报「未在目标进程中找到已加载的模块」（`CallExport` 拿不到基址），紧接着核验又报「核验通过」（`VerifyModuleLoaded` 有 3 × 300ms 重试）
   - 修法：新增 `WaitApcloaded`，导出调用前每 100ms 轮询模块列表（上限 3000ms），安静探针抽成 `IsModuleLoadedByName` 供轮询复用；`VerifyModuleLoaded` 也改用它，不再重复枚举两遍
   - 表现是 x86 下的间歇性失败（八次里一次），很容易被当成“测试不稳”而忽略；实际上目标程序的 `SleepEx(1000, TRUE)` 越慢、APC 越容易推迟到调导出函数之后
+- **手动映射超时后释放远程线程正在执行的页，目标进程必崩**（`DllInjector/Program.cs`）：`ManualMapInjectIntoProcess` 在 `WaitForSingleObject` 返回 `WAIT_TIMEOUT` / `WAIT_FAILED` 时只打一条警告就 `goto failCleanup`，而 `failCleanup` 无条件 `VirtualFreeEx` 掉三块远程内存——其中 `scBuf` 正是远程线程此刻的取指页。释放正在执行的指令页等于立刻 `0xC0000005`
+  - 同一文件里 `LoadLibraryIntoProcess` 早就有 `remoteBufBusy` 保护（超时就把这块内存标记为「不要动」），手动映射这条路径漏了
+  - 修法：新增 `threadMayBeRunning`，超时分支置真；`failCleanup` 只在它为假时才关线程句柄、释放三块内存，为真时只打一行「已保留目标进程内的临时内存」——泄漏几十 KB 远好过打死目标进程
+  - `UnmapManualMapIntoProcess` 同病同修（它的 `argsBuf` / `scBuf` 同样被无条件释放）
+- **`EjectDll` 的「模块仍在列表」检查是死代码**：`:1976` 写的是 `string.Equals(pm.FileName, moduleName, ...)`，而 `pm.FileName` 是**完整路径**、`moduleName` 来自 `Path.GetFileName`，两者永不相等 → `stillLoaded` 恒为 false。同一方法里另外三处比较都正确用了 `Path.GetFileName(m.FileName)`
+  - 只把比较改对还不够：`FreeLibrary` 在引用计数 >1 时正常返回非 0 而模块确实还在列表里，那是**正确行为**，不能判成卸载失败（真正的失败信号是 `freeResult == 0`）
+  - 所以两件事一起做：比较改成 `Path.GetFileName(pm.FileName)`，同时把「仍在列表」从 `return false` 降级为一行提示（说明还有其它持有者，属正常结果）
+  - `E2E` 第 7 组原本断言「只卸一次时模块仍在列表里且返回成功」——这条断言此前能过，恰恰是因为死代码让返回值恒真
+- **反射式注入把整块镜像封成 `PAGE_EXECUTE_READ`，可写数据段也被禁写**：`ReflectiveInjectIntoProcess` 结尾对 `sizeOfImage` 整段调 `SealShellcodePage`，DLL 只要有可写全局变量，第一次写就崩
+  - 新增 `SealImageSections`：头部页 `PAGE_READONLY`、可执行节 `PAGE_EXECUTE_READ`、其余 `PAGE_READWRITE`，按 `VirtualSize` 计算 span 并钳到 `sizeOfImage`，最后 `FlushInstructionCache`
+  - 顺带解决了另一处自相矛盾：`ManualMapInjectIntoProcess` 的注释强调「绝不用 `PAGE_EXECUTE_READWRITE`，那是 EDR 最典型特征」，而反射路径原本就是整段 RWX
+- **`SealShellcodePage` 的返回值被所有调用方丢弃**：`VirtualProtectEx` 失败时只打一行「警告」就继续，页仍然可写。现在调用方检查返回值，失败时明确提示「该页仍可写」而不是静默降级
+- **`DllInjector.mmmap` 落盘不是原子操作**：`SaveMmMapFile` 用裸 `File.WriteAllText`，而同一个文件里 `ConfigStore.Flush` 早就实现了「写 `.tmp` + `File.Replace`」并附了大段注释说明为什么必要。手动映射记录写到一半被杀 → 文件截断 → 下次 `LoadMmMapFile` 反序列化抛异常被 `catch {}` 吞掉 → 全部基址记录静默丢失
+  - 抽出 `AtomicFile.WriteAllText` / `WriteAllLines`，`ConfigStore.Flush` 与 `SaveMmMapFile` 共用
+- **GUI 从不写 `inject_log.txt`，但 README 承诺「界面日志 + 日志文件双通道」**：`Log()` 纯内存，只有 CLI 分支在末尾写一次文件
+  - `MainForm` 新增 `_logFile` / `_logFileBroken` + `OpenLogFile()` / `CloseLogFile()`：每次启动覆写 `inject_log.txt`，首行写版本与时间戳，`AutoFlush`；每行日志同时落盘，写失败就置 broken 并只提示一次
+- **`-injectname` 会给自己注入**：枚举 `Process.GetProcesses()` 时没有排除 `Environment.ProcessId`，`-injectname DllInjector ...` 会尝试把 GUI 自己当目标打死
+  - 排除自身 PID，提示语改为「未找到匹配的进程（名称模式: …）；已自动排除注入器自身。」
+- **所有输入框都接受文件拖放，拖一个文件就把整串路径写进去**：`MakeBox()` 给 5 个 TextBox 无差别绑了 `AllowDrop` + `DragDrop`，包括「启动参数」「导出函数」「调用参数」——往「启动参数」里拖文件会得到一串带分号的路径
+  - `MakeBox(bool acceptFiles = false)`，只有「目标程序」「DLL 列表」两个框开启
+- **GUI「卸载 DLL」把整串多 DLL 文本当模块名**：`_txtDll.Text.Trim().Trim('"')` 整串传给 `EjectDll`，`Path.GetFileName` 之后得到 `"a.dll;b.dll"` 这种必然找不到的名字
+  - 改用 `SplitDlls` 拆分；多个 DLL 时弹选择框，列出每个 DLL 是否已加载，让用户选一个再卸
+- **CLI `-args` 多词参数丢引号**：`-args --title "My Game"` 拼进命令行后变成三段
+  - 新增 `QuoteArgIfNeeded`（按 Windows 命令行的引号 / 反斜杠转义规则），`-args` 的每个 token 逐个过一遍
+- **`BatchInjectProcesses` 部分失败也算成功**：`return okN > 0` —— 批量注入 10 个成功 1 个也返回 0。改成全部成功才算成功，并新增 `--any` 开关保留旧语义给「能注进去一个就够」的脚本
+- **`WildcardMatch` 每次调用都重新编译正则**：`-injectname` 会对每个进程调两次（带 / 不带 `.exe`），几百进程就是上千次正则编译
+  - 加 `ConcurrentDictionary` 缓存已编译的 `Regex`（`Compiled | CultureInvariant`），null 参数直接返回 false
+- **`ConfigStore.Method` 每赋值一次就全量重写一次配置文件**：GUI 每次点注入按钮都会触发
+  - setter 里先比对新旧值，相同则直接返回；`Flush` 也加了「内容没变就不写」
+- **配置可写性探测用固定文件名，有竞态且会留垃圾**：`.dllinjector_wtest` 两个实例同时启动会互相踩，进程在写与删之间被杀就留下垃圾文件
+  - 探测名改为 `.dllinjector_wtest_<Guid:N>`，`try` / `finally` 保证删除
+- **手动映射卸载失败时不清理 `MmBases` 记录**：失败路径记录残留，下次 `-status` 仍报「记录有效」
+  - 卸载失败且确认模块已不在时清掉记录
+- **`Process.GetProcessById(pid).Modules` 没有 `Dispose`**：`EjectDll` 与 `Status` 里几处都漏了
+  - 统一 `using var proc = ...`（`EjectDll` 里两处同进程枚举合并成一次）
+- **`ResumeThread` 的 P/Invoke 签名错误**：声明成 `bool`，而它返回 `DWORD`（上一个挂起计数，失败是 `(DWORD)-1`）——封送成 `bool` 后 `0xFFFFFFFF` 与 `1` 无法区分
+  - 改成返回 `uint` 并检查返回值，`ResumeThread` 失败时明确报错而不是照旧打「主线程已恢复」
+- **`PROCESS_ACCESS_FOR_INJECT` 缺 `PROCESS_QUERY_LIMITED_INFORMATION`**：`Status` / `EjectDll` 之后要枚举模块与读启动时间，只给 `PROCESS_QUERY_INFORMATION` 在部分受保护进程上会失败
+  - 补上 `PROCESS_QUERY_LIMITED_INFORMATION`（它比 `QUERY_INFORMATION` 宽容，能拿到的信息够用）
+- **相对路径的 exe 让 `lpCurrentDirectory` 变成空串**：`Path.GetDirectoryName("game.exe")` 返回 `""` 而不是 `null`，`CreateProcess` 直接失败——用户只输文件名时必现
+  - 空串归一成 `null`，并补一条「目标程序没有目录部分，用当前目录」的提示
+- **AnyCPU 托管目标被误判位数**：`PeHelper.GetExeBitness` 只看 COFF `machine`，`0x014C` 一律当 32 位。AnyCPU 的 .NET exe 在 x64 上实际跑 64 位，却被判成 32 位后直接拒绝注入
+  - 读 CLR 头：`ILONLY` 且未置 `32BITREQUIRED` 时按宿主位数处理
+- **`test/TextHookDll` 通用挂钩状态跨 Unhook → Install 从不重置**（`TextHookDll.c`）：`g_gen` / `g_genTargets` 只在 `RegisterGeneric` 里写、永不清理
+  - 后果一：改 ini 后重装会复用上一轮的 thunk（旧的 `textArg` / `argc` / `conv` + 旧函数指针），x86 上 `argc` 从 5 变 2 会弹歪栈直接 AV
+  - 后果二：槽位永不释放，8 个不同通用 profile 之后永久「通用挂钩槽位已满」
+  - 修法：`HookAllModules` 里 `g_dynCount = 0` 旁边补 `memset(g_gen, 0, ...)` 与 `memset(g_genTargets, 0, ...)`
+- **`PipeWrite` 可能带着 pending I/O 返回，且共享事件不复位**：`OVERLAPPED` 是调用方的栈变量，`CancelIoEx` 之后 1 秒也没等到就直接返回，内核稍后会把完成状态写进已经销毁的栈帧
+  - 修法：`OVERLAPPED` 改堆分配；每次操作前先 `ResetEvent` 吃掉残留信号；成功 / 非 `PENDING` 错误立即释放；超时后 `CancelIoEx` 再等 12 秒，仍未完成则**故意不释放**（内核还持有指针）——泄漏一块 32 字节远好过写坏调用方栈
+- **`StopHooks` 的有界等待被击穿，工作线程活得比 DLL 长**：`WriterThreadProc` 的内层排空循环不检查 `g_stop`，消费者停顿时单次广播最坏要 3 秒，而 `StopHooks` 只等 2 秒就 `CloseHandle` 线程句柄——关句柄不会终止线程，随后 `UnhookAll` + `FreeLibrary`，线程跑在已卸载的映像上
+  - 修法：排空循环取节点前加 `if (g_stop) return 0;`；等待上限提到 5 秒；真的超时则用 `OutputDebugStringW` 明确警告「此时卸载 DLL 可能导致目标进程崩溃」
+- **`Enqueue` 与 `StopHooks` 争用 `g_qEvent`**：`Enqueue` 里的 `if (g_qEvent) SetEvent(g_qEvent)` 与 `StopHooks` 里关闭它之间存在 TOCTOU，`SetEvent` 可能作用在已被回收的句柄上
+  - 两处都放进 `g_qCs` 临界区，先取局部句柄再判断
+- **`Hook_GetProcAddress` 把 `real_GetProcAddress` 读了两次**：判断与调用之间 `UnhookAll` 可能把它置 `NULL`
+  - 先读进局部函数指针再判断
+- **`cp=1200`（UTF-16）让所有 `*A` 文本静默消失**：`MultiByteToWideChar(1200, ...)` 对任何输入都返回 0 / `ERROR_INVALID_PARAMETER`，而失败时又不计 `g_statFiltered`，表现成「上报 0 条、过滤 0 次」，与「钩子没被调用」不可区分。内置 profile `generic-unicode` 用的正是 `cp=1200`
+  - `EmitAnsi` 为 1200 / 1201 加单独的直通路径（按 `wchar_t` 对数 `memcpy`，1201 逐对调序），不再经过 `MultiByteToWideChar`；转换失败也计入 `g_statFiltered`
+- **`TestTextHook.c` 的失败路径不卸载钩子**：`RunScenario` 里两处 `if (!log) return;` 直接返回，后续场景的 `InstallConfig` 撞上 `if (g_initialized) return TRUE` 变成 no-op，后面所有断言都以错误的原因失败
+  - 提前返回前补 `g_Unhook(NULL)`
+- **`TestTextHook.c` 里唯一的非 ASCII 窄字面量**：该文件开头声明「不含任何非 ASCII 字面量：期望值一律用 `\uXXXX` 转义」，而 `WaitLog("こんにちは", 3000)` 违反了它（只因 `build.bat` 传 `/utf-8` 才没炸）
+  - 改成 `ToUtf8(kExpectHello, ...)` 转出来再比对
+- **`CHANGELOG.md` 里有两个 `## [1.0.0]`**：release job 的 `awk` 按 `## [` 首次匹配切段，打 `v1.0.0` 标签时只会取到前一段，后一段永远进不了 Release body
+  - 后一段（2026-09-01 的图形界面首发）改名为 `## [1.0.0-alpha]`
+- **`.gitignore` 少一个换行让两条规则同时失效**：`Desktop.ini$RECYCLE.BIN/` 被当成一个模式，于是 `Desktop.ini` 与 `$RECYCLE.BIN/` 都没被忽略（`git check-ignore` 实测返回 1）
+  - 拆成两行；顺带把笔误的 `.dlInjector_wtest`（小写 L）改成 `.dllinjector_wtest`
 
 ### 变更
 - **`test/DllInjectorE2E` 接入 CI**：`native` job 新增两个步骤，`test\DllInjectorE2E\build.bat` 与 `--x86`
+- **`TestTextHook.c` 的场景数 8 → 9**：`main` 的用法串改成 `1-9`，新增的 `iniAuto` / `iniAutoMiss` 两个临时文件在收尾处一并删除
 - **验证器的固定等待改成轮询**：`TestTextHook.c` 里 8 个场景共 40 秒的 `Sleep(700)` / `Sleep(1200)` 换成 `WaitLog`（轮询日志直到出现期望内容）与 `WaitWhileTrue`（轮询 IAT 是否已还原）。写线程本来就是入队即 `SetEvent` 唤醒，一行文本落盘只需几毫秒，固定 `Sleep` 把最坏情况当成了常态；`test\TextHookDll\build.bat` 因此从 48.9 秒降到 15.5 秒
   - 轮询一上就把固定等待盖住的三个竞态全暴露出来了（上面两条修复，加上「等待锚点选得太早」：只等「已安装 profile=」会在横幅逐条落盘的中途提前返回，现在统一改等排在最后的「动态取址：」那行）
-- **文档同步**：README 的测试素材列表与目录树、`docs/index.html` 的构建代码块与命令行特性、`CONTRIBUTING.md` 的目录职责与提交前自检、`docs/text-hook-design.md` §10.1 的场景表（7 → 8 行）与场景 8 说明
+  - 场景 9 也踩了同一个坑：`InstallConfig` 返回后立刻读日志会读到「文件还不存在」，所以两半都先 `WaitLog("engine=auto 已命中"/"engine=auto 未能命中")` 再读整份日志
+- **`test/TextHookDll/build.bat` 的两个 DLL 链接行补上 `user32.lib`**：`hintClass` 匹配要用 `EnumWindows` / `GetClassNameA` / `GetWindowThreadProcessId`，三个都在 user32；x64 与 x86 两行都加了
+- **`TextHookDll.profiles.ini` 模板补 `hintExe=` / `hintClass=` / `engine=auto` 说明，并新增示例 6**：示例 6 给两个 profile 各写一条互不重叠的 hint，演示「注入时只传 `engine=auto`」；同时把 `cp=1200` 的说明改成「走单独的 UTF-16 直通路径（不经过 `MultiByteToWideChar`，那对 1200 会返回失败）」
+- **文档同步**：`README.md` 的文本 Hook 段新增「连 `engine=` 都不用写」小节与 `engine=auto` 的规则表、`engine` 配置项补 `auto`、场景数 8 → 9、当前状态段落；`docs/text-hook-design.md` 的 §3.1 能力表（`hintClass`/`hintExe` 改为 ✅）、新增 §3.3 `engine=auto`、§3.2 键表补两行、§8 路线图 S3 行与说明、§9 已知限制里那条 `auto` 条目划掉改写、§10.1 场景表 8 → 9 行并补场景 9 说明
+- **`CONTRIBUTING.md` 的目录职责块**：`Program.cs` 的「约 3000 行」改成实际规模（约 4200 行），并把 `AtomicFile`（原子写）补进区块列表
 
 ## [1.1.0] - 2026-10-19
 
@@ -282,7 +359,12 @@
 - QueueUserAPC 注入崩溃：APC 为异步执行，LoadLibraryW 在目标主线程可告警后才运行；此前路径内存过早释放导致目标进程访问无效内存崩溃，改为 APC 方式保留路径内存（随进程退出回收）
 - 记忆功能对多 DLL 失效：加载上次选择时对整串分号路径做 File.Exists 必然失败，改为按分号逐段校验，多 DLL 可完整带出
 
-## [1.0.0] - 2026-09-01
+## [1.0.0-alpha] - 2026-09-01
+
+> 本节原名也是 `## [1.0.0]`，与上面 2026-09-07 那节重名。后果是 `.github/workflows/build.yml`
+> 的发布流程用 `awk` 按 `## [版本]` 首次匹配切段，打 `v1.0.0` 标签时只会取到 09-07 那节，
+> 本节连同下面的 P1 / P2 永远进不了 Release 说明。改名后两者不再冲突。
+> （`v1.0.0` 标签指向 2026-09-08 的提交，对应的是 09-07 那节，所以 09-07 保留 `1.0.0`。）
 
 ### 新增
 - 图形界面（WinForms）：选择目标 exe 与 dll，一键「注入并启动」

@@ -19,6 +19,7 @@ namespace DllInjector
         public const uint MEM_RELEASE       = 0x8000;
         public const uint PAGE_READWRITE    = 0x04;
         public const uint PAGE_EXECUTE_READ = 0x20;
+        public const uint PAGE_READONLY     = 0x02;
         public const uint PAGE_EXECUTE_READWRITE = 0x40;
         public const uint INFINITE          = 0xFFFFFFFF;
         public const uint WAIT_TIMEOUT      = 0x00000102;
@@ -30,6 +31,9 @@ namespace DllInjector
         public const uint PROCESS_VM_READ           = 0x0010;
         public const uint PROCESS_VM_WRITE          = 0x0020;
         public const uint PROCESS_QUERY_INFORMATION = 0x0400;
+        // 受限查询权限：只能读映像名 / 退出码这类元信息，拿不到完整令牌信息，
+        // 但 Win7 起对「权限不足也想报个名字」的场景比 QUERY_INFORMATION 宽容。
+        public const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
 
         // 令牌权限
         public const uint TOKEN_QUERY               = 0x0008;
@@ -38,8 +42,15 @@ namespace DllInjector
         public const uint ERROR_NOT_ALL_ASSIGNED    = 1300;   // AdjustTokenPrivileges 返回 true 但权限未生效
 
         /// <summary>注入 / 卸载所需的最小权限组合</summary>
+        /// <remarks>
+        /// 带上 PROCESS_QUERY_LIMITED_INFORMATION 是为了让「注入成功之后」的收尾工作
+        /// （读映像名、判断位数、卸载时枚举模块）不必再开第二个句柄。它比
+        /// PROCESS_QUERY_INFORMATION 宽容，且 Win7 起就有；两者同时申请时
+        /// 系统取并集，没有副作用。
+        /// </remarks>
         public const uint PROCESS_ACCESS_FOR_INJECT =
-            PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION;
+            PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_READ | PROCESS_VM_WRITE |
+            PROCESS_QUERY_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION;
 
         // 注入方式
         public const int INJECT_CRT = 0;   // CreateRemoteThread（默认，兼容性最好）
@@ -111,8 +122,11 @@ namespace DllInjector
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern IntPtr CreateRemoteThread(IntPtr hProcess, IntPtr lpThreadAttributes, UIntPtr dwStackSize, IntPtr lpStartAddress, IntPtr lpParameter, uint dwCreationFlags, out uint lpThreadId);
 
+        // 返回 DWORD（上一个挂起计数），失败时是 (DWORD)-1 —— 不是 BOOL。
+        // 早先错声明成 bool：封送层把「非零」映射成 true，于是 0xFFFFFFFF（失败）
+        // 和正常的 1 变得无从区分，返回值等于白拿。
         [DllImport("kernel32.dll", SetLastError = true)]
-        public static extern bool ResumeThread(IntPtr hThread);
+        public static extern uint ResumeThread(IntPtr hThread);
 
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool GetExitCodeThread(IntPtr hThread, out uint lpExitCode);
@@ -143,6 +157,11 @@ namespace DllInjector
 
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool IsWow64Process(IntPtr hProcess, out bool Wow64Process);
+
+        // Win10 1709+ 才有。相比 IsWow64Process 只有一个是/否，它能把「WOW64 层里的 x86 进程」
+        // 和「ARM64 系统上原生跑的 x64 进程」分开——后者用旧 API 会被判成 32 位。
+        [DllImport("kernel32.dll", SetLastError = true)]
+        public static extern bool IsWow64Process2(IntPtr hProcess, out ushort pProcessMachine, out ushort pNativeMachine);
 
         [DllImport("ntdll.dll")]
         public static extern int NtCreateThreadEx(
@@ -178,6 +197,70 @@ namespace DllInjector
             int code = Marshal.GetLastWin32Error();
             return $"0x{code:X8} ({new Win32Exception(code).Message})";
         }
+
+        private const ushort MACHINE_UNKNOWN = 0;
+        private const ushort MACHINE_I386 = 0x014C;
+        private const ushort MACHINE_ARMNT = 0x01C4;
+        private const ushort MACHINE_AMD64 = 0x8664;
+        private const ushort MACHINE_ARM64 = 0xAA64;
+
+        /// <summary>
+        /// 判断目标进程是 32 位还是 64 位，返回 32 / 64；判断不出来返回 0。
+        /// </summary>
+        /// <remarks>
+        /// 为什么不能直接用 IsWow64Process：它的语义是「这个进程是否跑在 WOW64 层」，
+        /// 而 WOW64 只在 64 位系统上存在。于是有两个它会明确答错的场景：
+        ///   1) 32 位 Windows 上，**所有**进程的 Wow64Process 都是 FALSE，旧代码因此把每个进程
+        ///      都算成 64 位 —— x86 版注入器在这种机器上会拒绝一切注入。
+        ///   2) ARM64 Windows 上原生跑的 x64 进程，Wow64Process 同样是 FALSE，但它不是 64 位
+        ///      意义上的「本机进程」，只靠这个布尔量无法和真正 64 位区分（对 x64 注入器恰好结论
+        ///      相同，但一旦出现 ARM64 原生进程就完全错了）。
+        /// IsWow64Process2 直接给出 processMachine / nativeMachine，能把这些情况分开。
+        /// 老系统（Win7/8/8.1）没有这个导出，DllImport 会在首次调用时抛
+        /// EntryPointNotFoundException，此时退回旧 API + OS 位数一起判断。
+        /// </remarks>
+        public static int GetProcessBitness(IntPtr hProcess)
+        {
+            if (hProcess == IntPtr.Zero) return 0;
+            try
+            {
+                if (IsWow64Process2(hProcess, out ushort processMachine, out ushort nativeMachine))
+                {
+                    if (processMachine != MACHINE_UNKNOWN)
+                    {
+                        // 跑在仿真/WOW64 层里：以 processMachine 为准
+                        switch (processMachine)
+                        {
+                            case MACHINE_I386:
+                            case MACHINE_ARMNT: return 32;
+                            case MACHINE_AMD64:
+                            case MACHINE_ARM64: return 64;
+                            default: break;
+                        }
+                    }
+                    // processMachine == UNKNOWN 表示「和系统同架构」，答案由 nativeMachine 决定
+                    switch (nativeMachine)
+                    {
+                        case MACHINE_I386:
+                        case MACHINE_ARMNT: return 32;
+                        case MACHINE_AMD64:
+                        case MACHINE_ARM64: return 64;
+                        default: return Environment.Is64BitOperatingSystem ? 64 : 32;
+                    }
+                }
+            }
+            catch (EntryPointNotFoundException) { }
+            catch (DllNotFoundException) { }
+
+            // 退回旧 API。关键在于先看系统位数：32 位系统上所有进程都是 32 位。
+            if (!Environment.Is64BitOperatingSystem) return 32;
+            try
+            {
+                if (IsWow64Process(hProcess, out bool wow64)) return wow64 ? 32 : 64;
+            }
+            catch { }
+            return 0;
+        }
     }
 
     /// <summary>读取 PE 文件头判断可执行文件位数</summary>
@@ -196,11 +279,72 @@ namespace DllInjector
                 fs.Seek(peOffset, SeekOrigin.Begin);
                 if (br.ReadUInt32() != 0x00004550) return 0;       // "PE\0\0"
                 ushort machine = br.ReadUInt16();
-                if (machine == 0x014C) return 32;                  // IMAGE_FILE_MACHINE_I386
+                // AnyCPU 的托管 exe：Machine 字段同样是 I386(0x014C)，但它并不「是 32 位」——
+                // 在 64 位 Windows 上 CLR 会把它跑成 64 位进程。旧版只看 Machine，于是把所有
+                // AnyCPU 目标都判成 32 位，x64 注入器一比对就报「位数不匹配」直接拒绝。
+                // 这里补一步：Machine 是 I386 时再看 CLR 头的 COMIMAGE_FLAGS_32BITREQUIRED。
                 if (machine == 0x8664) return 64;                  // IMAGE_FILE_MACHINE_AMD64
-                return 0;
+                if (machine == 0xAA64) return 64;                  // IMAGE_FILE_MACHINE_ARM64
+                if (machine == 0x01C4 || machine == 0x01C0) return 32; // ARM / ARMNT，按 32 位
+                if (machine != 0x014C) return 0;
+                return IsAnyCpuManaged(fs, br, peOffset)
+                    ? (Environment.Is64BitOperatingSystem ? 64 : 32)
+                    : 32;
             }
             catch { return 0; }
+        }
+
+        /// <summary>
+        /// 判断一个 Machine=I386 的 PE 是否其实是 AnyCPU 托管程序集。
+        /// 条件：有 CLR 头（DataDirectory[14] 非空）且 COMIMAGE_FLAGS_32BITREQUIRED 未置位。
+        /// 任何一步解析不出来都返回 false，保守地按真正的 32 位处理——宁可拒绝也不误注。
+        /// </summary>
+        private static bool IsAnyCpuManaged(FileStream fs, BinaryReader br, int peOffset)
+        {
+            try
+            {
+                fs.Seek(peOffset + 4, SeekOrigin.Begin);            // 跳过 PE 签名
+                br.ReadUInt16();                                    // Machine
+                br.ReadUInt16();                                    // NumberOfSections
+                br.ReadUInt32();                                    // TimeDateStamp
+                br.ReadUInt32();                                    // PointerToSymbolTable
+                br.ReadUInt32();                                    // NumberOfSymbols
+                ushort optSize = br.ReadUInt16();
+                br.ReadUInt16();                                    // Characteristics
+                long optStart = fs.Position;
+                ushort magic = br.ReadUInt16();
+                if (magic != 0x10B) return false;                   // AnyCPU 只可能是 PE32 外壳
+                const int CLR_DIR_INDEX = 14;                       // DataDirectory[14] = CLR Runtime Header
+                fs.Seek(optStart + 96 + CLR_DIR_INDEX * 8, SeekOrigin.Begin);
+                uint clrRva = br.ReadUInt32();
+                if (clrRva == 0) return false;                      // 没有 CLR 头 = 原生 x86
+
+                // RVA → 文件偏移：在节表里找包住该 RVA 的节
+                fs.Seek(optStart + optSize, SeekOrigin.Begin);
+                for (int i = 0; i < 96; i++)
+                {
+                    long secStart = fs.Position;
+                    if (secStart + 40 > fs.Length) return false;
+                    fs.Seek(secStart + 8, SeekOrigin.Begin);        // VirtualSize
+                    uint vSize = br.ReadUInt32();
+                    uint vAddr = br.ReadUInt32();
+                    uint rawSize = br.ReadUInt32();
+                    uint rawPtr = br.ReadUInt32();
+                    uint span = vSize > 0 ? vSize : rawSize;
+                    if (clrRva >= vAddr && clrRva < vAddr + span)
+                    {
+                        long off = rawPtr + (clrRva - vAddr);
+                        if (off + 20 > fs.Length) return false;
+                        fs.Seek(off + 16, SeekOrigin.Begin);        // CLR 头 Flag 在偏移 16
+                        uint flags = br.ReadUInt32();
+                        const uint COMIMAGE_FLAGS_32BITREQUIRED = 0x00000002;
+                        return (flags & COMIMAGE_FLAGS_32BITREQUIRED) == 0;
+                    }
+                    fs.Seek(secStart + 40, SeekOrigin.Begin);
+                }
+            }
+            catch { }
+            return false;
         }
 
         /// <summary>读取 PE 导出表，返回指定导出函数的 RVA（相对模块基址）；未找到或解析失败返回 -1。</summary>
@@ -476,6 +620,7 @@ namespace DllInjector
         {
             // 记忆窗口位置（含边框的窗口矩形）
             try { ConfigStore.WindowPos = $"{Bounds.X},{Bounds.Y},{Bounds.Width},{Bounds.Height}"; } catch { }
+            CloseLogFile();
             base.OnFormClosing(e);
         }
 
@@ -545,12 +690,12 @@ namespace DllInjector
         private void BuildUi()
         {
             _lblExe = MakeLabel("目标程序:");
-            _txtExe = MakeBox();
+            _txtExe = MakeBox(acceptFiles: true);
             _btnExe = MakeBrowseButton("浏览",
                 () => _txtExe.Text = PickFile("可执行文件 (*.exe)|*.exe|所有文件 (*.*)|*.*"));
 
             _lblDll = MakeLabel("DLL 文件:");
-            _txtDll = MakeBox();
+            _txtDll = MakeBox(acceptFiles: true);
             _btnDll = MakeBrowseButton("浏览",
                 () => { string f = PickFiles("DLL 文件 (*.dll)|*.dll|所有文件 (*.*)|*.*"); if (f != null) _txtDll.Text = f; });
             _btnSort = MakeBrowseButton("⇅ 排序",
@@ -787,15 +932,22 @@ namespace DllInjector
         private static Label MakeLabel(string text)
             => new Label { Text = text, AutoSize = true };
 
-        private TextBox MakeBox()
+        /// <summary>创建输入框。<paramref name="acceptFiles"/> 控制是否接受文件拖放——
+        /// 只有「目标程序」「DLL」两个框该接收：它们的值本来就是文件路径。
+        /// 原先这里无差别给所有输入框挂拖放处理器，结果往「启动参数」框拖一个文件，
+        /// 会把整串路径加 ';' 覆写进参数，Run 再拼进命令行，目标程序收到的参数完全走样。</summary>
+        private TextBox MakeBox(bool acceptFiles = false)
         {
-            var tb = new TextBox { AllowDrop = true };
-            tb.DragEnter += (s, e) => { if (e.Data.GetDataPresent(DataFormats.FileDrop)) e.Effect = DragDropEffects.Copy; };
-            tb.DragDrop += (s, e) =>
+            var tb = new TextBox { AllowDrop = acceptFiles };
+            if (acceptFiles)
             {
-                if (e.Data.GetData(DataFormats.FileDrop) is string[] files && files.Length > 0)
-                    tb.Text = string.Join(";", files);
-            };
+                tb.DragEnter += (s, e) => { if (e.Data.GetDataPresent(DataFormats.FileDrop)) e.Effect = DragDropEffects.Copy; };
+                tb.DragDrop += (s, e) =>
+                {
+                    if (e.Data.GetData(DataFormats.FileDrop) is string[] files && files.Length > 0)
+                        tb.Text = string.Join(";", files);
+                };
+            }
             return tb;
         }
 
@@ -805,6 +957,16 @@ namespace DllInjector
             b.Click += (s, e) => onClick();
             return b;
         }
+
+        /// <summary>主窗体用的按钮工厂（内嵌对话框里各自有一份私有版本，因为它们不需要主题缩放）</summary>
+        private Button MakeBtn(string text, bool accent = false) => new Button
+        {
+            Text = text,
+            FlatStyle = FlatStyle.Flat,
+            BackColor = accent ? Theme.Accent : Theme.ButtonBack,
+            ForeColor = Color.White,
+            Cursor = Cursors.Hand
+        };
 
         /// <summary>文件选择：初始目录固定为注入器 EXE 所在文件夹（与 DllInjector 同目录）</summary>
         private string PickFile(string filter)
@@ -852,11 +1014,53 @@ namespace DllInjector
         private const int LogTrimSlack = 200;
         private int _logLines;
 
+        // GUI 日志落盘（inject_log.txt）。
+        // README 一直承诺「界面日志 + 日志文件双通道」，但原先只有 CLI 分支在末尾
+        // 整份覆写写一次，GUI 模式全程只在内存里——用户遇到「注入完目标程序白屏」
+        // 想回看日志时什么都没有。这里改成 GUI 每写一行就同步追加，进程被杀也不丢。
+        private StreamWriter _logFile;
+        private bool _logFileBroken;      // 一旦写失败就彻底停止尝试，避免每条日志都抛一次
+
+        private void OpenLogFile()
+        {
+            if (_logFile != null || _logFileBroken) return;
+            try
+            {
+                string path = Path.Combine(AppContext.BaseDirectory, "inject_log.txt");
+                // 每次启动覆写：日志只服务本次会话，避免文件无限增长。
+                _logFile = new StreamWriter(path, append: false, new UTF8Encoding(false)) { AutoFlush = true };
+                _logFile.WriteLine($"# DllInjector {Program.GetVersionText()}  {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+            }
+            catch
+            {
+                _logFileBroken = true;
+                _logFile = null;
+            }
+        }
+
+        private void CloseLogFile()
+        {
+            try { _logFile?.Flush(); _logFile?.Dispose(); } catch { }
+            _logFile = null;
+        }
+
         private void Log(string msg)
         {
             if (InvokeRequired) { BeginInvoke(new Action<string>(Log), msg); return; }
-            _log.AppendText($"[{DateTime.Now:HH:mm:ss}] {msg}{Environment.NewLine}");
-            _logLines++;
+            string line = $"[{DateTime.Now:HH:mm:ss}] {msg}";
+            _log.AppendText(line + Environment.NewLine);
+            // 按「实际写进去的行数」计数，而不是按调用次数：msg 里可能带换行
+            // （例如把异常信息、多行用法说明塞进一次 Log），只按次数计会让
+            // _logLines 与实际行数漂移，裁剪阈值随之失准。这里顺带把 \r\n 归一下。
+            _logLines += 1 + (msg.Length > 0 ? msg.Split('\n').Length - 1 : 0);
+
+            // 落盘与界面同步：日志内容一致，用户可以把 inject_log.txt 直接发给别人。
+            OpenLogFile();
+            if (_logFile != null)
+            {
+                try { _logFile.WriteLine(line); }
+                catch { _logFileBroken = true; try { _logFile.Dispose(); } catch { } _logFile = null; }
+            }
 
             if (_logLines > LogMaxLines + LogTrimSlack)
             {
@@ -929,6 +1133,7 @@ namespace DllInjector
                                 list.Add(new ProcItem { Pid = p.Id, Name = $"{p.ProcessName} [PID {p.Id}]" });
                         }
                         catch { }
+                        finally { p.Dispose(); }
                     }
                     list.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
                     return list;
@@ -1021,12 +1226,19 @@ namespace DllInjector
         private async void BtnEject_Click(object sender, EventArgs e)
         {
             if (!TryGetSelectedPid(out int pid)) return;
-            string dll = _txtDll.Text.Trim().Trim('"');
-            if (string.IsNullOrEmpty(dll))
+
+            // DLL 框是多值框（分号分隔）。原先把整串 "a.dll;b.dll" 当模块名传给 EjectDll，
+            // 后者做 Path.GetFileName 后得到 "a.dll;b.dll"，必然找不到模块——
+            // 多 DLL 场景下这个按钮等于不可用。这里先拆分，多于一个时弹选择框。
+            string[] dlls = InjectorCore.SplitDlls(_txtDll.Text);
+            if (dlls.Length == 0)
             {
                 MessageBox.Show("请先选择要卸载的 dll 文件（或输入模块名）。", "提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
+            string dll = dlls.Length == 1 ? dlls[0] : PickEjectTarget(pid, dlls);
+            if (string.IsNullOrEmpty(dll)) return;
+
             var btn = sender as Button;
             btn.Enabled = false;
             try
@@ -1041,6 +1253,77 @@ namespace DllInjector
             {
                 btn.Enabled = true;
             }
+        }
+
+        /// <summary>DLL 框里有多个 DLL 时，让用户挑一个要卸载的。
+        /// 只列出目标进程里**确实已加载**的那些，并标出未加载的，避免用户白点一次。
+        /// 返回 null 表示用户取消。</summary>
+        private string PickEjectTarget(int pid, string[] dlls)
+        {
+            var loaded = new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                using var proc = System.Diagnostics.Process.GetProcessById(pid);
+                foreach (System.Diagnostics.ProcessModule m in proc.Modules)
+                {
+                    try { loaded.Add(m.ModuleName); } catch { }
+                }
+            }
+            catch { }
+
+            using var dlg = new Form
+            {
+                Text = "选择要卸载的 DLL — PID " + pid,
+                StartPosition = FormStartPosition.CenterParent,
+                FormBorderStyle = FormBorderStyle.FixedDialog,
+                MinimizeBox = false,
+                MaximizeBox = false,
+                ShowInTaskbar = false,
+                BackColor = Theme.Back,
+                ForeColor = Theme.Fore,
+                ClientSize = new Size(Scale(460), Scale(260)),
+            };
+            var list = new ListBox
+            {
+                IntegralHeight = false,
+                BackColor = Theme.BoxBack,
+                ForeColor = Theme.Fore,
+                BorderStyle = BorderStyle.FixedSingle,
+                Font = new Font("Consolas", 9F * _scale),
+            };
+            foreach (var d in dlls)
+            {
+                string name = Path.GetFileName(d.Trim().Trim('"'));
+                bool isLoaded = loaded.Contains(name);
+                list.Items.Add(isLoaded ? name : name + "    （未加载）");
+            }
+            if (list.Items.Count > 0) list.SelectedIndex = 0;
+
+            string picked = null;
+            var ok = MakeBtn("卸载", true);
+            var cancel = MakeBtn("取消", false);
+            ok.Click += (s, e) =>
+            {
+                int i = list.SelectedIndex;
+                if (i >= 0 && i < dlls.Length) picked = dlls[i];
+                dlg.DialogResult = DialogResult.OK;
+            };
+            cancel.Click += (s, e) => dlg.DialogResult = DialogResult.Cancel;
+            dlg.AcceptButton = ok;
+            dlg.CancelButton = cancel;
+
+            dlg.Controls.Add(list);
+            dlg.Controls.Add(ok);
+            dlg.Controls.Add(cancel);
+            dlg.Layout += (s, e) =>
+            {
+                int pad = Scale(12), btnH = Scale(28), btnW = Scale(90);
+                list.SetBounds(pad, pad, dlg.ClientSize.Width - pad * 2, dlg.ClientSize.Height - pad * 2 - btnH - Scale(8));
+                ok.SetBounds(dlg.ClientSize.Width - pad - btnW, dlg.ClientSize.Height - pad - btnH, btnW, btnH);
+                cancel.SetBounds(ok.Left - Scale(8) - btnW, ok.Top, btnW, btnH);
+            };
+
+            return dlg.ShowDialog(this) == DialogResult.OK ? picked : null;
         }
 
         /// <summary>从进程下拉框取出 PID；未选择时提示并返回 false</summary>
@@ -1314,13 +1597,13 @@ namespace DllInjector
                     {
                         if (p.Id <= 0) continue;
                         string bits = "位数未知";
-                        IntPtr h = NativeMethods.OpenProcess(0x1000 /* PROCESS_QUERY_LIMITED_INFORMATION */, false, p.Id);
+                        IntPtr h = NativeMethods.OpenProcess(NativeMethods.PROCESS_QUERY_LIMITED_INFORMATION, false, p.Id);
                         if (h != IntPtr.Zero)
                         {
                             try
                             {
-                                bool w64 = false;
-                                if (NativeMethods.IsWow64Process(h, out w64)) bits = w64 ? "32 位" : "64 位";
+                                int b = NativeMethods.GetProcessBitness(h);
+                                if (b != 0) bits = b == 32 ? "32 位" : "64 位";
                             }
                             catch { }
                             finally { NativeMethods.CloseHandle(h); }
@@ -1328,6 +1611,7 @@ namespace DllInjector
                         list.Add(new ProcEntry { Pid = p.Id, Name = p.ProcessName, Bits = bits });
                     }
                     catch { }
+                    finally { p.Dispose(); }
                 }
                 list.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
                 return list;
@@ -1335,10 +1619,17 @@ namespace DllInjector
 
             private void Fill(string filter)
             {
+                // 记住已经勾选的 PID：重新筛一次列表不该把用户的勾选清掉。
+                // 旧实现无条件 Add(e, false)，于是输入框里每敲一个字符
+                // （filter 变化 → Fill 重跑）就把之前的勾选全丢了。
+                var checkedPids = new System.Collections.Generic.HashSet<int>();
+                foreach (var o in _list.CheckedItems)
+                    if (o is ProcEntry pe) checkedPids.Add(pe.Pid);
+
                 _list.Items.Clear();
                 foreach (var e in _all)
                     if (string.IsNullOrEmpty(filter) || e.Name.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0)
-                        _list.Items.Add(e, false);
+                        _list.Items.Add(e, checkedPids.Contains(e.Pid));
             }
         }
     }
@@ -1487,8 +1778,10 @@ namespace DllInjector
 
         private static void SaveMmMapFile(System.Collections.Generic.Dictionary<string, string> map)
         {
-            try { File.WriteAllText(MmMapPath, System.Text.Json.JsonSerializer.Serialize(map)); }
-            catch { }
+            // 与 ConfigStore.Flush 共用同一份原子写：注入途中被杀不能让 mmmap 变成半截 JSON。
+            // 原先这里是裸 File.WriteAllText，被截断后 LoadMmMapFile 的反序列化异常又被
+            // catch {} 吞掉，结果就是「手动映射记录整份静默消失」——用户看到的是卸载全部失败。
+            AtomicFile.WriteAllText(MmMapPath, System.Text.Json.JsonSerializer.Serialize(map));
         }
 
         private static System.Collections.Generic.Dictionary<string, string> LoadMmMapFile()
@@ -1511,7 +1804,10 @@ namespace DllInjector
         public static bool EnableSeDebugPrivilege(Action<string> log)
         {
             IntPtr token;
-            if (!NativeMethods.OpenProcessToken(System.Diagnostics.Process.GetCurrentProcess().Handle,
+            // using 包住：Process 对象持有的是内核句柄，这条路径在每次注入前都会走一遍，
+            // 不释放就会按注入次数累积（GUI 里连点几次「注入」很明显）。
+            using var self = System.Diagnostics.Process.GetCurrentProcess();
+            if (!NativeMethods.OpenProcessToken(self.Handle,
                 NativeMethods.TOKEN_ADJUST_PRIVILEGES | NativeMethods.TOKEN_QUERY, out token))
             {
                 log("提示: 打开进程令牌失败，未启用 SeDebugPrivilege - " + NativeMethods.LastErrorText());
@@ -1618,13 +1914,24 @@ namespace DllInjector
                 return false;
             }
 
-            string workDir = Path.GetDirectoryName(exePath);
-            string cmdLine = "\"" + exePath + "\"";
+            // 相对路径必须先转绝对：下面两处都依赖它。
+            //  - Path.GetDirectoryName("game.exe") 返回的是**空串**而不是 null，
+            //    CreateProcess 收到 "" 当作 lpCurrentDirectory 会直接失败（ERROR_DIRECTORY）。
+            //    用户只输文件名时（把 exe 拖进框里、或注入器和目标同目录）必现。
+            //  - 传了 lpApplicationName 时它是相对路径也不会走 lpCurrentDirectory 的搜索。
+            string exeFull = Path.GetFullPath(exePath);
+            string workDir = Path.GetDirectoryName(exeFull);
+            if (string.IsNullOrEmpty(workDir))
+            {
+                log("错误: 无法确定目标程序所在目录: " + exePath);
+                return false;
+            }
+            string cmdLine = "\"" + exeFull + "\"";
             if (!string.IsNullOrEmpty(args)) cmdLine += " " + args;
             var si = new NativeMethods.STARTUPINFO { cb = Marshal.SizeOf<NativeMethods.STARTUPINFO>() };
             NativeMethods.PROCESS_INFORMATION pi;
 
-            if (!NativeMethods.CreateProcess(exePath, cmdLine, IntPtr.Zero, IntPtr.Zero,
+            if (!NativeMethods.CreateProcess(exeFull, cmdLine, IntPtr.Zero, IntPtr.Zero,
                     false, NativeMethods.CREATE_SUSPENDED | NativeMethods.CREATE_NEW_CONSOLE,
                     IntPtr.Zero, workDir, ref si, out pi))
             {
@@ -1669,44 +1976,66 @@ namespace DllInjector
             }
             finally
             {
-                NativeMethods.ResumeThread(pi.hThread);
-                log("主线程已恢复，目标程序开始运行。");
+                // ResumeThread 返回的是「上一个挂起计数」，0xFFFFFFFF 表示失败。
+                // 旧代码不看返回值照样报「主线程已恢复」，一旦失败用户会以为程序在跑、
+                // 其实目标进程一直挂在挂起态，后面所有超时都变得无法解释。
+                uint prev = NativeMethods.ResumeThread(pi.hThread);
+                if (prev == 0xFFFFFFFF)
+                    log("警告: 恢复主线程失败 - " + NativeMethods.LastErrorText()
+                        + "。目标进程可能仍处于挂起状态（会表现为后续核验/导出调用全部超时）。");
+                else
+                    log("主线程已恢复，目标程序开始运行。");
                 NativeMethods.CloseHandle(pi.hThread);
             }
 
-            // 注入后调用 DLL 导出函数（目标进程已运行、模块齐全）
-            if (!string.IsNullOrEmpty(exportFunc) && injected.Count > 0)
+            // 从这里到核验结束都用 pi.hProcess，必须保证异常路径也把句柄关掉：
+            // 旧代码的 CloseHandle 是顺序执行的一行，前面任何一步抛异常（CallExport 里
+            // 有 Marshal 操作、VerifyModuleLoaded 会枚举模块）都会漏掉进程句柄。
+            try
             {
-                if (method == NativeMethods.INJECT_APC)
+                // 注入后调用 DLL 导出函数（目标进程已运行、模块齐全）
+                if (!string.IsNullOrEmpty(exportFunc) && injected.Count > 0)
                 {
-                    // 先等 APC 把 DLL 真正装进去，否则导出函数必定拿不到模块基址
-                    WaitApcloaded(pi.dwProcessId, injected.ToArray(), log);
-                }
-                if (method == NativeMethods.INJECT_RFI)
-                    log("提示: 反射式注入不自动调用导出函数（反射 DLL 不进入进程模块列表，且 Loader 返回句柄经线程退出码截断无法可靠定位），初始化请由 DLL 在 ReflectiveLoader / DllMain 内自行完成。");
-                else
-                    foreach (var dll in injected)
-                        CallExport(pi.hProcess, pi.dwProcessId, dll, exportFunc, exportArg, log,
-                            InjectorCore.MmBases.TryGetValue(pi.dwProcessId + "|" + dll, out MmRecord mmRec) ? mmRec.Base : 0);
-            }
-
-            NativeMethods.CloseHandle(pi.hProcess);
-
-            // 注入结果核验（目标进程已运行，模块列表齐全）
-            if (injected.Count > 0)
-            {
-                log("----- 注入结果核验 -----");
-                bool verifyOk = true;
-                foreach (var dll in injected)
-                {
+                    if (method == NativeMethods.INJECT_APC)
+                    {
+                        // 先等 APC 把 DLL 真正装进去，否则导出函数必定拿不到模块基址
+                        WaitApcloaded(pi.dwProcessId, injected.ToArray(), log);
+                    }
                     if (method == NativeMethods.INJECT_RFI)
-                        log($"核验通过：{Path.GetFileName(dll)} 反射映射成功（ReflectiveLoader 返回句柄非零；反射 DLL 不进入进程模块列表属正常）。");
-                    else if (method == NativeMethods.INJECT_MM)
-                        log($"核验通过：{Path.GetFileName(dll)} 手动映射成功（shellcode 返回完整基址 0x{(InjectorCore.MmBases.TryGetValue(pi.dwProcessId + "|" + dll, out MmRecord mmb) ? mmb.Base : 0):X}；手动映射 DLL 不进入进程模块列表属正常）。");
-                    else if (!VerifyModuleLoaded(pi.dwProcessId, dll, log)) verifyOk = false;
+                        log("提示: 反射式注入不自动调用导出函数（反射 DLL 不进入进程模块列表，且 Loader 返回句柄经线程退出码截断无法可靠定位），初始化请由 DLL 在 ReflectiveLoader / DllMain 内自行完成。");
+                    else
+                        foreach (var dll in injected)
+                            CallExport(pi.hProcess, pi.dwProcessId, dll, exportFunc, exportArg, log,
+                                InjectorCore.MmBases.TryGetValue(pi.dwProcessId + "|" + dll, out MmRecord mmRec) ? mmRec.Base : 0);
                 }
-                if (!verifyOk && method == NativeMethods.INJECT_APC)
-                    log("提示: QueueUserAPC 需要目标主线程处于可告警(alertable)等待（如 SleepEx / GetMessage 消息循环），否则 APC 不会执行；失败请改用 CreateRemoteThread 或 NtCreateThreadEx。");
+
+                // 注入结果核验（目标进程已运行，模块列表齐全）
+                if (injected.Count > 0)
+                {
+                    log("----- 注入结果核验 -----");
+                    bool verifyOk = true;
+                    foreach (var dll in injected)
+                    {
+                        if (method == NativeMethods.INJECT_RFI)
+                            log($"核验通过：{Path.GetFileName(dll)} 反射映射成功（ReflectiveLoader 返回句柄非零；反射 DLL 不进入进程模块列表属正常）。");
+                        else if (method == NativeMethods.INJECT_MM)
+                            log($"核验通过：{Path.GetFileName(dll)} 手动映射成功（shellcode 返回完整基址 0x{(InjectorCore.MmBases.TryGetValue(pi.dwProcessId + "|" + dll, out MmRecord mmb) ? mmb.Base : 0):X}；手动映射 DLL 不进入进程模块列表属正常）。");
+                        else if (!VerifyModuleLoaded(pi.dwProcessId, dll, log)) verifyOk = false;
+                    }
+                    if (!verifyOk)
+                    {
+                        // 核验不通过 = 整体失败。旧代码只把 verifyOk 用来决定要不要打 APC 提示，
+                        // 返回值 entirely 由 allOk（= 远程线程创建成功）决定，于是
+                        // 「CreateRemoteThread 成功但 DLL 根本没进模块列表」也会 exit 0。
+                        allOk = false;
+                        if (method == NativeMethods.INJECT_APC)
+                            log("提示: QueueUserAPC 需要目标主线程处于可告警(alertable)等待（如 SleepEx / GetMessage 消息循环），否则 APC 不会执行；失败请改用 CreateRemoteThread 或 NtCreateThreadEx。");
+                    }
+                }
+            }
+            finally
+            {
+                NativeMethods.CloseHandle(pi.hProcess);
             }
 
             log(allOk ? "===== 注入流程完成 =====" : "===== 注入流程结束（部分 DLL 未成功，见上方日志）=====");
@@ -1732,11 +2061,9 @@ namespace DllInjector
             }
             try
             {
-                // 运行中进程用 IsWow64Process 判断位数
-                bool isWow64 = false;
-                int targetBits = toolBits;
-                if (NativeMethods.IsWow64Process(hProcess, out isWow64))
-                    targetBits = isWow64 ? 32 : 64;
+                // 运行中进程的位数：见 GetProcessBitness 里的说明，不能只用 IsWow64Process
+                int targetBits = NativeMethods.GetProcessBitness(hProcess);
+                if (targetBits == 0) targetBits = toolBits;
 
                 log($"目标进程 PID={pid}（{targetBits} 位）| 注入器: {toolBits} 位 | DLL 数量: {dllPaths.Length}");
                 if (targetBits != toolBits)
@@ -1826,7 +2153,13 @@ namespace DllInjector
             }
         }
 
-        /// <summary>批量注入：向多个目标进程逐一注入同一组 DLL，最后汇总成功 / 失败结果；至少成功 1 个返回 true</summary>
+        /// <summary>批量注入：向多个目标进程逐一注入同一组 DLL，最后汇总成功 / 失败结果</summary>
+        /// <remarks>
+        /// 返回值语义是「全部成功才算成功」。原先写的是 <c>return okN &gt; 0</c>（至少成功一个就返回 true），
+        /// 对脚本自动化很不友好：10 个进程里 9 个失败、1 个成功也拿到退出码 0，
+        /// 调用方无法察觉。现已改为全成功才返回 true，部分成功时额外打一行提示，
+        /// 让「为什么退出码非零」在日志里一眼可见。
+        /// </remarks>
         public static bool BatchInjectProcesses(int[] pids, string[] dllPaths, int method, string exportFunc, string exportArg, Action<string> log)
         {
             log($"===== 批量注入 {pids.Length} 个进程（DLL {dllPaths.Length} 个）=====");
@@ -1840,8 +2173,12 @@ namespace DllInjector
                 else { failN++; failPids.Add(pid); }
             }
             log($"===== 批量注入汇总: 成功 {okN} 个，失败 {failN} 个 =====");
-            if (failN > 0) log("失败 PID: " + string.Join(", ", failPids));
-            return okN > 0;
+            if (failN > 0)
+            {
+                log("失败 PID: " + string.Join(", ", failPids));
+                log($"提示: 有 {failN} 个进程未能注入成功，本次批量注入判为失败（退出码 1）。");
+            }
+            return pids.Length > 0 && failN == 0;
         }
 
         /// <summary>从运行中的进程卸载 DLL（注入器侧枚举模块基址 + 远程 FreeLibrary）</summary>
@@ -1862,11 +2199,9 @@ namespace DllInjector
             }
             try
             {
-                // 位数校验（与注入一致）
-                bool isWow64 = false;
-                int targetBits = toolBits;
-                if (NativeMethods.IsWow64Process(hProcess, out isWow64))
-                    targetBits = isWow64 ? 32 : 64;
+                // 位数校验（与注入一致，走同一个 GetProcessBitness）
+                int targetBits = NativeMethods.GetProcessBitness(hProcess);
+                if (targetBits == 0) targetBits = toolBits;
                 if (targetBits != toolBits)
                 {
                     log($"错误: 位数不匹配。请使用与目标进程同位数（{targetBits} 位）的注入器版本。");
@@ -1967,20 +2302,36 @@ namespace DllInjector
                     NativeMethods.CloseHandle(hThread);
                 }
 
-                // 双重确认：模块列表里应该已经看不到它了。残留说明 FreeLibrary 只是减了引用计数。
+                // 双重确认：FreeLibrary 成功后再看一次模块列表。
+                // 注意这里的语义：FreeLibrary 只要把引用计数减 1 就返回非 0，
+                // 所以「模块仍在列表里」是**完全正常**的行为（这个 DLL 被注入过两次，
+                // 或者目标程序自己也加载了它）。真正的失败信号只有一个 —— freeResult == 0，
+                // 上面已经判过并 return false 了。这里只做提示，不能当作失败。
+                //
+                // 原先这里写的是 `string.Equals(pm.FileName, moduleName, ...)`：
+                // pm.FileName 是完整路径，moduleName 只是 Path.GetFileName 的结果，
+                // 两者永不相等 → stillLoaded 恒为 false，整段是死代码。
+                // 同文件 FindModuleBaseByName:2981、Status:2076、VerifyModuleLoaded:3033
+                // 都正确用了 Path.GetFileName(m.FileName)，唯独这里漏改。
                 bool stillLoaded = false;
                 try
                 {
-                    foreach (System.Diagnostics.ProcessModule pm in System.Diagnostics.Process.GetProcessById(pid).Modules)
+                    using var proc = System.Diagnostics.Process.GetProcessById(pid);
+                    foreach (System.Diagnostics.ProcessModule pm in proc.Modules)
                     {
-                        if (string.Equals(pm.FileName, moduleName, StringComparison.OrdinalIgnoreCase)) { stillLoaded = true; break; }
+                        try
+                        {
+                            if (string.Equals(Path.GetFileName(pm.FileName), moduleName, StringComparison.OrdinalIgnoreCase))
+                            { stillLoaded = true; break; }
+                        }
+                        catch { }
                     }
                 }
                 catch { }
                 if (stillLoaded)
                 {
-                    log("警告: FreeLibrary 已返回成功，但模块仍在目标进程模块列表中（引用计数未归零）。");
-                    return false;
+                    log("提示: FreeLibrary 成功（引用计数已减 1），但模块仍在目标进程模块列表中 —— "
+                        + "说明还有其它持有者（重复注入过，或目标程序自己也加载了它）。卸载一次只减一次引用计数，属正常结果。");
                 }
 
                 log("===== 卸载完成 =====");
@@ -2054,8 +2405,7 @@ namespace DllInjector
                 {
                     try
                     {
-                        bool wow64 = false;
-                        if (NativeMethods.IsWow64Process(hProcess, out wow64)) targetBits = wow64 ? 32 : 64;
+                        targetBits = NativeMethods.GetProcessBitness(hProcess);
                     }
                     finally { NativeMethods.CloseHandle(hProcess); }
                 }
@@ -2275,7 +2625,15 @@ namespace DllInjector
                 log("警告: LoadLibrary 返回 0，DLL 加载失败（检查依赖 / 位数是否匹配）。");
                 return false;
             }
-            log($"注入成功！DLL 已加载（模块句柄 0x{code:X}）。");
+            // 远程线程的退出码是 LoadLibraryW 的返回值，也就是 HMODULE，但
+            // GetExitCodeThread 只能拿到 **32 位**。所以它只能当「非零 = 看起来成功」用：
+            //   · 不要把它当完整基址打印（64 位目标上会印出一个不存在的地址）；
+            //   · 也不要试图用「高位是不是 0x8xxxxxxx」去判断崩溃 —— 模块基址的低
+            //     32 位本来就可能落在 0x80000000 以上（例如基址 0x7FF989070000
+            //     截断后正是 0x89070000），那样会把正常的 CRT/NTC 注入全判成失败。
+            // 真正的判据是调用方随后的模块列表核验（VerifyModuleLoaded /
+            // FindModuleBaseByName），这里只排除「明确返回 0」这一种情况。
+            log($"LoadLibraryW 返回非零（线程退出码 0x{code:X8}，仅为 HMODULE 低 32 位），等待模块列表核验确认。");
             return true;
         }
 
@@ -2568,11 +2926,63 @@ namespace DllInjector
         {
             if (!NativeMethods.VirtualProtectEx(hProcess, buf, (UIntPtr)size, NativeMethods.PAGE_EXECUTE_READ, out uint oldProtect))
             {
-                log("警告: 把 shellcode 页改为 RX 失败 - " + NativeMethods.LastErrorText() + "（继续执行，该页仍可写）。");
+                // 失败不是「无害的警告」：这块页会以 PAGE_READWRITE 存活到进程结束，
+                // 而它马上就要装 shellcode 并被执行——等于留下一块 RW 内存给可执行代码用。
+                // 在开了 DEP / EDR 的机器上这既可能是执行失败的直接原因，也是最典型的可疑特征。
+                // 调用方继续执行（否则一次 VirtualProtectEx 抖动就让整条注入路径没法用），
+                // 但必须把降级状态说清楚，别让人以为是正常流程。
+                log("警告(降级): 把 shellcode 页改为 RX 失败 - " + NativeMethods.LastErrorText()
+                    + "。该页将以可写状态执行，DEP/EDR 环境下可能直接失败，且属于可疑内存特征。");
                 return false;
             }
             NativeMethods.FlushInstructionCache(hProcess, buf, (UIntPtr)size);
             return true;
+        }
+
+        /// <summary>把目标进程里一块按内存布局展开的 PE 镜像按节属性收紧保护位。
+        /// 可执行节（IMAGE_SCN_MEM_EXECUTE）→ PAGE_EXECUTE_READ（可写的不给执行时用 PAGE_EXECUTE_READWRITE），
+        /// 纯数据节 → PAGE_READWRITE，头部页 → PAGE_READONLY。
+        /// 反射注入跑完后必须是这个形态：整块封 RX 会把 .data 也禁写，带可写全局变量的 DLL 首次赋值就 AV。</summary>
+        private static void SealImageSections(IntPtr hProcess, IntPtr baseAddr, byte[] raw,
+            int peOff, int sectionStart, int numSections, uint sizeOfHeaders, uint sizeOfImage, Action<string> log)
+        {
+            const uint SCN_MEM_EXECUTE = 0x20000000;
+            const uint SCN_MEM_WRITE = 0x80000000;
+
+            // 头部单独处理：它装的是 PE 头与节表，运行期只读。
+            if (sizeOfHeaders > 0)
+            {
+                if (!NativeMethods.VirtualProtectEx(hProcess, baseAddr, (UIntPtr)sizeOfHeaders, NativeMethods.PAGE_READONLY, out _))
+                    log("警告: 把镜像头部页改为只读失败 - " + NativeMethods.LastErrorText() + "（继续执行，该页仍可写）。");
+            }
+
+            for (int i = 0; i < numSections; i++)
+            {
+                int s = sectionStart + i * 40;
+                if (s + 40 > raw.Length) break;
+                uint vaddr = BitConverter.ToUInt32(raw, s + 12);
+                uint vsize = BitConverter.ToUInt32(raw, s + 8);
+                uint rsize = BitConverter.ToUInt32(raw, s + 16);
+                uint chars = BitConverter.ToUInt32(raw, s + 36);
+                // 内存页大小按 VirtualSize 算；VirtualSize 为 0（少见但合法）时退回文件大小。
+                uint span = vsize > 0 ? vsize : rsize;
+                if (span == 0) continue;
+                // 钳到映像范围内，避免畸形节表把保护改到别的内存上去。
+                if (vaddr >= sizeOfImage) continue;
+                if (vaddr + span > sizeOfImage) span = sizeOfImage - vaddr;
+
+                uint prot;
+                if ((chars & SCN_MEM_EXECUTE) != 0)
+                    prot = (chars & SCN_MEM_WRITE) != 0
+                        ? NativeMethods.PAGE_EXECUTE_READWRITE   // 自修改代码，罕见但必须尊重
+                        : NativeMethods.PAGE_EXECUTE_READ;
+                else
+                    prot = NativeMethods.PAGE_READWRITE;
+
+                if (!NativeMethods.VirtualProtectEx(hProcess, new IntPtr(baseAddr.ToInt64() + vaddr), (UIntPtr)span, prot, out _))
+                    log($"警告: 收紧节 [{i}] (RVA 0x{vaddr:X}) 的保护位失败 - " + NativeMethods.LastErrorText() + "（该节保持可写）。");
+            }
+            NativeMethods.FlushInstructionCache(hProcess, baseAddr, (UIntPtr)sizeOfImage);
         }
 
         /// <summary>手动映射注入（Manual Map）：把 DLL 文件字节与一段自包含、位置无关的映射 shellcode 写入目标进程，
@@ -2588,6 +2998,10 @@ namespace DllInjector
         {
             remoteBuf = IntPtr.Zero;
             hRemoteThread = IntPtr.Zero;
+
+            // 远程线程是否可能仍停在 scBuf 里取指。必须声明在所有 goto failCleanup 之前：
+            // 若声明在 goto 之后，跳到 failCleanup 时该变量未赋值，编译不过（CS0165）。
+            bool threadMayBeRunning = false;
 
             // 1. 读取 DLL 文件字节并校验 PE
             byte[] raw;
@@ -2670,9 +3084,25 @@ namespace DllInjector
             if (hRemoteThread == IntPtr.Zero)
             { log("错误: 创建手动映射远程线程失败 - " + NativeMethods.LastErrorText()); goto failCleanup; }
 
+            // threadMayBeRunning = 远程线程可能仍在 scBuf 里取指。
+            // 这是本文件最容易造成「目标进程当场猝死」的一个状态：一旦超时，线程并没有
+            // 停下——它只是还没跑完。此时若照常 VirtualFreeEx(scBuf)，等于把正在执行的
+            // 指令页从它脚下抽掉，目标进程必吃 0xC0000005。
+            // 对照 LoadLibraryIntoProcess 的 remoteBufBusy：那里早就防住了，这里原先漏了。
+            // 代价是泄漏三页内存（raw/args/sc），但那远好过打死用户的目标进程。
             uint wait = NativeMethods.WaitForSingleObject(hRemoteThread, 15000);
-            if (wait == NativeMethods.WAIT_TIMEOUT) { log("警告: 手动映射超时（15 秒），shellcode 可能在映射过程中阻塞。"); goto failCleanup; }
-            if (wait == NativeMethods.WAIT_FAILED) { log("错误: WaitForSingleObject 失败 - " + NativeMethods.LastErrorText()); goto failCleanup; }
+            if (wait == NativeMethods.WAIT_TIMEOUT)
+            {
+                log("警告: 手动映射超时（15 秒），shellcode 可能在映射过程中阻塞。");
+                threadMayBeRunning = true;
+                goto failCleanup;
+            }
+            if (wait == NativeMethods.WAIT_FAILED)
+            {
+                log("错误: WaitForSingleObject 失败 - " + NativeMethods.LastErrorText());
+                threadMayBeRunning = true;
+                goto failCleanup;
+            }
             if (!NativeMethods.GetExitCodeThread(hRemoteThread, out uint code))
             { log("错误: GetExitCodeThread 失败 - " + NativeMethods.LastErrorText()); goto failCleanup; }
             if (code == 0)
@@ -2699,10 +3129,20 @@ namespace DllInjector
             return new IntPtr(fullBase);
 
         failCleanup:
-            if (hRemoteThread != IntPtr.Zero) { NativeMethods.CloseHandle(hRemoteThread); hRemoteThread = IntPtr.Zero; }
-            NativeMethods.VirtualFreeEx(hProcess, rawBuf, UIntPtr.Zero, NativeMethods.MEM_RELEASE);
-            NativeMethods.VirtualFreeEx(hProcess, argsBuf, UIntPtr.Zero, NativeMethods.MEM_RELEASE);
-            NativeMethods.VirtualFreeEx(hProcess, scBuf, UIntPtr.Zero, NativeMethods.MEM_RELEASE);
+            // 线程已确认退出（exit code 可读）才关句柄并回收内存；否则一律保留，
+            // 让内核继续持有那块页，直到目标进程自己结束——泄漏胜过崩溃。
+            if (!threadMayBeRunning)
+            {
+                if (hRemoteThread != IntPtr.Zero) { NativeMethods.CloseHandle(hRemoteThread); hRemoteThread = IntPtr.Zero; }
+                NativeMethods.VirtualFreeEx(hProcess, rawBuf, UIntPtr.Zero, NativeMethods.MEM_RELEASE);
+                NativeMethods.VirtualFreeEx(hProcess, argsBuf, UIntPtr.Zero, NativeMethods.MEM_RELEASE);
+                NativeMethods.VirtualFreeEx(hProcess, scBuf, UIntPtr.Zero, NativeMethods.MEM_RELEASE);
+            }
+            else
+            {
+                log("提示: 已保留目标进程内的临时内存（DLL 字节 / 参数 / shellcode），避免释放正在执行的指令页。"
+                    + "目标进程结束时会随其地址空间一并回收；若需立即清理，请关闭该进程。");
+            }
             return IntPtr.Zero;
         }
         /// <summary>卸载手动映射注入的 DLL：目标进程内执行卸载 shellcode，
@@ -2760,10 +3200,13 @@ namespace DllInjector
 
             uint wait = NativeMethods.WaitForSingleObject(hThread, 15000);
             bool ok;
+            // 与 ManualMapInjectIntoProcess 同理：超时只说明线程还没跑完，不代表它停了。
+            // 这时 VirtualFreeEx(scBuf) 会把正在执行的卸载 shellcode 页从脚下抽掉。
+            bool threadMayBeRunning = false;
             if (wait == NativeMethods.WAIT_TIMEOUT)
-            { log("警告: 手动映射卸载超时（15 秒），DllMain(DLL_PROCESS_DETACH) 可能阻塞。"); ok = false; }
+            { log("警告: 手动映射卸载超时（15 秒），DllMain(DLL_PROCESS_DETACH) 可能阻塞。"); ok = false; threadMayBeRunning = true; }
             else if (wait == NativeMethods.WAIT_FAILED)
-            { log("错误: WaitForSingleObject 失败 - " + NativeMethods.LastErrorText()); ok = false; }
+            { log("错误: WaitForSingleObject 失败 - " + NativeMethods.LastErrorText()); ok = false; threadMayBeRunning = true; }
             else if (NativeMethods.GetExitCodeThread(hThread, out uint code) && code == 1)
             { log("手动映射卸载成功（DllMain 已收到 DLL_PROCESS_DETACH，镜像内存已释放）。"); ok = true; }
             else if (NativeMethods.GetExitCodeThread(hThread, out uint code2) && code2 != 0)
@@ -2771,9 +3214,17 @@ namespace DllInjector
             else
             { log("警告: 卸载 shellcode 返回 0，可能失败（模块基址无效或 VirtualFree 被拒）。"); ok = false; }
 
+            // 关线程句柄是安全的：它只释放本地引用，不会终止仍在运行的线程。
             NativeMethods.CloseHandle(hThread);
-            NativeMethods.VirtualFreeEx(hProcess, argsBuf, UIntPtr.Zero, NativeMethods.MEM_RELEASE);
-            NativeMethods.VirtualFreeEx(hProcess, scBuf, UIntPtr.Zero, NativeMethods.MEM_RELEASE);
+            if (!threadMayBeRunning)
+            {
+                NativeMethods.VirtualFreeEx(hProcess, argsBuf, UIntPtr.Zero, NativeMethods.MEM_RELEASE);
+                NativeMethods.VirtualFreeEx(hProcess, scBuf, UIntPtr.Zero, NativeMethods.MEM_RELEASE);
+            }
+            else
+            {
+                log("提示: 已保留目标进程内的卸载 shellcode 与参数内存，避免释放正在执行的指令页。");
+            }
             return ok;
         }
 
@@ -2848,6 +3299,11 @@ namespace DllInjector
                 return IntPtr.Zero;
             }
 
+            // 分配成功即交给调用方保管：这样下面任何「线程还没跑起来」的失败路径，
+            // 调用方都能照常回收这块镜像。唯一例外是线程已经在里面跑起来的超时路径，
+            // 那里会把 remoteBuf 清回 0（见下方 timeout 分支）。
+            remoteBuf = baseAddr;
+
             // 5. 写入内存布局：头部 + 各节复制到各自的 VirtualAddress（而非文件偏移）
             if (!NativeMethods.WriteProcessMemory(hProcess, baseAddr, raw, (UIntPtr)sizeOfHeaders, out _))
             { log("错误: 写入镜像头失败 - " + NativeMethods.LastErrorText()); return IntPtr.Zero; }
@@ -2890,8 +3346,20 @@ namespace DllInjector
             }
 
             uint wait = NativeMethods.WaitForSingleObject(hRemoteThread, 15000);
-            if (wait == NativeMethods.WAIT_TIMEOUT) { log("警告: 反射加载超时（15 秒），DLL 可能在映射过程中阻塞。"); return IntPtr.Zero; }
-            if (wait == NativeMethods.WAIT_FAILED) { log("错误: WaitForSingleObject 失败 - " + NativeMethods.LastErrorText()); return IntPtr.Zero; }
+            if (wait == NativeMethods.WAIT_TIMEOUT)
+            {
+                log("警告: 反射加载超时（15 秒），DLL 可能在映射过程中阻塞。");
+                // 线程此刻正跑在这块镜像里（ReflectiveLoader 的入口就是我们传过去的地址），
+                // 交给调用方 VirtualFreeEx 等于把正在执行的代码页抽掉。清回 0 明确表示「不要动它」。
+                remoteBuf = IntPtr.Zero;
+                return IntPtr.Zero;
+            }
+            if (wait == NativeMethods.WAIT_FAILED)
+            {
+                log("错误: WaitForSingleObject 失败 - " + NativeMethods.LastErrorText());
+                remoteBuf = IntPtr.Zero;
+                return IntPtr.Zero;
+            }
             if (!NativeMethods.GetExitCodeThread(hRemoteThread, out uint code))
             {
                 log("错误: GetExitCodeThread 失败 - " + NativeMethods.LastErrorText());
@@ -2915,10 +3383,12 @@ namespace DllInjector
             }
             log($"反射加载成功！DLL 已由 ReflectiveLoader 自行映射执行（模块句柄 0x{code:X}）。");
 
-            // 7. 加载器已退出，把这块「搬运源」缓冲从 RW 封成 RX：
-            //    ReflectiveLoader 运行期间必须可写（它自己的全局变量就落在这块镜像里），
-            //    但跑完之后没有任何理由再让它可写。保留执行权限是为了兼容少数会在加载后回调自身代码的 loader。
-            SealShellcodePage(hProcess, baseAddr, (int)sizeOfImage, log);
+            // 7. 加载器已退出，按节属性分别收紧这块镜像的保护。
+            //    原先这里是一行 SealShellcodePage(baseAddr, sizeOfImage) 把**整块**映像封成
+            //    PAGE_EXECUTE_READ —— 连带把 .data/.bss 也变成只读，任何带可写全局变量的
+            //    反射 DLL 都会在首次赋值时崩掉（STATUS_ACCESS_VIOLATION）。这不是加固，是制造 bug。
+            //    正确做法：可执行节（含代码）→ RX，其余（数据/资源/未初始化）→ RW。
+            SealImageSections(hProcess, baseAddr, raw, peOff, sectionStart, numSections, sizeOfHeaders, sizeOfImage, log);
             return new IntPtr(code);
         }
 
@@ -3180,6 +3650,53 @@ namespace DllInjector
         }
     }
 
+    /// <summary>原子写文件的公共实现。
+    /// 为什么需要它：注入过程中进程被杀（用户直接关窗口、机器断电、杀软终止）时，
+    /// 直接 File.WriteAllText 会留下半截甚至空文件，下次启动读回来就是「记录全丢」。
+    /// 先写 .tmp 再 File.Replace，磁盘上任何时刻都存在完整的新版本或完整的旧版本。
+    /// ConfigStore 与 InjectorCore 的 mmmap 落盘共用这一份实现，避免两处各写一套、
+    /// 其中一处漏掉（原先 mmmap 就是漏的那一处，被截断后反序列化异常被 catch 吞掉，
+    /// 表现为手动映射记录静默消失、后续卸载全部失效）。</summary>
+    internal static class AtomicFile
+    {
+        /// <summary>原子写入文本。失败返回 false（不抛异常，调用方按「落盘失败」处理即可）。</summary>
+        public static bool WriteAllText(string path, string text, Encoding encoding = null)
+        {
+            if (string.IsNullOrEmpty(path)) return false;
+            encoding ??= new UTF8Encoding(false);
+            string tmp = path + ".tmp";
+            try
+            {
+                File.WriteAllText(tmp, text, encoding);
+                if (File.Exists(path))
+                {
+                    // 传 null 表示不留 .bak 备份文件
+                    File.Replace(tmp, path, null);
+                }
+                else
+                {
+                    File.Move(tmp, path);
+                }
+                return true;
+            }
+            catch
+            {
+                // 原子替换失败（目录只读、被杀软占用等）时退回直接覆盖，
+                // 至少保住「这次能存上」，而不是让用户的选择无声消失。
+                try { File.WriteAllText(path, text, encoding); return true; }
+                catch { return false; }
+            }
+            finally
+            {
+                try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
+            }
+        }
+
+        /// <summary>原子写入若干行（UTF-8 无 BOM）。</summary>
+        public static bool WriteAllLines(string path, System.Collections.Generic.IEnumerable<string> lines)
+            => WriteAllText(path, string.Join("\r\n", lines) + "\r\n");
+    }
+
     /// <summary>配置存储：键值对格式（兼容旧的两行 exe/dll 格式），配置文件优先放注入器同目录，目录不可写时回退到 %AppData%</summary>
     internal static class ConfigStore
     {
@@ -3197,11 +3714,21 @@ namespace DllInjector
             {
                 if (Directory.Exists(exeDir))
                 {
-                    string probe = Path.Combine(exeDir, ".dllinjector_wtest");
-                    File.WriteAllText(probe, "t");
-                    File.Delete(probe);
-                    _path = Path.Combine(exeDir, "DllInjector.config");
-                    return;
+                    // 用带 GUID 的临时名探测可写性。原先探测文件是固定名
+                    // ".dllinjector_wtest"：两个实例同时启动会互相踩（A 刚写完 B 就删掉，
+                    // A 的 Delete 抛 FileNotFound，流程误判为不可写而回退 %AppData%）；
+                    // 若进程恰好死在 WriteAllText 与 Delete 之间，还会在安装目录留下垃圾文件。
+                    string probe = Path.Combine(exeDir, ".dllinjector_wtest_" + Guid.NewGuid().ToString("N"));
+                    try
+                    {
+                        File.WriteAllText(probe, "t");
+                        _path = Path.Combine(exeDir, "DllInjector.config");
+                        return;
+                    }
+                    finally
+                    {
+                        try { if (File.Exists(probe)) File.Delete(probe); } catch { }
+                    }
                 }
             }
             catch { }
@@ -3275,14 +3802,7 @@ namespace DllInjector
             catch { /* 读失败：保持空表，按默认值走 */ }
         }
 
-        /// <summary>把内存里的键值写回磁盘（原子替换）</summary>
-        /// <remarks>
-        /// 为什么不用 File.WriteAllLines 直接覆盖：写到一半进程被杀（用户在注入
-        /// 过程中关窗口、或者机器断电），配置文件就变成半截甚至空文件——下次启动
-        /// 所有记忆全丢，而且用户完全不知道发生了什么。
-        /// 改为「写临时文件 → File.Replace 原子替换」：任何时刻磁盘上都存在一个
-        /// 完整的旧版本或新版本，不存在中间态。
-        /// </remarks>
+        /// <summary>把内存里的键值写回磁盘（原子替换，实现在 <see cref="AtomicFile"/>）</summary>
         private static void Flush()
         {
             if (_path == null) return;
@@ -3290,30 +3810,7 @@ namespace DllInjector
             foreach (var kv in _data)
                 lines.Add(kv.Key + "=" + kv.Value);
 
-            string tmp = _path + ".tmp";
-            try
-            {
-                File.WriteAllLines(tmp, lines, new UTF8Encoding(false));
-                if (File.Exists(_path))
-                {
-                    // File.Replace 需要备份文件名参数；传 null 表示不留备份
-                    File.Replace(tmp, _path, null);
-                }
-                else
-                {
-                    File.Move(tmp, _path);
-                }
-            }
-            catch
-            {
-                // 原子替换失败（目录只读、被杀软占用等）时退回直接覆盖，
-                // 至少保住「这次能存上」，而不是让用户的选择无声消失。
-                try { File.WriteAllLines(_path, lines, new UTF8Encoding(false)); } catch { }
-            }
-            finally
-            {
-                try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
-            }
+            AtomicFile.WriteAllLines(_path, lines);
 
             // 刚写的内容就是缓存内容，刷新一下戳记，避免下次 Get 又白读一遍
             try
@@ -3353,17 +3850,38 @@ namespace DllInjector
         /// 0=CRT 1=NTC 2=APC 3=RFI 4=MM。新增方式只能追加在末尾，
         /// 因为这里靠 m &lt;= 4 这个上限做校验。
         /// </summary>
+        /// <remarks>
+        /// setter 做了「值没变就不落盘」的短路：GUI 里每个按钮点击都会写一次
+        /// <c>ConfigStore.Method = method</c>，而绝大多数点击选的还是上次那个方式。
+        /// 不短路的话每次点击都要走一遍 ReloadIfNeeded + tmp + File.Replace，
+        /// 既多一次磁盘往返，又让防病毒软件反复看到配置文件被替换。
+        /// </remarks>
         public static int Method
         {
             get { int m; return int.TryParse(Get("method", "0"), out m) && m >= NativeMethods.INJECT_CRT && m <= NativeMethods.INJECT_MM ? m : NativeMethods.INJECT_CRT; }
-            set { if (_path == null) return; ReloadIfNeeded(); _data["method"] = value.ToString(); Flush(); }
+            set
+            {
+                if (_path == null) return;
+                ReloadIfNeeded();
+                string text = value.ToString();
+                if (_data.TryGetValue("method", out var old) && old == text) return;
+                _data["method"] = text;
+                Flush();
+            }
         }
 
         /// <summary>窗口位置 "x,y,w,h"，空表示未记忆</summary>
         public static string WindowPos
         {
             get { return Get("winpos", ""); }
-            set { if (_path == null) return; ReloadIfNeeded(); _data["winpos"] = value; Flush(); }
+            set
+            {
+                if (_path == null) return;
+                ReloadIfNeeded();
+                if (_data.TryGetValue("winpos", out var old) && old == value) return;
+                _data["winpos"] = value;
+                Flush();
+            }
         }
     }
 
@@ -3461,7 +3979,7 @@ namespace DllInjector
                             { inArgs = false; if (i + 1 < args.Length) exportFunc = args[++i]; continue; }
                             if (string.Equals(args[i], "-exportarg", StringComparison.OrdinalIgnoreCase))
                             { inArgs = false; if (i + 1 < args.Length) exportArg = args[++i]; continue; }
-                            if (inArgs) cmdArgs = (cmdArgs.Length > 0 ? cmdArgs + " " : "") + args[i];
+                            if (inArgs) cmdArgs = (cmdArgs.Length > 0 ? cmdArgs + " " : "") + QuoteArgIfNeeded(args[i]);
                             else dlls.Add(args[i]);
                         }
                         ok = InjectorCore.Run(exe, dlls.ToArray(), cmdArgs, method, exportFunc, exportArg, log);
@@ -3509,18 +4027,21 @@ namespace DllInjector
                             dlls.Add(args[i]);
                         }
                         var pids = new System.Collections.Generic.List<int>();
+                        int selfPid = Environment.ProcessId;
                         foreach (var p in System.Diagnostics.Process.GetProcesses())
                         {
                             try
                             {
-                                // 进程名可能带 .exe 后缀，两种都匹配
-                                if (p.Id > 0 && !string.IsNullOrEmpty(p.ProcessName) &&
+                                // 排除自己：`-injectname DllInjector hook.dll` 会把 DLL 注进
+                                // 正在执行这次注入的进程本身，直接把自己打死（GUI 版尤其明显）。
+                                if (p.Id > 0 && p.Id != selfPid && !string.IsNullOrEmpty(p.ProcessName) &&
                                     (WildcardMatch(pattern, p.ProcessName) || WildcardMatch(pattern, p.ProcessName + ".exe")))
                                     pids.Add(p.Id);
                             }
                             catch { }
+                            finally { p.Dispose(); }
                         }
-                        if (pids.Count == 0) { log("未找到匹配的进程（名称模式: " + pattern + "）。"); }
+                        if (pids.Count == 0) { log("未找到匹配的进程（名称模式: " + pattern + "）；已自动排除注入器自身。"); }
                         else
                         {
                             log($"按进程名匹配到 {pids.Count} 个进程: {string.Join(", ", pids)}");
@@ -3569,7 +4090,12 @@ namespace DllInjector
                     else
                         Console.WriteLine(BuildUsage());
 
-                    File.WriteAllLines(logPath, lines);
+                    // 日志落盘是「附带产物」，不能决定成败：程序目录可能只读（装在
+                    // Program Files 下、或从只读介质运行），那时 File.WriteAllLines 会抛，
+                    // 旧代码的 catch 会把 code 改成 1，于是「注入成功」被报成「失败」。
+                    // 反过来同样要小心：不能把写入失败吞得无声无息。
+                    try { File.WriteAllLines(logPath, lines); }
+                    catch (Exception exLog) { Console.WriteLine("警告: 写日志文件失败 - " + exLog.Message); }
                     code = ok ? 0 : 1;
                 }
                 catch (Exception ex)
@@ -3604,7 +4130,7 @@ namespace DllInjector
         }
 
         /// <summary>版本号文本，取自 csproj 的 Version（不要在源码里再写死一份）</summary>
-        private static string GetVersionText()
+        internal static string GetVersionText()
         {
             var asm = typeof(Program).Assembly;
             var info = asm.GetCustomAttributes(typeof(System.Reflection.AssemblyInformationalVersionAttribute), false);
@@ -3618,6 +4144,51 @@ namespace DllInjector
                 return "DllInjector " + v;
             }
             return "DllInjector " + asm.GetName().Version;
+        }
+
+        /// <summary>
+        /// 把一个已解析的 argv 元素还原成命令行片段。
+        /// Environment.GetCommandLineArgs() 已经把引号剥掉了，重新用空格拼接会丢边界：
+        /// `-args --title "My Game"` 会变成 `--title My Game` 三段，目标程序看到的是错的参数。
+        /// 含空格/制表符的片段一律补上双引号；片段内部已有的双引号按 Windows 规则转义。
+        /// </summary>
+        internal static string QuoteArgIfNeeded(string arg)
+        {
+            if (arg == null) return "\"\"";
+            if (arg.Length == 0) return "\"\"";
+            bool needQuote = false;
+            for (int i = 0; i < arg.Length; i++)
+            {
+                char c = arg[i];
+                if (c == ' ' || c == '\t') { needQuote = true; break; }
+            }
+            if (!needQuote) return arg;
+
+            var sb = new System.Text.StringBuilder();
+            sb.Append('"');
+            for (int i = 0; i < arg.Length; i++)
+            {
+                // 反斜杠只有在后面紧跟引号时才有转义意义，Windows 命令行解析规则如此
+                int backslashes = 0;
+                while (i < arg.Length && arg[i] == '\\') { backslashes++; i++; }
+                if (i == arg.Length)
+                {
+                    sb.Append('\\', backslashes * 2);
+                    break;
+                }
+                if (arg[i] == '"')
+                {
+                    sb.Append('\\', backslashes * 2 + 1);
+                    sb.Append('"');
+                }
+                else
+                {
+                    sb.Append('\\', backslashes);
+                    sb.Append(arg[i]);
+                }
+            }
+            sb.Append('"');
+            return sb.ToString();
         }
 
         /// <summary>
@@ -3669,13 +4240,29 @@ namespace DllInjector
         }
 
         /// <summary>进程名通配匹配（支持 * 与 ?，大小写不敏感）</summary>
+        /// <remarks>
+        /// 加编译缓存：-injectname 会对每个进程调两次（分别试带/不带 .exe 的名称，
+        /// 而这两次用的都是同一个 pattern）。几百个进程就是上千次 Regex 构造 + 编译。
+        /// 缓存键就是 pattern 本身，条目数天然被 pattern 的写法限制住，不会无限增长。
+        /// </remarks>
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, System.Text.RegularExpressions.Regex> _wildcardCache
+            = new(System.StringComparer.Ordinal);
+
         internal static bool WildcardMatch(string pattern, string text)
         {
+            if (pattern == null || text == null) return false;
             try
             {
-                string rx = "^" + System.Text.RegularExpressions.Regex.Escape(pattern)
-                    .Replace(@"\*", ".*").Replace(@"\?", ".") + "$";
-                return System.Text.RegularExpressions.Regex.IsMatch(text, rx, System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                var rx = _wildcardCache.GetOrAdd(pattern, p =>
+                {
+                    string r = "^" + System.Text.RegularExpressions.Regex.Escape(p)
+                        .Replace(@"\*", ".*").Replace(@"\?", ".") + "$";
+                    return new System.Text.RegularExpressions.Regex(r,
+                        System.Text.RegularExpressions.RegexOptions.IgnoreCase
+                        | System.Text.RegularExpressions.RegexOptions.CultureInvariant
+                        | System.Text.RegularExpressions.RegexOptions.Compiled);
+                });
+                return rx.IsMatch(text);
             }
             catch { return string.Equals(pattern, text, StringComparison.OrdinalIgnoreCase); }
         }

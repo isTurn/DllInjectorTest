@@ -121,17 +121,17 @@ exit /b 0
 rem ---- x64 -----------------------------------------------------------------
 call "%VC%\vcvars64.bat" >nul
 ml64 /nologo /c "%SRC%ReflectiveLoader_x64.asm" || goto :fail
-cl /nologo /Brepro /utf-8 /LD /O2 "%SRC%TestReflectiveDll.c" "%SRC%ReflectiveLoader_x64.obj" /link /Brepro /OUT:"%DLLOUT%TestReflectiveDll-x64.dll" /DEF:"%SRC%Reflective.def"
+cl /nologo /W3 /Brepro /utf-8 /LD /O2 "%SRC%TestReflectiveDll.c" "%SRC%ReflectiveLoader_x64.obj" /link /Brepro /OUT:"%DLLOUT%TestReflectiveDll-x64.dll" /DEF:"%SRC%Reflective.def"
 if errorlevel 1 goto :fail
-cl /nologo /Brepro /utf-8 /O2 "%SRC%TestLoader.c" /link /Brepro /OUT:"%OUT%\TestLoader-x64.exe" /SUBSYSTEM:CONSOLE
+cl /nologo /W3 /Brepro /utf-8 /O2 "%SRC%TestLoader.c" /link /Brepro /OUT:"%OUT%\TestLoader-x64.exe" /SUBSYSTEM:CONSOLE
 if errorlevel 1 goto :fail
 
 rem ---- x86 -----------------------------------------------------------------
 call "%VC%\vcvars32.bat" >nul
 ml /nologo /c "%SRC%ReflectiveLoader_x86.asm" || goto :fail
-cl /nologo /Brepro /utf-8 /LD /O2 "%SRC%TestReflectiveDll.c" "%SRC%ReflectiveLoader_x86.obj" /link /Brepro /OUT:"%DLLOUT%TestReflectiveDll-x86.dll" /DEF:"%SRC%Reflective.def"
+cl /nologo /W3 /Brepro /utf-8 /LD /O2 "%SRC%TestReflectiveDll.c" "%SRC%ReflectiveLoader_x86.obj" /link /Brepro /OUT:"%DLLOUT%TestReflectiveDll-x86.dll" /DEF:"%SRC%Reflective.def"
 if errorlevel 1 goto :fail
-cl /nologo /Brepro /utf-8 /O2 "%SRC%TestLoader.c" /link /Brepro /OUT:"%OUT%\TestLoader-x86.exe" /SUBSYSTEM:CONSOLE
+cl /nologo /W3 /Brepro /utf-8 /O2 "%SRC%TestLoader.c" /link /Brepro /OUT:"%OUT%\TestLoader-x86.exe" /SUBSYSTEM:CONSOLE
 if errorlevel 1 goto :fail
 
 rem ---- clean intermediates -------------------------------------------------

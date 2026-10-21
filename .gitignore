@@ -48,7 +48,6 @@ inject_log.txt
 hook_call_log.txt
 DllInjector.config
 DllInjector.mmmap
-.dlInjector_wtest
 .dllinjector_wtest
 
 # ---- Test assets ----
@@ -99,6 +98,7 @@ __pycache__/
 # ---- OS junk ----
 Thumbs.db
 ehthumbs.db
-Desktop.ini$RECYCLE.BIN/
+Desktop.ini
+$RECYCLE.BIN/
 *.lnk
 .DS_Store

@@ -410,10 +410,10 @@
     <div class="feat-grid">
       <div class="feat"><div class="f-ico">🪝</div><h3>IAT Hook 六个文本 API</h3><p>挂钩 <code>TextOutA/W</code>、<code>ExtTextOutA/W</code>、<code>DrawTextA/W</code>，覆盖主 EXE 与随游戏加载的全部非系统模块。按<strong>地址</strong>匹配 IAT 槽，API Set 转发与名字修饰自动兼容。</p></div>
       <div class="feat"><div class="f-ico">🔤</div><h3>编码统一转 UTF-8</h3><p>Shift-JIS / GBK / UTF-16 按 profile 指定的代码页解码，统一转成 UTF-8 后上报。</p></div>
-      <div class="feat"><div class="f-ico">📝</div><h3>改 ini 即可适配新引擎</h3><p>引擎适配表外部化为 <code>TextHookDll.profiles.ini</code>，DLL 从自身目录自动加载——改挂钩集合、代码页、长度与去重阈值都<strong>不用重编译</strong>。框架不认识的函数也能挂：写 <code>text=</code> / <code>len=</code> / <code>argc=</code> 声明参数位置即可。</p></div>
+      <div class="feat"><div class="f-ico">📝</div><h3>改 ini 即可适配新引擎</h3><p>引擎适配表外部化为 <code>TextHookDll.profiles.ini</code>，DLL 从自身目录自动加载——改挂钩集合、代码页、长度与去重阈值都<strong>不用重编译</strong>。框架不认识的函数也能挂：写 <code>text=</code> / <code>len=</code> / <code>argc=</code> 声明参数位置即可；再写上 <code>hintExe=</code> / <code>hintClass=</code>，连 <code>engine=</code> 都不用传（<code>engine=auto</code> 自动挑 profile）。</p></div>
       <div class="feat"><div class="f-ico">🎯</div><h3>动态取址也覆盖</h3><p>引擎若用 <code>GetProcAddress</code> 自己取地址再调用，导入表里看不到该函数。DLL 会把各模块 IAT 里的 <code>GetProcAddress</code> 换成替身，把查询重定向到替换函数。</p></div>
       <div class="feat"><div class="f-ico">📡</div><h3>命名管道推送</h3><p>去重后经独立写线程推送到命名管道，客户端不读也不会卡住游戏线程；断线自动重建实例。服务端默认开 <strong>4 个实例</strong>，同一行文本广播给所有消费者。</p></div>
-      <div class="feat"><div class="f-ico">🧪</div><h3>进程内端到端验证</h3><p><code>TestTextHook</code> 把「装钩子 → 输出文本 → 收管道 → 卸钩子」收进一个进程，x64 / x86 各跑 8 个场景，一条命令给出结论。</p></div>
+      <div class="feat"><div class="f-ico">🧪</div><h3>进程内端到端验证</h3><p><code>TestTextHook</code> 把「装钩子 → 输出文本 → 收管道 → 卸钩子」收进一个进程，x64 / x86 各跑 9 个场景，一条命令给出结论。</p></div>
       <div class="feat"><div class="f-ico">🔌</div><h3>注入器零改动</h3><p>复用既有的 <code>-export</code> / <code>-exportarg</code> 机制下发引擎配置，不需要为文本 Hook 单独改注入器。</p></div>
       <div class="feat"><div class="f-ico">✅</div><h3>两层自动化测试</h3><p><code>test\DllInjectorTests</code> 覆盖 PE 解析、DLL 分隔、<code>-method</code> 解析与进程名通配——这些地方错了不会崩，只会静默给出错误结果。<code>test\DllInjectorE2E</code> 则真的建进程、注入、调导出、卸载，五种注入方式双架构全覆盖。</p></div>
     </div>

@@ -116,29 +116,32 @@ rem ---- x64 -----------------------------------------------------------------
 echo [1/2] building x64 ...
 call "%VC%\vcvars64.bat" >nul
 
-cl /nologo /LD /O2 /utf-8 "%SRC%TextHookDll.c" /link /DEF:"%SRC%TextHookDll.def" /OUT:"%OUT%\TextHookDll-x64.dll"
+rem user32.lib is needed since S3 auto-detect: engine=auto matches hintClass=
+rem against the class names of this process's top-level windows (EnumWindows /
+rem GetClassNameA / GetWindowThreadProcessId all live in user32).
+cl /nologo /W3 /LD /O2 /utf-8 "%SRC%TextHookDll.c" /link /DEF:"%SRC%TextHookDll.def" /OUT:"%OUT%\TextHookDll-x64.dll" user32.lib
 if errorlevel 1 goto :fail
 
-cl /nologo /O2 /utf-8 "%SRC%TextHookClient.c" /link /OUT:"%OUT%\TextHookClient.exe" /SUBSYSTEM:CONSOLE
+cl /nologo /W3 /O2 /utf-8 "%SRC%TextHookClient.c" /link /OUT:"%OUT%\TextHookClient.exe" /SUBSYSTEM:CONSOLE
 if errorlevel 1 goto :fail
 
-cl /nologo /O2 /utf-8 "%TARGET%\TestTextTarget.c" /link /OUT:"%OUT%\TextTarget_x64.exe" /SUBSYSTEM:CONSOLE gdi32.lib user32.lib
+cl /nologo /W3 /O2 /utf-8 "%TARGET%\TestTextTarget.c" /link /OUT:"%OUT%\TextTarget_x64.exe" /SUBSYSTEM:CONSOLE gdi32.lib user32.lib
 if errorlevel 1 goto :fail
 
-cl /nologo /O2 /utf-8 "%SRC%TestTextHook.c" /link /OUT:"%OUT%\TestTextHook-x64.exe" /SUBSYSTEM:CONSOLE gdi32.lib user32.lib
+cl /nologo /W3 /O2 /utf-8 "%SRC%TestTextHook.c" /link /OUT:"%OUT%\TestTextHook-x64.exe" /SUBSYSTEM:CONSOLE gdi32.lib user32.lib
 if errorlevel 1 goto :fail
 
 rem ---- x86 -----------------------------------------------------------------
 echo [2/2] building x86 ...
 call "%VC%\vcvars32.bat" >nul
 
-cl /nologo /LD /O2 /utf-8 "%SRC%TextHookDll.c" /link /DEF:"%SRC%TextHookDll.def" /OUT:"%OUT%\TextHookDll-x86.dll"
+cl /nologo /W3 /LD /O2 /utf-8 "%SRC%TextHookDll.c" /link /DEF:"%SRC%TextHookDll.def" /OUT:"%OUT%\TextHookDll-x86.dll" user32.lib
 if errorlevel 1 goto :fail
 
-cl /nologo /O2 /utf-8 "%TARGET%\TestTextTarget.c" /link /OUT:"%OUT%\TextTarget_x86.exe" /SUBSYSTEM:CONSOLE gdi32.lib user32.lib
+cl /nologo /W3 /O2 /utf-8 "%TARGET%\TestTextTarget.c" /link /OUT:"%OUT%\TextTarget_x86.exe" /SUBSYSTEM:CONSOLE gdi32.lib user32.lib
 if errorlevel 1 goto :fail
 
-cl /nologo /O2 /utf-8 "%SRC%TestTextHook.c" /link /OUT:"%OUT%\TestTextHook-x86.exe" /SUBSYSTEM:CONSOLE gdi32.lib user32.lib
+cl /nologo /W3 /O2 /utf-8 "%SRC%TestTextHook.c" /link /OUT:"%OUT%\TestTextHook-x86.exe" /SUBSYSTEM:CONSOLE gdi32.lib user32.lib
 if errorlevel 1 goto :fail
 
 rem ---- clean intermediates left next to the sources ------------------------

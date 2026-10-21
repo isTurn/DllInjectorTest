@@ -135,10 +135,10 @@ if exist "%DLLOUT%hook_call_log.txt" del /q "%DLLOUT%hook_call_log.txt"
 rem ---- x64 -----------------------------------------------------------------
 call "%VC%\vcvars64.bat" >nul
 
-cl /nologo /Brepro /LD /O2 /utf-8 "%SRC%TestHookDll.c" /link /Brepro /DEF:"%SRC%TestHookDll.def" /OUT:"%DLLOUT%TestHookDll-x64.dll"
+cl /nologo /W3 /Brepro /LD /O2 /utf-8 "%SRC%TestHookDll.c" /link /Brepro /DEF:"%SRC%TestHookDll.def" /OUT:"%DLLOUT%TestHookDll-x64.dll"
 if errorlevel 1 goto :fail
 
-cl /nologo /Brepro /O2 /utf-8 "%SRC%TestLoad.c" /link /Brepro /OUT:"%OUT%\TestLoad-x64.exe" /SUBSYSTEM:CONSOLE
+cl /nologo /W3 /Brepro /O2 /utf-8 "%SRC%TestLoad.c" /link /Brepro /OUT:"%OUT%\TestLoad-x64.exe" /SUBSYSTEM:CONSOLE
 if errorlevel 1 goto :fail
 
 echo.
@@ -149,10 +149,10 @@ if errorlevel 1 goto :fail
 rem ---- x86 -----------------------------------------------------------------
 call "%VC%\vcvars32.bat" >nul
 
-cl /nologo /Brepro /LD /O2 /utf-8 "%SRC%TestHookDll.c" /link /Brepro /DEF:"%SRC%TestHookDll.def" /OUT:"%DLLOUT%TestHookDll-x86.dll"
+cl /nologo /W3 /Brepro /LD /O2 /utf-8 "%SRC%TestHookDll.c" /link /Brepro /DEF:"%SRC%TestHookDll.def" /OUT:"%DLLOUT%TestHookDll-x86.dll"
 if errorlevel 1 goto :fail
 
-cl /nologo /Brepro /O2 /utf-8 "%SRC%TestLoad.c" /link /Brepro /OUT:"%OUT%\TestLoad-x86.exe" /SUBSYSTEM:CONSOLE
+cl /nologo /W3 /Brepro /O2 /utf-8 "%SRC%TestLoad.c" /link /Brepro /OUT:"%OUT%\TestLoad-x86.exe" /SUBSYSTEM:CONSOLE
 if errorlevel 1 goto :fail
 
 echo.

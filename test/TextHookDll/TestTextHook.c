@@ -357,7 +357,10 @@ static void RunScenario(const Scenario* sc)
     size_t sz = 0;
     char* log = ReadWholeFile(g_logPath, &sz);
     Check(log != NULL, "texthook_log.txt 已生成");
-    if (!log) return;
+    // 失败提前返回时**必须**卸载。否则后续场景的 InstallConfig 会撞上
+    // `if (g_initialized) return TRUE;` 直接变成 no-op：横幅不打、WaitLog 超时，
+    // 后面所有断言都会以「莫名其妙」的理由失败，把真正的病根埋掉。
+    if (!log) { g_Unhook(NULL); return; }
 
     if (sc->expectBanner)
         Check(LogContains(log, sc->expectBanner), sc->expectBanner);
@@ -375,7 +378,7 @@ static void RunScenario(const Scenario* sc)
     WaitLog(sc->expectWide ? utf8Wide : utf8Hello, 3000);
 
     log = ReadWholeFile(g_logPath, &sz);
-    if (!log) { Check(0, "重新读取 texthook_log.txt"); return; }
+    if (!log) { Check(0, "重新读取 texthook_log.txt"); g_Unhook(NULL); return; }
 
     if (sc->expectHello) {
         Check(LogContains(log, utf8Hello), "抓到 TextOutA 的 SJIS 文本并正确转成 UTF-8");
@@ -611,7 +614,12 @@ static void RunSanitizeScenario(void)
     DeleteDC(hMem);
     ReleaseDC(NULL, hScreen);
 
-    WaitLog("こんにちは", 3000);
+    // 本文件自述「不含任何非 ASCII 窄字面量，期望值一律用 \uXXXX 转义」，
+    // 这条断言原来直接写了「こんにちは」，只是因为 build.bat 传了 /utf-8
+    // 才凑巧成立——去掉那个开关就会变成乱码匹配，永远失败。
+    char hello[128];
+    ToUtf8(kExpectHello, hello, sizeof(hello));
+    WaitLog(hello, 3000);
 
     size_t sz = 0;
     char* log = ReadWholeFile(g_logPath, &sz);
@@ -622,8 +630,6 @@ static void RunSanitizeScenario(void)
     }
 
     // 正向：三句 hello 被空格连成一整行。\t → 1 个空格，\r\n → 2 个空格。
-    char hello[128];
-    ToUtf8(kExpectHello, hello, sizeof(hello));
     char expect[256];
     sprintf_s(expect, sizeof(expect), "%s %s  %s", hello, hello, hello);
     Check(LogContains(log, expect),
@@ -835,6 +841,106 @@ static void RunPipeScenario(void)
 }
 
 // ---------------------------------------------------------------------------
+// 场景 9：engine=auto —— 按 hintExe / hintClass 自动选 profile
+//
+// 为什么值得单独一个场景：S3 的承诺是「改 ini 不用重编译」，但在这之前
+// 使用者仍得在命令行里手写 engine=名字。auto 把最后这一小步也去掉：
+// ini 里写好 hint，注入时只传 engine=auto 就行。
+//
+// 这里要验证两件事，缺一不可：
+//   a) 命中的路径 —— hint 与当前进程匹配时真的选到那个 profile；
+//   b) 未命中的路径 —— 没有任何 hint 匹配时必须**明确报告**并退回默认，
+//      而不是静默用上一个 profile。猜错 profile 与「引擎没走 IAT」在日志里
+//      是同一个现象，不报出来就没法排查。
+// ---------------------------------------------------------------------------
+
+static void RunAutoScenario(const wchar_t* iniAuto, const wchar_t* iniAutoMiss)
+{
+    printf("\n  --- 场景 9：engine=auto 按 hint 自动选 profile ---\n");
+
+    // ---- a) 命中 ----------------------------------------------------------
+    DeleteFileW(g_logPath);
+
+    wchar_t cfg[1024];
+    swprintf_s(cfg, 1024,
+               L"profilefile=%ls|engine=auto|dedup=0|log=1", iniAuto);
+
+    DWORD rc = g_InstallConfig((LPVOID)cfg);
+    Check(rc > 0, "InstallConfig 返回成功（engine=auto 命中场景）");
+
+    // 横幅是经写线程异步落盘的，直接读文件会撞上「还没写出来」。
+    // 先等 auto 那行出现，再读整份日志做断言。
+    WaitLog("engine=auto 已命中", 3000);
+
+    size_t sz = 0;
+    char* log = ReadWholeFile(g_logPath, &sz);
+    if (log) {
+        Check(LogContains(log, "已安装 profile=test-auto-hit"),
+              "engine=auto 命中了 hintExe 匹配的 test-auto-hit");
+        Check(LogContains(log, "engine=auto 已命中 profile=test-auto-hit"),
+              "启动横幅明确报告了 auto 的命中结果");
+        free(log);
+    } else {
+        Check(0, "读取 texthook_log.txt（engine=auto 命中场景）");
+    }
+
+    // 命中的 profile 真的生效了才会有文本。
+    HDC     hScreen = GetDC(NULL);
+    HDC     hMem    = CreateCompatibleDC(hScreen);
+    HBITMAP hBmp    = CreateCompatibleBitmap(hScreen, 800, 600);
+    HGDIOBJ hOld    = SelectObject(hMem, hBmp);
+    TextOutA(hMem, 10, 10, kSjisHello, (int)strlen(kSjisHello));
+    SelectObject(hMem, hOld);
+    DeleteObject(hBmp);
+    DeleteDC(hMem);
+    ReleaseDC(NULL, hScreen);
+
+    char utf8Hello[128];
+    ToUtf8(kExpectHello, utf8Hello, sizeof(utf8Hello));
+    WaitLog(utf8Hello, 3000);
+
+    log = ReadWholeFile(g_logPath, &sz);
+    if (log) {
+        Check(LogContains(log, utf8Hello),
+              "auto 选中的 profile 真的挂上了钩子（抓到了文本）");
+        free(log);
+    } else {
+        Check(0, "重新读取 texthook_log.txt（engine=auto 命中场景）");
+    }
+
+    g_Unhook(NULL);
+    WaitWhileTrue(HasLeakedSlots, 2000);
+
+    // ---- b) 未命中 --------------------------------------------------------
+    //      换一份「hint 谁也不匹配」的 ini。必须报「未能命中」并退回默认，
+    //      而不是继续用上一轮的 test-auto-hit。
+    DeleteFileW(g_logPath);
+    swprintf_s(cfg, 1024,
+               L"profilefile=%ls|engine=auto|cp=932|dedup=0|log=1", iniAutoMiss);
+
+    rc = g_InstallConfig((LPVOID)cfg);
+    Check(rc > 0, "InstallConfig 返回成功（engine=auto 未命中场景）");
+
+    WaitLog("engine=auto 未能命中", 3000);
+
+    log = ReadWholeFile(g_logPath, &sz);
+    if (log) {
+        Check(LogContains(log, "engine=auto 未能命中任何 profile"),
+              "hint 都不匹配时横幅明确报告「未能命中」");
+        Check(LogContains(log, "已安装 profile=generic-gdi"),
+              "未命中时退回默认 profile=generic-gdi（不是上一轮的文件 profile）");
+        free(log);
+    } else {
+        Check(0, "读取 texthook_log.txt（engine=auto 未命中场景）");
+    }
+
+    g_Unhook(NULL);
+    WaitWhileTrue(HasLeakedSlots, 2000);
+    Check(CountIatSlotsInsideDll(g_hDllUnderTest) == 0,
+          "engine=auto 两轮安装/卸载后 IAT 已还原");
+}
+
+// ---------------------------------------------------------------------------
 
 int main(int argc, char** argv)
 {
@@ -848,7 +954,7 @@ int main(int argc, char** argv)
     printf("================================================\n");
 
     if (argc < 2) {
-        printf("用法: TestTextHook.exe <TextHookDll 路径> [sample ini 路径] [只跑的场景号 1-8]\n");
+        printf("用法: TestTextHook.exe <TextHookDll 路径> [sample ini 路径] [只跑的场景号 1-9]\n");
         return 1;
     }
 
@@ -873,10 +979,13 @@ int main(int argc, char** argv)
     DirOf(dllPath, dir, MAX_PATH);
 
     wchar_t logPath[MAX_PATH], iniGood[MAX_PATH], iniBad[MAX_PATH], iniGeneric[MAX_PATH];
+    wchar_t iniAuto[MAX_PATH], iniAutoMiss[MAX_PATH];
     swprintf_s(logPath, MAX_PATH, L"%stexthook_log.txt", dir);
     swprintf_s(iniGood, MAX_PATH, L"%s_test_profiles_good.ini", dir);
     swprintf_s(iniBad,  MAX_PATH, L"%s_test_profiles_bad.ini", dir);
     swprintf_s(iniGeneric, MAX_PATH, L"%s_test_profiles_generic.ini", dir);
+    swprintf_s(iniAuto, MAX_PATH, L"%s_test_profiles_auto.ini", dir);
+    swprintf_s(iniAutoMiss, MAX_PATH, L"%s_test_profiles_auto_miss.ini", dir);
     g_logPath = logPath;
 
     printf("DLL      : %ls\n", dllPath);
@@ -946,6 +1055,43 @@ int main(int argc, char** argv)
     Check(WriteAsciiFile(iniGeneric, kIniGenericText),
           "写入通用转发器用的 profile 文件（text= / len= / argc=）");
 
+    // 场景 9 用：hintExe 用通配符匹配**本测试进程自己的 exe 名**。
+    // 不写死 TestTextHook-x64.exe 是因为同一份代码要跑 x64 和 x86 两遍。
+    // 第一个 profile 的 hint 故意写成永不匹配，用来确认 auto 真的按顺序挑了
+    // 后面那个，而不是「反正只有一个候选」。
+    static const char kIniAutoText[] =
+        "[test-auto-miss]\r\n"
+        "desc=hint never matches this process\r\n"
+        "codepage=932\r\n"
+        "minlen=2\r\n"
+        "dedup=0\r\n"
+        "hintExe=__no_such_game__.exe\r\n"
+        "hook=gdi32.dll,TextOutA\r\n"
+        "\r\n"
+        "[test-auto-hit]\r\n"
+        "desc=hint matches the test harness itself\r\n"
+        "codepage=932\r\n"
+        "minlen=2\r\n"
+        "dedup=0\r\n"
+        "hintExe=TestTextHook*.exe\r\n"
+        "hook=gdi32.dll,TextOutA\r\n";
+
+    // 未命中场景：所有 hint 都不匹配当前进程。
+    static const char kIniAutoMissText[] =
+        "[test-auto-miss]\r\n"
+        "desc=hint never matches this process\r\n"
+        "codepage=932\r\n"
+        "minlen=2\r\n"
+        "dedup=0\r\n"
+        "hintExe=__no_such_game__.exe\r\n"
+        "hintClass=__NoSuchWindowClass__\r\n"
+        "hook=gdi32.dll,TextOutA\r\n";
+
+    Check(WriteAsciiFile(iniAuto, kIniAutoText),
+          "写入 engine=auto 命中场景的 profile 文件");
+    Check(WriteAsciiFile(iniAutoMiss, kIniAutoMissText),
+          "写入 engine=auto 未命中场景的 profile 文件");
+
     // ---- 3. 场景 1：内置 profile ---------------------------------------------
     static const Scenario sc1 = {
         "场景 1：内置 generic-gdi（挂全部 6 个函数）",
@@ -1007,6 +1153,10 @@ int main(int argc, char** argv)
     // ---- 7b. 场景 8：控制字符清洗 -------------------------------------------
     if (!only || only == 8) RunSanitizeScenario();
 
+    // ---- 7c. 场景 9：engine=auto 自动选 profile -----------------------------
+    //      放在管道场景之前：管道场景会额外做多轮安装/卸载。
+    if (!only || only == 9) RunAutoScenario(iniAuto, iniAutoMiss);
+
     // ---- 8. 场景 5：命名管道 ------------------------------------------------
     //      必须在最后跑：它会额外做多轮安装/卸载，前面的场景要保持各自干净。
     if (!only || only == 5) RunPipeScenario();
@@ -1018,6 +1168,8 @@ int main(int argc, char** argv)
     DeleteFileW(iniGood);
     DeleteFileW(iniBad);
     DeleteFileW(iniGeneric);
+    DeleteFileW(iniAuto);
+    DeleteFileW(iniAutoMiss);
 
     printf("\n================================================\n");
     if (g_failures == 0) {

@@ -102,11 +102,11 @@ typedef struct {
 | `name` / `codepage` / `minLen` / `dedupMs` | ✅ 已实现 | 可外部化，见 §3.2 |
 | `textArg` / `lenArg` | ✅ 已实现（S3 完整版） | ini 里的 `text=` / `len=` 直接声明「第几个参数是文本、第几个是长度」；未声明时退回编译期写死的 6 个专用提取器 |
 | `argc` / `wide` / `conv` | ✅ 已实现 | 参数总数（1..8）、文本是 `wchar_t*` 还是 `char*`、调用约定（`stdcall` / `cdecl`） |
-| `hintClass` / `hintExe` | ❌ 未实现 | `auto` 识别尚未落地，只能靠 `engine=` 显式指定 |
+| `hintClass` / `hintExe` | ✅ 已实现 | `engine=auto` 时按 exe 名 / 顶层窗口类名（都支持 `*` `?` 通配）挑 profile，见 §3.3 |
 
 **这张表是理解 S3 能力边界的关键**：`textArg` / `lenArg` 外部化之后，文件 profile
 不再局限于框架已知的 6 个函数——只要写清楚参数位置，任何导出函数都能挂。
-仍然做不到的是「自动猜出参数位置」（`hintClass` / `hintExe` 那两行），
+仍然做不到的是「自动猜出参数位置」（`text=` / `len=` 那几行必须人填），
 以及不做句子重组、不覆盖 DirectX 自绘。
 
 ### 3.2 外部化后的 profile 文件（S3）
@@ -148,6 +148,8 @@ hook=myengine.dll,RenderText
 | `argc=` | 该函数的参数总数（1..8）。**必填**——转发调用必须知道弹多少字节栈 |
 | `wide=` | `1` = 文本是 `wchar_t*`（UTF-16，直接上报）；`0` = `char*`（按 `codepage` 转） |
 | `conv=` | `stdcall`（默认，绝大多数 Win32 API）或 `cdecl` |
+| `hintExe=` | 目标进程 exe 名，支持 `*` `?`。只对 `engine=auto` 有意义（见 §3.3） |
+| `hintClass=` | 目标进程顶层窗口类名，支持 `*` `?`。别名 `hint=`。只对 `engine=auto` 有意义 |
 
 这几个键可以写在任意 `hook=` 之前或之后，整段读完再统一填进该段的每个 target。
 校验是「全有或全无」：`argc` 越界、`text`/`len` 超出 `argc`、值不是数字，
@@ -168,6 +170,40 @@ hook=myengine.dll,RenderText
 `GetProcAddress` 拿到真实地址，再遍历各模块导入表找**值等于该地址**的槽。
 这样 API Set 转发（`api-ms-win-*`）、名字修饰（`_TextOutA@20`）、大小写差异
 全部自动兼容——按名字比对时这些情况会整片匹配不到，表现为「profile 明明对了却抓不到」。
+
+### 3.3 `engine=auto`：按 hint 自动选 profile
+
+外部化解决了「改适配不用重编译」，但注入时仍得在命令行里手写
+`engine=<名字>`。`hintExe` / `hintClass` 把最后这一步也去掉：
+
+```ini
+[game-a]
+desc=游戏 A
+codepage=932
+hintExe=gamea*.exe          ; 目标进程 exe 名，支持 * 和 ?
+hintClass=TWin32Window*     ; 目标进程任意顶层窗口的类名，支持 * 和 ?
+hook=gdi32.dll,TextOutA
+```
+
+注入时只传 `-exportarg "engine=auto|cp=932|log=1"` 即可。
+
+| 项 | 行为 |
+| --- | --- |
+| 参与条件 | 某个 profile 的 `hintExe` / `hintClass` **都为空**则不参与判定，绝不误选 |
+| 匹配规则 | `hintExe` 比对 `GetModuleFileNameW(NULL)` 的文件名部分；`hintClass` 用 `EnumWindows` 遍历本进程顶层窗口，任一 `GetClassNameA` 命中即算匹配 |
+| 通配 | `*`（任意长）与 `?`（单字符），大小写无关；实现是迭代式回溯，不用递归（pattern 来自用户 ini，递归深度不受控） |
+| 两个 hint 都写 | 必须**同时**命中 |
+| 多命中 | 取靠前的：文件 profile 先于内置 profile，符合「文件覆盖内置」的既有语义 |
+| 别名 | `hint=` 等价于 `hintClass=` |
+| 可观测性 | 启动横幅**单独一行**报告命中或未命中，未命中时提示去补哪个键 |
+
+一个容易踩的点：**写了 hint 的 profile 在不传 `engine=` 时也会参与判定**。
+`engine=auto` 的作用是把这个行为显式声明出来、并强制打印判定结果；
+想彻底关掉自动判定就传一个具体的 `engine=<名字>`。
+
+为什么「未命中」必须单独报一行：猜错 profile 与「引擎压根没走 IAT」
+在日志里是同一个现象（一条文本都没有）。不把判定结果打出来，使用者就分不清
+该去改 hint、还是该去查引擎的调用路径。
 
 ---
 
@@ -338,14 +374,16 @@ CreateProcess(SUSPENDED) → 逐个 LoadLibraryW 注入 DLL → ResumeThread →
 | --- | --- | --- |
 | **S1** | 框架骨架 + IAT Hook + 编码转换 + 管道输出 + `generic-gdi` profile | ✅ 已实现 |
 | **S2** | 最小长度反汇编器 + Inline Hook，覆盖「连 `GetProcAddress` 都自己现取」的引擎 | 待做 |
-| **S3** | 外部化 profile（INI 文件，改引擎适配不用重编译 DLL），含 `textArg` / `lenArg` 参数位置外部化 | ✅ 已实现 |
+| **S3** | 外部化 profile（INI 文件，改引擎适配不用重编译 DLL），含 `textArg` / `lenArg` 参数位置外部化 + `engine=auto` 按 `hintExe` / `hintClass` 自动选 profile | ✅ 已实现 |
 | **S4** | 具体引擎 profile：对实机样本逆向填 `module!func` 与参数布局 | 待做（需样本） |
 | **S5** | VTable / DirectX 系适配，或改用「读引擎文本缓冲区」路线 | 待做 |
 
 S3 完成后，profile 已从编译期挪到运行期：适配新引擎只要写一个文本文件，
-不用重新编译、也不用重新分发 DLL。S3 外部化了四样东西——挂哪些函数、用什么编码、
-去重与长度阈值、**以及「第几个参数是文本 / 长度、参数总数、窄宽字符、调用约定」**。
-所以「框架不认识的函数」现在也能挂，只要在 ini 里写清参数位置（见 §3.2）。
+不用重新编译、也不用重新分发 DLL。S3 外部化了五样东西——挂哪些函数、用什么编码、
+去重与长度阈值、「第几个参数是文本 / 长度、参数总数、窄宽字符、调用约定」，
+以及**这个 profile 该在什么进程上生效**（`hintExe` / `hintClass`，见 §3.3）。
+所以「框架不认识的函数」现在也能挂，只要在 ini 里写清参数位置（见 §3.2）；
+写好 hint 之后连 `engine=` 都不用传。
 
 仍然留在编译期的是**怎么把取到的字节变成一句完整的话**：句子重组、逐字显示的合并、
 DirectX 自绘的读取路径——这些属于 S4 / S5。
@@ -379,11 +417,12 @@ S3（profile 外部化）与 S2（尚未实现的 Inline Hook）。逐条标注�
   `InterlockedExchangePointer` 并保持页面可执行（RWX 写入、写完立刻还原原保护属性），
   把「写缓冲推迟到 VirtualProtect 之后」这条最容易出事的路径堵上了；
   但**逐槽之间仍不是原子的**，启动时注入（挂起态）无此问题
-- **`auto` 识别尚未实现**：`hintExe` / `hintClass` 只出现在上面那张目标形态图里，
-  实际 `EngineProfile` 结构体中并没有这两个字段，`ApplyConfig` 里也没有任何按进程名 /
-  窗口类名匹配的逻辑——所以现在必须靠 `engine=` 显式指定 profile（不指定就用
-  `generic-gdi` 兜底）。真正的引擎识别需要更多样本特征（资源段特征、字符串特征、
-  模块列表特征），属于 S4
+- ~~**`auto` 识别尚未实现**~~（**已实现**，见 §3.3）：`EngineProfile` 已有
+  `hintExe` / `hintClass` 字段，`ApplyConfig` 解析 `hintExe=` / `hintClass=`（`hint=` 为
+  `hintClass=` 的别名），`engine=auto` 时由 `ResolveAutoProfile()` 按「文件 profile 先、
+  内置后」的顺序找第一个命中的。判定结果打在启动横幅里。
+  **仍然做不到**的是更进一步的引擎识别——资源段特征、字符串特征、模块列表特征，
+  那些属于 S4；`auto` 只按「exe 名 + 窗口类名」两个廉价信号做匹配
 - **不做文本合并**：GalGame 常把一句话分多次输出（逐字显示），一阶段按次上报，
   句子重组交给消费端
 - ~~**管道单消费者**~~（**已改**）：服务端默认创建 4 个实例，同一行文本广播给所有消费者；
@@ -430,7 +469,7 @@ test\TextHookDll\build.bat
 真正的竞态（日志文件共享冲突、广告还没刷完就断言）全被盖住了。
 改成轮询后降到 15 秒，且一上就暴露了三个真实缺陷（见 `CHANGELOG.md`）。
 
-它跑的 8 个场景：
+它跑的 9 个场景：
 
 | 场景 | 目的 |
 | --- | --- |
@@ -442,6 +481,7 @@ test\TextHookDll\build.bat
 | 6 动态取址 | **唯一覆盖 `GetProcAddress` 替身的场景**，见下 |
 | 7 通用转发器 | **唯一覆盖 `text=` / `len=` / `argc=` 的场景**，见下 |
 | 8 控制字符清洗 | **唯一覆盖「文本里带 `\t` / `\r` / `\n`」的场景**，见下 |
+| 9 `engine=auto` | **唯一覆盖 `hintExe` / `hintClass` 自动选 profile 的场景**，见下 |
 
 场景 1–4 都只靠 `texthook_log.txt` 判断结果，全程没有客户端连管道——也就是说
 **管道线程的生命周期一直没被验证过**。场景 5 补上这一块：
@@ -498,6 +538,18 @@ profile 对挂钩集合的实际约束、**卸载后主 EXE 的 IAT 已完全还
 
 > 反向验证同样做过：把 `SanitizeControls` 注释掉重编，场景 8 的两条断言立刻 FAIL、
 > `VERIFY_FAIL` + 非零退出；恢复后全绿。**没有做过反向验证的断言，不能算验证过。**
+
+场景 9 针对 `engine=auto`（见 §3.3）。它分两半跑，两半都必须有：
+
+- **命中**：ini 里放两个 profile，第一个的 `hintExe` 故意写成永不匹配的名字，
+  第二个写 `hintExe=TestTextHook*.exe`（通配符匹配测试进程自身）。断言横幅报告
+  命中的是**第二个**——这样测的不只是「挑到了一个」，还包括「按顺序跳过不匹配的」。
+  随后真的调一次 `TextOutA`，确认选中的 profile 真的装上了钩子。
+- **未命中**：换一份 hint 谁也不匹配的 ini，断言横幅明确报「未能命中」并退回
+  `generic-gdi`，而不是继续沿用上一轮的文件 profile。
+
+`hintExe` 用通配符而不是写死 `TestTextHook-x64.exe`，是因为同一份测试代码要跑
+x64 和 x86 两遍；写死就只能在一种架构上通过。
 
 `TestTextTarget` / `TestTextHook` 都用**硬编码字节数组或 `\uXXXX` 转义**写期望文本，
 不含任何非 ASCII 字面量，因此「抓到的文本对不对」与源码文件编码无关。

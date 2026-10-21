@@ -48,13 +48,14 @@ test\ManualMap\build_shellcode.bat
 ## 目录职责
 
 ```
-DllInjector/Program.cs       注入器全部源码（单文件，约 3000 行）
+DllInjector/Program.cs       注入器全部源码（单文件，约 4200 行）
   ├─ NativeMethods           Win32 / ntdll P/Invoke 声明与常量
   ├─ PeHelper                PE 头解析：位数、导出表 RVA、注入前体检
   ├─ MainForm                WinForms 界面（手写 DPI 缩放布局）
   │   ├─ DllSortDialog       多 DLL 注入顺序拖拽排序
   │   └─ BatchInjectDialog   多进程批量注入勾选
   ├─ InjectorCore            注入核心（GUI 与 CLI 共用）
+  ├─ AtomicFile              原子写文件（tmp + File.Replace，防写到一半被杀留下空文件）
   ├─ ConfigStore             配置持久化（记忆 exe/dll/注入方式/窗口位置）
   ├─ Theme                   暗色主题色板
   └─ Program                 入口：UAC 自提权 + CLI 模式分发
